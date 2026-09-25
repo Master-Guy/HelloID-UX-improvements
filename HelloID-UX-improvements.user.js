@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-25.1
+// @version      2026-09-25.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -8,12 +8,84 @@
 // @match        https://*.helloid.com/*
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
 // @run-at       document-start
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @sandbox      JavaScript
 // ==/UserScript==
-
 
 (function () {
     'use strict';
+
+    // =====================================================================
+    // Settings
+    // =====================================================================
+    // These are the defaults. Your own changes are stored by Tampermonkey
+    // (Tampermonkey menu > "Settings…") and survive script updates.
+
+    const DEFAULTS = Object.freeze({
+        // Entitlements tab: number of rules requested from the server in one go.
+        // Must be higher than the number of rules on any target system.
+        fetchAllTake: 99999,
+
+        // Entitlements tab: wait this long after the last filter click
+        // before reloading, so several buttons can be set in one go.
+        filterReloadDelayMs: 1500,
+
+        // Entitlements tab: icon colors per filter status
+        filterColors: {
+            unknown:  '#cdcdcd',  // no filter
+            enabled:  'black',    // only rules WITH this entitlement
+            disabled: 'red',      // only rules WITHOUT this entitlement
+        },
+
+        // Copy buttons: how long the check/cross is shown after copying
+        copyFeedbackMs: 1000,
+    });
+
+    const SETTINGS_KEY = 'settings';
+
+    const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+    // Defaults + stored overrides. Nested objects (like filterColors) are
+    // merged too, so overriding one color keeps the other defaults.
+    function mergeSettings(defaults, overrides) {
+        const result = { ...defaults };
+        for (const [key, value] of Object.entries(overrides || {})) {
+            result[key] = isPlainObject(defaults[key]) && isPlainObject(value)
+                ? mergeSettings(defaults[key], value)
+                : value;
+        }
+        return result;
+    }
+
+    const SETTINGS = Object.freeze(mergeSettings(DEFAULTS, GM_getValue(SETTINGS_KEY, {})));
+
+    GM_registerMenuCommand('Settings…', () => {
+        const current = JSON.stringify(GM_getValue(SETTINGS_KEY, {}), null, 2);
+        const input = prompt(
+            'Your overrides as JSON (empty = all defaults).\n\n' +
+            'Defaults:\n' + JSON.stringify(DEFAULTS),
+            current
+        );
+        if (input === null) return;
+
+        try {
+            const overrides = input.trim() ? JSON.parse(input) : {};
+            if (!isPlainObject(overrides)) throw new Error('Not an object');
+            GM_setValue(SETTINGS_KEY, overrides);
+            location.reload();
+        } catch {
+            alert('Invalid JSON, nothing was saved.');
+        }
+    });
+
+    GM_registerMenuCommand('Reset settings to defaults', () => {
+        if (!confirm('Reset all settings to their defaults?')) return;
+        GM_setValue(SETTINGS_KEY, {});
+        location.reload();
+    });
 
     // =====================================================================
     // Filter state
@@ -28,9 +100,9 @@
     const statusOrder = Object.values(ButtonStatus);
 
     const statusColor = {
-        [ButtonStatus.UNKNOWN]:  '#cdcdcd',
-        [ButtonStatus.ENABLED]:  'black',
-        [ButtonStatus.DISABLED]: 'red',
+        [ButtonStatus.UNKNOWN]:  SETTINGS.filterColors.unknown,
+        [ButtonStatus.ENABLED]:  SETTINGS.filterColors.enabled,
+        [ButtonStatus.DISABLED]: SETTINGS.filterColors.disabled,
     };
 
     const FILTERS = [
@@ -39,22 +111,28 @@
         { key: 'permissions', field: 'permissionEntitlementForSystem',    icon: 'fa-users',     title: 'Permission entitlement(s)' },
     ];
 
-    const STORAGE_KEY = 'tm-helloid-entitlement-filters';
+    const FILTER_STATE_KEY = 'filterState';
+    const LEGACY_STORAGE_KEY = 'tm-helloid-entitlement-filters'; // older versions used localStorage
 
     function loadState() {
+        const stored = GM_getValue(FILTER_STATE_KEY, null);
+        if (isPlainObject(stored)) return stored;
+
+        // One-time migration from localStorage
         try {
-            return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
-        } catch {
-            return {};
-        }
+            const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY));
+            if (isPlainObject(legacy)) {
+                GM_setValue(FILTER_STATE_KEY, legacy);
+                localStorage.removeItem(LEGACY_STORAGE_KEY);
+                return legacy;
+            }
+        } catch { /* ignore */ }
+
+        return {};
     }
 
     function saveState(state) {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        } catch (e) {
-            console.warn('Could not save filter state', e);
-        }
+        GM_setValue(FILTER_STATE_KEY, state);
     }
 
     const filterState = loadState();
@@ -79,6 +157,10 @@
     // Response interception
     // =====================================================================
 
+    // The page's real window. With @sandbox JavaScript this is the page itself;
+    // patching the script's own window would not affect HelloID.
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
     const TARGET = /\/entitlements-overview(\?|$)/;
 
     // Field the grid uses to decide how many rows exist
@@ -94,7 +176,7 @@
             take: takeParam === null ? Infinity : (parseInt(takeParam, 10) || Infinity),
         };
         u.searchParams.set('skip', '0');
-        u.searchParams.set('take', '99999');
+        u.searchParams.set('take', String(SETTINGS.fetchAllTake));
         page.url = u.toString();
         return page;
     }
@@ -122,17 +204,17 @@
     }
 
     // --- fetch ---
-    const origFetch = window.fetch;
-    window.fetch = async function (input, init) {
-        const url = input instanceof Request ? input.url : String(input);
+    const origFetch = pageWindow.fetch;
+    pageWindow.fetch = async function (input, init) {
+        const url = input instanceof pageWindow.Request ? input.url : String(input);
         if (!TARGET.test(url)) return origFetch.call(this, input, init);
 
         const page = rewriteUrl(url);
-        const newInput = input instanceof Request ? new Request(page.url, input) : page.url;
+        const newInput = input instanceof pageWindow.Request ? new pageWindow.Request(page.url, input) : page.url;
         const response = await origFetch.call(this, newInput, init);
 
         const text = await response.clone().text();
-        const modified = new Response(modifyJsonText(text, page), {
+        const modified = new pageWindow.Response(modifyJsonText(text, page), {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
@@ -142,7 +224,7 @@
     };
 
     // --- XMLHttpRequest ---
-    const proto = XMLHttpRequest.prototype;
+    const proto = pageWindow.XMLHttpRequest.prototype;
     const origOpen = proto.open;
     const origResponse = Object.getOwnPropertyDescriptor(proto, 'response').get;
     const origResponseText = Object.getOwnPropertyDescriptor(proto, 'responseText').get;
@@ -199,11 +281,10 @@
     // Reload after a short pause, so you can click the buttons several times
     // to set the statuses you want before the data is fetched again.
     // Every click (on any of the three buttons) restarts the timer.
-    const RELOAD_DELAY_MS = 1500;
     let reloadTimer;
     function scheduleReload() {
         clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(() => location.reload(), RELOAD_DELAY_MS);
+        reloadTimer = setTimeout(() => location.reload(), SETTINGS.filterReloadDelayMs);
     }
 
     function createFilterButton(filter) {
@@ -302,7 +383,7 @@
 
             const ok = await copyToClipboard(text);
             icon.className = ok ? 'fa-solid fa-check' : 'fa-solid fa-xmark';
-            setTimeout(() => { icon.className = 'fa-solid fa-copy'; }, 1000);
+            setTimeout(() => { icon.className = 'fa-solid fa-copy'; }, SETTINGS.copyFeedbackMs);
         });
 
         return btn;
