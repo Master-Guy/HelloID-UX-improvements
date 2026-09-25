@@ -2,8 +2,8 @@
 // @name         HelloID UX improvements
 // @version      2026-09-25.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
-// @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-IX-Improvements.user.js
-// @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-IX-Improvements.user.js
+// @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-IX-improvements.user.js
+// @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-IX-improvements.user.js
 // @author       Master-Guy
 // @match        https://*.helloid.com/*
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
