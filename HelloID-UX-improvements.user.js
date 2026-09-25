@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-25.2
+// @version      2026-09-25.3
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @author       Master-Guy
+// @homepageURL  https://github.com/Master-Guy/HelloID-UX-improvements
 // @match        https://*.helloid.com/*
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
 // @run-at       document-start
@@ -21,8 +22,8 @@
     // =====================================================================
     // Settings
     // =====================================================================
-    // These are the defaults. Your own changes are stored by Tampermonkey
-    // (Tampermonkey menu > "Settings…") and survive script updates.
+    // These are the defaults. Your own changes are made via the Tampermonkey
+    // toolbar menu, are stored by Tampermonkey and survive script updates.
 
     const DEFAULTS = Object.freeze({
         // Entitlements tab: number of rules requested from the server in one go.
@@ -62,26 +63,119 @@
 
     const SETTINGS = Object.freeze(mergeSettings(DEFAULTS, GM_getValue(SETTINGS_KEY, {})));
 
-    GM_registerMenuCommand('Settings…', () => {
-        const current = JSON.stringify(GM_getValue(SETTINGS_KEY, {}), null, 2);
-        const input = prompt(
-            'Your overrides as JSON (empty = all defaults).\n\n' +
-            'Defaults:\n' + JSON.stringify(DEFAULTS),
-            current
-        );
-        if (input === null) return;
+    // --- Settings menu (Tampermonkey toolbar menu) ---
 
-        try {
-            const overrides = input.trim() ? JSON.parse(input) : {};
-            if (!isPlainObject(overrides)) throw new Error('Not an object');
-            GM_setValue(SETTINGS_KEY, overrides);
-            location.reload();
-        } catch {
-            alert('Invalid JSON, nothing was saved.');
+    const getPath = (obj, path) => path.split('.').reduce((o, k) => o?.[k], obj);
+
+    function setPath(obj, path, value) {
+        const keys = path.split('.');
+        const last = keys.pop();
+        let o = obj;
+        for (const k of keys) {
+            if (!isPlainObject(o[k])) o[k] = {};
+            o = o[k];
         }
-    });
+        o[last] = value;
+    }
 
-    GM_registerMenuCommand('Reset settings to defaults', () => {
+    function deletePath(obj, path) {
+        const keys = path.split('.');
+        const last = keys.pop();
+        const parent = keys.reduce((o, k) => o?.[k], obj);
+        if (!isPlainObject(parent)) return;
+        delete parent[last];
+        // Clean up empty parent objects
+        if (keys.length && Object.keys(parent).length === 0) deletePath(obj, keys.join('.'));
+    }
+
+    const parsePositiveInt = (v) => {
+        const n = Number(v);
+        return Number.isInteger(n) && n > 0 ? n : undefined;
+    };
+    const parseColor = (v) => (CSS.supports('color', v) ? v : undefined);
+
+    const SETTING_DEFS = [
+        {
+            path: 'copyFeedbackMs',
+            label: 'Copy buttons: feedback time (ms)',
+            description: 'How long the check mark (or cross) is shown after clicking a copy button.',
+            parse: parsePositiveInt,
+            hint: 'a whole number of milliseconds',
+        },
+        {
+            path: 'fetchAllTake',
+            label: 'Entitlements: max rules to fetch',
+            description: 'Number of rules requested from the server in one go on the Entitlements tab. ' +
+                         'Must be higher than the number of rules on any target system.',
+            parse: parsePositiveInt,
+            hint: 'a whole number',
+        },
+        {
+            path: 'filterColors.unknown',
+            label: 'Entitlements filter: color for "no filter"',
+            description: 'Icon color of a filter button that is not filtering.',
+            parse: parseColor,
+            hint: 'a CSS color, e.g. #cdcdcd or grey',
+        },
+        {
+            path: 'filterColors.enabled',
+            label: 'Entitlements filter: color for "with entitlement"',
+            description: 'Icon color of a filter button that only shows rules WITH this entitlement.',
+            parse: parseColor,
+            hint: 'a CSS color, e.g. black or #000',
+        },
+        {
+            path: 'filterColors.disabled',
+            label: 'Entitlements filter: color for "without entitlement"',
+            description: 'Icon color of a filter button that only shows rules WITHOUT this entitlement.',
+            parse: parseColor,
+            hint: 'a CSS color, e.g. red or #c00',
+        },
+        {
+            path: 'filterReloadDelayMs',
+            label: 'Entitlements filter: reload delay (ms)',
+            description: 'How long to wait after the last click on a filter button before the page reloads, ' +
+                         'so you can set several filters in one go.',
+            parse: parsePositiveInt,
+            hint: 'a whole number of milliseconds',
+        },
+    ].sort((a, b) => a.label.localeCompare(b.label));
+
+    function editSetting(def) {
+        const overrides = GM_getValue(SETTINGS_KEY, {});
+        const current = getPath(overrides, def.path);
+        const defaultValue = getPath(DEFAULTS, def.path);
+
+        const input = prompt(
+            `${def.label}\n\n` +
+            `${def.description}\n\n` +
+            `Default: ${defaultValue}\n` +
+            `Leave empty to use the default.`,
+            current ?? ''
+        );
+        if (input === null) return; // cancelled
+
+        const trimmed = input.trim();
+        if (trimmed === '') {
+            deletePath(overrides, def.path);
+        } else {
+            const value = def.parse(trimmed);
+            if (value === undefined) {
+                alert(`"${trimmed}" is not valid. Expected ${def.hint}.\nNothing was saved.`);
+                return;
+            }
+            setPath(overrides, def.path, value);
+        }
+
+        GM_setValue(SETTINGS_KEY, overrides);
+        location.reload();
+    }
+
+    for (const def of SETTING_DEFS) {
+        GM_registerMenuCommand(`${def.label}: ${getPath(SETTINGS, def.path)}`, () => editSetting(def));
+    }
+
+    GM_registerMenuCommand('Reset all settings to defaults', () => {
         if (!confirm('Reset all settings to their defaults?')) return;
         GM_setValue(SETTINGS_KEY, {});
         location.reload();
