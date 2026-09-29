@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-25.3
+// @version      2026-09-29.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @author       Master-Guy
 // @homepageURL  https://github.com/Master-Guy/HelloID-UX-improvements
 // @match        https://*.helloid.com/*
+// @match        https://*.helloid.training/*
+// @match        https://helloid.*
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
 // @run-at       document-start
 // @grant        GM_getValue
@@ -536,6 +538,12 @@
             // Reserve room so long names end in "..." before the button
             cell.style.paddingRight = '36px';
 
+            // Show the full name on hover. Set at hover time, since the
+            // grid recycles cells while scrolling.
+            cell.addEventListener('mouseenter', () => {
+                cell.title = cellTextWithout(cell, btn).trim();
+            });
+
             cell.appendChild(btn);
         });
     }
@@ -543,6 +551,123 @@
     function addCopyButtons() {
         addSystemTileCopyButtons();
         addRuleGridCopyButtons();
+    }
+
+    // =====================================================================
+    // Business rules overview: resizable columns
+    // =====================================================================
+
+    const RULES_GRID = 'helloid-rules-grid ag-grid-angular';
+
+    const isGridApi = (a) => a && typeof a.getColumnDefs === 'function';
+
+    // Grid API reachable from an AG Grid object, if any. Where exactly it
+    // lives depends on the AG Grid version, so try the known places.
+    function gridApiFrom(o) {
+        if (!o || typeof o !== 'object') return null;
+        let fromBean;
+        try { fromBean = o.getBean?.('gridApi') ?? o.context?.getBean?.('gridApi'); } catch { /* no such bean */ }
+        const candidates = [
+            o,
+            o.api,
+            o.gridApi,
+            o.beans?.gridApi,                       // v32+
+            o.gos?.api,                             // v31
+            o.gridOptionsService?.api,              // v29-v30
+            o.gridOptionsWrapper?.gridOptions?.api, // older
+            o.gridOptions?.api,
+            fromBean,
+        ];
+        return candidates.find(isGridApi) ?? null;
+    }
+
+    // AG Grid stores its objects on DOM elements under keys like
+    // "__ag_grid_instance" and "__AG_<random>" (the latter holds e.g. the
+    // header cell component). Search those, one level deep.
+    function findGridApi(gridEl) {
+        const els = [gridEl, ...gridEl.querySelectorAll('.ag-root-wrapper, .ag-header-cell')];
+        for (const el of els) {
+            for (const key of Object.keys(el)) {
+                if (!/^__ag/i.test(key)) continue;
+                const value = el[key];
+                const api = gridApiFrom(value) ??
+                    (value && typeof value === 'object'
+                        ? Object.values(value).map(gridApiFrom).find(Boolean)
+                        : null);
+                if (api) return api;
+            }
+        }
+        return null;
+    }
+
+    function needsResizable(defs) {
+        return defs.some(d => d.children
+            ? needsResizable(d.children)
+            : d.resizable !== true || d.minWidth != null || d.maxWidth != null);
+    }
+
+    // Some columns are fixed-width (minWidth === maxWidth), which blocks
+    // resizing even with resizable: true. Drop both limits; each column
+    // keeps its current width as starting point.
+    function withResizable(defs) {
+        return defs.map(d => d.children
+            ? { ...d, children: withResizable(d.children) }
+            : { ...d, resizable: true, minWidth: undefined, maxWidth: undefined });
+    }
+
+    // Set while we update the columns, so the resulting newColumnsLoaded
+    // event doesn't trigger another update (endless loop if the grid puts
+    // a default minWidth back).
+    let applyingResizable = false;
+
+    function applyResizable(api) {
+        if (applyingResizable) return;
+        const defs = api.getColumnDefs();
+        if (!defs || !needsResizable(defs)) return;
+        const newDefs = withResizable(defs);
+        applyingResizable = true;
+        try {
+            if (typeof api.setGridOption === 'function') {
+                api.setGridOption('columnDefs', newDefs); // v31+
+            } else {
+                api.setColumnDefs(newDefs);
+            }
+        } finally {
+            applyingResizable = false;
+        }
+    }
+
+    // Line on the right edge of each header cell, where the resize handle is.
+    // An inset shadow instead of a border, so the cell size doesn't change.
+    const STYLE_ID = 'tm-helloid-ux-styles';
+    const STYLES = `
+        ${RULES_GRID} .ag-header-cell {
+            box-shadow: inset -1px 0 0 #f0f0f0;
+        }
+    `;
+
+    function addStyles() {
+        if (document.getElementById(STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = STYLES;
+        (document.head ?? document.documentElement).appendChild(style);
+    }
+
+    const resizableGrids = new WeakSet();
+
+    function makeRuleGridResizable() {
+        document.querySelectorAll(RULES_GRID).forEach(gridEl => {
+            if (resizableGrids.has(gridEl)) return;
+
+            const api = findGridApi(gridEl);
+            if (!api) return; // grid not ready yet; the observer will retry
+
+            resizableGrids.add(gridEl);
+            applyResizable(api);
+            // If the page sets new columns later, make those resizable too
+            api.addEventListener?.('newColumnsLoaded', () => applyResizable(api));
+        });
     }
 
     // Watch the DOM: whenever a page is (re)rendered without our buttons,
@@ -555,7 +680,9 @@
             requestAnimationFrame(() => {
                 pending = false;
                 if (isEntitlementsPage()) addFilterOptions();
+                addStyles();
                 addCopyButtons();
+                makeRuleGridResizable();
             });
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
