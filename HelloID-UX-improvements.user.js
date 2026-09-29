@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-29.1
+// @version      2026-09-29.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -554,10 +554,11 @@
     }
 
     // =====================================================================
-    // Business rules overview: resizable columns
+    // All grids: resizable columns
     // =====================================================================
 
-    const RULES_GRID = 'helloid-rules-grid ag-grid-angular';
+    // Every AG Grid table in HelloID, on any page or tab
+    const AG_GRIDS = 'ag-grid-angular';
 
     const isGridApi = (a) => a && typeof a.getColumnDefs === 'function';
 
@@ -641,7 +642,7 @@
     // An inset shadow instead of a border, so the cell size doesn't change.
     const STYLE_ID = 'tm-helloid-ux-styles';
     const STYLES = `
-        ${RULES_GRID} .ag-header-cell {
+        ${AG_GRIDS} .ag-header-cell {
             box-shadow: inset -1px 0 0 #f0f0f0;
         }
     `;
@@ -656,8 +657,8 @@
 
     const resizableGrids = new WeakSet();
 
-    function makeRuleGridResizable() {
-        document.querySelectorAll(RULES_GRID).forEach(gridEl => {
+    function makeGridsResizable() {
+        document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
             if (resizableGrids.has(gridEl)) return;
 
             const api = findGridApi(gridEl);
@@ -682,7 +683,7 @@
                 if (isEntitlementsPage()) addFilterOptions();
                 addStyles();
                 addCopyButtons();
-                makeRuleGridResizable();
+                makeGridsResizable();
             });
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
