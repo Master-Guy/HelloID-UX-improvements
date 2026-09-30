@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-30.2
+// @version      2026-09-30.3
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -207,28 +207,31 @@
         { key: 'permissions', field: 'permissionEntitlementForSystem',    icon: 'fa-users',     title: 'Permission entitlement(s)' },
     ];
 
-    const FILTER_STATE_KEY = 'filterState';
-    const LEGACY_STORAGE_KEY = 'tm-helloid-entitlement-filters'; // older versions used localStorage
+    // Filters are kept per browser tab, in sessionStorage: they survive
+    // reloads of that tab, but other tabs have their own (see "Filters
+    // reset on navigation" below). Settings, by contrast, are shared.
+    function sessionGet(key, fallback) {
+        try {
+            const value = sessionStorage.getItem(key);
+            return value === null ? fallback : JSON.parse(value);
+        } catch {
+            return fallback; // blocked or invalid
+        }
+    }
+
+    function sessionSet(key, value) {
+        try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* blocked */ }
+    }
+
+    const FILTER_STATE_KEY = 'tm-helloid-filter-state';
 
     function loadState() {
-        const stored = GM_getValue(FILTER_STATE_KEY, null);
-        if (isPlainObject(stored)) return stored;
-
-        // One-time migration from localStorage
-        try {
-            const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY));
-            if (isPlainObject(legacy)) {
-                GM_setValue(FILTER_STATE_KEY, legacy);
-                localStorage.removeItem(LEGACY_STORAGE_KEY);
-                return legacy;
-            }
-        } catch { /* ignore */ }
-
-        return {};
+        const stored = sessionGet(FILTER_STATE_KEY, {});
+        return isPlainObject(stored) ? stored : {};
     }
 
     function saveState(state) {
-        GM_setValue(FILTER_STATE_KEY, state);
+        sessionSet(FILTER_STATE_KEY, state);
     }
 
     const filterState = loadState();
@@ -264,6 +267,9 @@
 
     // Always ask the server for everything, but remember which page the app wanted.
     function rewriteUrl(url) {
+        // Before filtering: drop filters left over from another page
+        syncFiltersWithPage();
+
         const u = new URL(url, location.href);
         const skipParam = u.searchParams.get('skip');
         const takeParam = u.searchParams.get('take');
@@ -886,6 +892,20 @@
     // Info columns shown centered, without "..." (after LABEL_RENAMES)
     const CENTERED_LABELS = new Set(['Actions']);
 
+    // Recent action columns: order and header icon. The tiles use the same
+    // icon for several actions; these tell them apart. Actions not listed
+    // here come after these, with the tile's own icon.
+    const ACTION_COLUMNS = [
+        { name: 'Grant account',     icon: 'fa-solid fa-user-plus' },
+        { name: 'Update account',    icon: 'fa-solid fa-user-pen' },
+        { name: 'Revoke account',    icon: 'fa-solid fa-user-xmark' },
+        { name: 'Enable account',    icon: 'fa-solid fa-unlock' },
+        { name: 'Disable account',   icon: 'fa-solid fa-lock' },
+        { name: 'Grant permission',  icon: 'fa-regular fa-square-check' },
+        { name: 'Update permission', icon: 'fa-regular fa-pen-to-square' },
+        { name: 'Revoke permission', icon: 'fa-regular fa-square-xmark' },
+    ];
+
     const FIT_CLASS = 'tm-fit'; // header of a column that fits its content
 
     // Symbols HelloID shows next to a system's name. Each gets a filter
@@ -896,9 +916,12 @@
         { key: 'warning',  icon: 'fa-solid fa-warning',   match: '.fa-warning',   label: 'systems with warnings' },
         { key: 'disabled', icon: 'fa-solid fa-power-off', match: '.fa-power-off', label: 'disabled systems' },
     ];
-    const FLAG_FILTERS_KEY = 'systemFlagFilters';
+    const FLAG_FILTERS_KEY = 'tm-helloid-system-flags'; // in sessionStorage
 
-    const activeFlags = () => GM_getValue(FLAG_FILTERS_KEY, []);
+    const activeFlags = () => {
+        const flags = sessionGet(FLAG_FILTERS_KEY, []);
+        return Array.isArray(flags) ? flags : [];
+    };
 
     // Keys of the SYSTEM_FLAGS shown on a tile
     function tileFlags(tile) {
@@ -967,10 +990,20 @@
 
     function columnModel(rows) {
         const withRecent = rows.find(r => r.recentLabel);
+        const position = (name) => {
+            const i = ACTION_COLUMNS.findIndex(c => c.name === name);
+            return i === -1 ? ACTION_COLUMNS.length : i;
+        };
         return {
             infoLabels: [...new Set(rows.flatMap(r => r.info.map(i => i.label)))],
+            // Sorted like ACTION_COLUMNS (stable, so unknown actions keep
+            // the tiles' order), with our icons
             actions: uniqueBy(rows.flatMap(r => r.actions), a => a.name)
-                .map(a => ({ name: a.name, icon: a.icon })),
+                .sort((a, b) => position(a.name) - position(b.name))
+                .map(a => ({
+                    name: a.name,
+                    icon: ACTION_COLUMNS.find(c => c.name === a.name)?.icon ?? a.icon,
+                })),
             recentLabel: withRecent?.recentLabel || 'Recent actions',
             recentInfo: withRecent?.recentInfo ?? '',
         };
@@ -1132,7 +1165,7 @@
             e.preventDefault();
             e.stopPropagation();
             const active = activeFlags();
-            GM_setValue(FLAG_FILTERS_KEY, active.includes(flag.key)
+            sessionSet(FLAG_FILTERS_KEY, active.includes(flag.key)
                 ? active.filter(k => k !== flag.key)
                 : [...active, flag.key]);
             applySystemsView();
@@ -1636,6 +1669,45 @@
         });
     }
 
+    // =====================================================================
+    // Filters reset on navigation
+    // =====================================================================
+    // Filters belong to the page they were set on. They survive our own
+    // reloads (the Entitlements filters reload the page), but start off
+    // on any other page. The filters and their page are kept in
+    // sessionStorage, per browser tab, so a new tab or browser session
+    // starts without filters, and tabs don't reset each other's filters.
+
+    const FILTER_PAGE_KEY = 'tm-helloid-filter-page';
+
+    // The page, without query parameters other than the tab, e.g.
+    // "/provisioning/#/target/systems/<id>|Entitlements"
+    function pageKey() {
+        const [route, query = ''] = location.hash.split('?');
+        const tab = new URLSearchParams(query).get('tab') ?? '';
+        return `${location.pathname}${route}|${tab}`;
+    }
+
+    function syncFiltersWithPage() {
+        const key = pageKey();
+        if (sessionGet(FILTER_PAGE_KEY, null) === key) return;
+        sessionSet(FILTER_PAGE_KEY, key);
+
+        // Entitlements filters (the object is shared, so clear it in place)
+        if (Object.keys(filterState).length) {
+            Object.keys(filterState).forEach(k => delete filterState[k]);
+            saveState(filterState);
+            // Redraw the buttons, if they're on the page already
+            document.getElementById(FILTER_DIV_ID)?.remove();
+        }
+
+        // Target systems list: symbol filters
+        if (activeFlags().length) {
+            sessionSet(FLAG_FILTERS_KEY, []);
+            applySystemsView();
+        }
+    }
+
     // Watch the DOM: whenever a page is (re)rendered without our buttons,
     // add them. Covers the initial load and SPA navigation.
     function startObserver() {
@@ -1645,6 +1717,7 @@
             pending = true;
             requestAnimationFrame(() => {
                 pending = false;
+                syncFiltersWithPage();
                 if (isEntitlementsPage()) addFilterOptions();
                 addStyles();
                 addCopyButtons();
