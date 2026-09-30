@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-29.3
+// @version      2026-09-30.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -364,6 +364,29 @@
     });
 
     // =====================================================================
+    // Filter panels: show all items instead of the first 50
+    // =====================================================================
+    // The filter pop-up cards (helloid-filter-panels) render their items
+    // with Angular's slice pipe: `filters | slice:0:50`. The pipe and the
+    // component aren't reachable from here, but the pipe just calls
+    // array.slice(0, 50). So catch exactly that call, when it comes from a
+    // pipe's transform(), and return everything instead.
+
+    const FILTER_PANEL_LIMIT = 50;
+    const ArrayProto = pageWindow.Array.prototype;
+    const origSlice = ArrayProto.slice;
+
+    ArrayProto.slice = function (start, end) {
+        if (start === 0 && end === FILTER_PANEL_LIMIT &&
+            arguments.length === 2 &&
+            Array.isArray(this) && this.length > FILTER_PANEL_LIMIT &&
+            /\btransform\b/.test(new Error().stack)) {
+            return origSlice.call(this);
+        }
+        return origSlice.apply(this, arguments);
+    };
+
+    // =====================================================================
     // UI
     // =====================================================================
 
@@ -425,6 +448,271 @@
         filterDiv.id = FILTER_DIV_ID;
         FILTERS.forEach(f => filterDiv.appendChild(createFilterButton(f)));
         searchBar.parentElement.appendChild(filterDiv);
+    }
+
+    // =====================================================================
+    // Filter panels: search, "selected only", per-list select buttons
+    // =====================================================================
+    // Each list (panel) gets a footer with its own controls, so they line
+    // up with their column:
+    //   large list (systems): [search box]
+    //                         [Selected systems only]  [Select all systems]
+    //   other lists (types):                           [Select all types]
+    // The footers sit at the bottom of their panel, so the button rows
+    // line up. HelloID's own "Select all" row (which (de)selects all lists
+    // at once) is hidden. The large list's header shows how many items
+    // are selected.
+
+    const SEARCH_CLASS = 'tm-filter-search';
+    const FOOTER_CLASS = 'tm-filter-footer';
+    const TOGGLE_CLASS = 'tm-filter-checked-only';
+    const SELECT_BTN_CLASS = 'tm-filter-select';
+    const COUNT_CLASS = 'tm-filter-count';
+
+    const panelItems = (panel) => [...panel.querySelectorAll('.filter-grid-column > .checkbox')];
+    const itemCheckbox = (item) => item.querySelector('input[type="checkbox"]');
+    const isShown = (item) => item.style.display !== 'none';
+    const isSearchable = (panel) => panel.matches('.filter-panel-large');
+
+    // Header text of a panel, without our count, e.g. "System"
+    function panelName(panel) {
+        const header = panel.querySelector('.card-header');
+        if (!header) return '';
+        return [...header.childNodes]
+            .filter(n => n.nodeType === Node.TEXT_NODE)
+            .map(n => n.textContent)
+            .join('')
+            .trim();
+    }
+
+    // "System" -> "systems", "Type" -> "types", "Category" -> "categories"
+    function plural(word) {
+        const w = word.toLowerCase();
+        if (/s$/.test(w)) return w;
+        if (/[^aeiou]y$/.test(w)) return w.slice(0, -1) + 'ies';
+        return w + 's';
+    }
+
+    // Set text only when it changed; our MutationObserver would otherwise
+    // see every write as a change and keep refreshing.
+    function setText(el, text) {
+        if (el.textContent !== text) el.textContent = text;
+    }
+
+    // Every word must appear in the name, in any order, ignoring case
+    function searchWords(host) {
+        const input = host.querySelector(`.${SEARCH_CLASS}`);
+        return (input?.value ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+    }
+
+    function refreshFilterPanels(host) {
+        const words = searchWords(host);
+        const checkedOnly = host.dataset.tmCheckedOnly === '1';
+
+        host.querySelectorAll('.filter-panel').forEach(panel => {
+            const items = panelItems(panel);
+
+            if (isSearchable(panel)) {
+                // Show/hide items
+                items.forEach(item => {
+                    const name = (item.title || item.textContent).toLowerCase();
+                    const show = words.every(w => name.includes(w)) &&
+                                 (!checkedOnly || itemCheckbox(item)?.checked);
+                    const display = show ? '' : 'none';
+                    if (item.style.display !== display) item.style.display = display;
+                });
+
+                // Selected count in the header
+                const header = panel.querySelector('.card-header');
+                let count = header?.querySelector(`.${COUNT_CLASS}`);
+                if (header && !count) {
+                    count = document.createElement('span');
+                    count.className = `${COUNT_CLASS} text-muted small m-l-5`;
+                    count.style.fontWeight = 'normal';
+                    header.appendChild(count);
+                }
+                if (count) {
+                    const selected = items.filter(i => itemCheckbox(i)?.checked).length;
+                    // e.g. "12 of 240 system(s) selected"
+                    const noun = panelName(panel).toLowerCase();
+                    setText(count, `${selected} of ${items.length} ${noun}(s) selected`);
+                }
+            }
+
+            // Button label: "Deselect all" when every visible item is ticked
+            const btn = panel.querySelector(`.${SELECT_BTN_CLASS}`);
+            if (btn) {
+                const visible = items.filter(isShown);
+                const allChecked = visible.length > 0 && visible.every(i => itemCheckbox(i)?.checked);
+                setText(btn.querySelector('span'),
+                    `${allChecked ? 'Deselect' : 'Select'} all ${plural(panelName(panel))}`);
+                const icon = btn.querySelector('i');
+                const iconClass = allChecked ? 'fa-regular fa-square' : 'fa-solid fa-check-square';
+                if (icon.className !== iconClass) icon.className = iconClass;
+            }
+        });
+
+        // "Selected ... only" toggle look
+        const toggle = host.querySelector(`.${TOGGLE_CLASS}`);
+        if (toggle) {
+            toggle.classList.toggle('btn-primary', checkedOnly);
+            toggle.classList.toggle('btn-default', !checkedOnly);
+        }
+    }
+
+    // Tick or untick the visible items of one panel, via their checkboxes,
+    // so HelloID handles each change as if clicked by hand.
+    function toggleVisible(host, panel) {
+        const visible = panelItems(panel).filter(isShown);
+        const allChecked = visible.length > 0 && visible.every(i => itemCheckbox(i)?.checked);
+        visible.forEach(item => {
+            const checkbox = itemCheckbox(item);
+            if (checkbox && checkbox.checked === allChecked) checkbox.click();
+        });
+        refreshFilterPanels(host);
+    }
+
+    function createSmallButton(iconClass, onClick) {
+        const btn = document.createElement('a');
+        btn.className = 'btn btn-xs btn-default m-t-10';
+        const icon = document.createElement('i');
+        icon.className = iconClass;
+        const label = document.createElement('span');
+        btn.append(icon, ' ', label);
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onClick();
+        });
+        return btn;
+    }
+
+    function createSearchBox(host) {
+        const input = document.createElement('input');
+        input.type = 'search';
+        input.placeholder = 'Search...';
+        input.className = `form-control input-sm m-t-10 ${SEARCH_CLASS}`;
+        Object.assign(input.style, { width: '100%', height: '24px' });
+        input.addEventListener('input', () => refreshFilterPanels(host));
+        // Keep typing away from the page's own key handlers
+        input.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') e.stopPropagation();
+        });
+        return input;
+    }
+
+    function createPanelFooter(host, panel) {
+        const footer = document.createElement('div');
+        footer.className = FOOTER_CLASS;
+        // Pushed to the bottom of the panel (a flex column, see below)
+        footer.style.marginTop = 'auto';
+
+        // Buttons stay on one row; the row is never narrower than the
+        // buttons, so the panel (min-width: min-content) grows to fit them
+        const buttons = document.createElement('div');
+        Object.assign(buttons.style, {
+            display: 'flex',
+            flexWrap: 'nowrap',
+            gap: '5px',
+            justifyContent: 'flex-end',
+            minWidth: 'max-content',
+        });
+
+        if (isSearchable(panel)) {
+            footer.appendChild(createSearchBox(host));
+
+            const items = plural(panelName(panel));
+            const toggle = createSmallButton('fa-solid fa-filter', () => {
+                host.dataset.tmCheckedOnly = host.dataset.tmCheckedOnly === '1' ? '' : '1';
+                refreshFilterPanels(host);
+            });
+            toggle.classList.add(TOGGLE_CLASS);
+            toggle.title = `Only show the selected ${items}`;
+            toggle.querySelector('span').textContent = `Selected ${items} only`;
+            // margin-right: auto keeps it left, the select button right
+            toggle.style.marginRight = 'auto';
+            buttons.appendChild(toggle);
+        }
+
+        const selectBtn = createSmallButton('', () => toggleVisible(host, panel));
+        selectBtn.classList.add(SELECT_BTN_CLASS);
+        buttons.appendChild(selectBtn);
+
+        footer.appendChild(buttons);
+        return footer;
+    }
+
+    // Reserve room for the longest label, so the button keeps its width
+    // when it switches between "Select all" and "Deselect all"
+    function reserveLabelWidth(btn, longestLabel) {
+        const span = btn.querySelector('span');
+        const current = span.textContent;
+        span.textContent = longestLabel;
+        btn.style.minWidth = `${btn.offsetWidth}px`;
+        span.textContent = current;
+    }
+
+    // Let the pop-up card grow to fit the panels: remove any max-width
+    // between the panels and the card itself
+    function uncapCardWidth(host) {
+        for (let el = host; el && el !== document.body; el = el.parentElement) {
+            el.style.setProperty('max-width', 'none', 'important');
+            if (el.matches('popover-container, .popover')) break;
+        }
+    }
+
+    function addFilterPanelSearch() {
+        document.querySelectorAll('helloid-filter-panels').forEach(host => {
+            if (!host.querySelector('.filter-panel-large')) return;
+
+            // HelloID's "Select all" row: replaced by the per-list buttons
+            const origSelectAll = [...host.querySelectorAll('a.btn')]
+                .find(a => !a.closest(`.${FOOTER_CLASS}`) && /select all/i.test(a.textContent));
+            if (origSelectAll?.parentElement) {
+                origSelectAll.parentElement.style.display = 'none';
+            }
+
+            const newPanels = [];
+            host.querySelectorAll('.filter-panel').forEach(panel => {
+                if (panel.querySelector(`.${FOOTER_CLASS}`)) return;
+
+                // Flex column, so the footer can sit at the bottom and the
+                // footers of all panels line up
+                Object.assign(panel.style, { display: 'flex', flexDirection: 'column' });
+                // At least as wide as its narrowest possible content, which
+                // includes the footer button row. The item names don't
+                // count: they are cut off with "..." anyway.
+                panel.style.setProperty('min-width', 'min-content', 'important');
+                // Keep the header as wide as its text, like before
+                const header = panel.querySelector('.card-header');
+                if (header) header.style.alignSelf = 'flex-start';
+
+                panel.appendChild(createPanelFooter(host, panel));
+                newPanels.push(panel);
+            });
+
+            if (!host.dataset.tmListening) {
+                host.dataset.tmListening = '1';
+                // Checkbox clicks change counts, labels and "Selected only"
+                host.addEventListener('change', () => refreshFilterPanels(host));
+            }
+
+            // Re-apply after the page re-renders the lists
+            refreshFilterPanels(host);
+
+            if (newPanels.length) {
+                uncapCardWidth(host);
+
+                newPanels.forEach(panel => {
+                    const selectBtn = panel.querySelector(`.${SELECT_BTN_CLASS}`);
+                    if (selectBtn) {
+                        reserveLabelWidth(selectBtn, `Deselect all ${plural(panelName(panel))}`);
+                    }
+                });
+
+                host.querySelector(`.${SEARCH_CLASS}`)?.focus();
+            }
+        });
     }
 
     // =====================================================================
@@ -638,12 +926,19 @@
         }
     }
 
-    // Line on the right edge of each header cell, where the resize handle is.
-    // An inset shadow instead of a border, so the cell size doesn't change.
     const STYLE_ID = 'tm-helloid-ux-styles';
     const STYLES = `
+        /* Line on the right edge of each header cell, where the resize
+           handle is. An inset shadow instead of a border, so the cell size
+           doesn't change. */
         ${AG_GRIDS} .ag-header-cell {
             box-shadow: inset -1px 0 0 #f0f0f0;
+        }
+
+        /* Filter panels show all items now (see the slice patch), so the
+           "Maximum of 50 entries shown" warning no longer applies. */
+        helloid-filter-panels i.fa-warning[title^="Maximum of ${FILTER_PANEL_LIMIT} entries"] {
+            display: none;
         }
     `;
 
@@ -683,6 +978,7 @@
                 if (isEntitlementsPage()) addFilterOptions();
                 addStyles();
                 addCopyButtons();
+                addFilterPanelSearch();
                 makeGridsResizable();
             });
         });
