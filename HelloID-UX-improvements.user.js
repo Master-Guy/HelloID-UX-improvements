@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-30.1
+// @version      2026-09-30.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -499,10 +499,15 @@
         if (el.textContent !== text) el.textContent = text;
     }
 
-    // Every word must appear in the name, in any order, ignoring case
+    // Search: every word must appear in the name, in any order, ignoring case
+    const toWords = (text) => (text ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+    const matchesWords = (name, words) => {
+        const n = name.toLowerCase();
+        return words.every(w => n.includes(w));
+    };
+
     function searchWords(host) {
-        const input = host.querySelector(`.${SEARCH_CLASS}`);
-        return (input?.value ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+        return toWords(host.querySelector(`.${SEARCH_CLASS}`)?.value);
     }
 
     function refreshFilterPanels(host) {
@@ -515,8 +520,7 @@
             if (isSearchable(panel)) {
                 // Show/hide items
                 items.forEach(item => {
-                    const name = (item.title || item.textContent).toLowerCase();
-                    const show = words.every(w => name.includes(w)) &&
+                    const show = matchesWords(item.title || item.textContent, words) &&
                                  (!checkedOnly || itemCheckbox(item)?.checked);
                     const display = show ? '' : 'none';
                     if (item.style.display !== display) item.style.display = display;
@@ -587,17 +591,25 @@
         return btn;
     }
 
-    function createSearchBox(host) {
+    // Search input in HelloID's own form style
+    function createSearchInput(onInput) {
         const input = document.createElement('input');
         input.type = 'search';
         input.placeholder = 'Search...';
-        input.className = `form-control input-sm m-t-10 ${SEARCH_CLASS}`;
-        Object.assign(input.style, { width: '100%', height: '24px' });
-        input.addEventListener('input', () => refreshFilterPanels(host));
+        input.className = 'form-control input-sm';
+        input.style.height = '24px';
+        input.addEventListener('input', onInput);
         // Keep typing away from the page's own key handlers
         input.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') e.stopPropagation();
         });
+        return input;
+    }
+
+    function createSearchBox(host) {
+        const input = createSearchInput(() => refreshFilterPanels(host));
+        input.classList.add('m-t-10', SEARCH_CLASS);
+        input.style.width = '100%';
         return input;
     }
 
@@ -809,22 +821,6 @@
                 (b) => cellTextWithout(cell, b),
                 'btn btn-default btn-xs'
             );
-            // Pin the button to the right edge of the cell
-            Object.assign(btn.style, {
-                position: 'absolute',
-                right: '4px',
-                top: '50%',
-                transform: 'translateY(-50%)',
-            });
-
-            // Positioning context for the button (AG Grid cells normally
-            // already are, but just in case)
-            if (getComputedStyle(cell).position === 'static') {
-                cell.style.position = 'relative';
-            }
-
-            // Reserve room so long names end in "..." before the button
-            cell.style.paddingRight = '36px';
 
             // Show the full name on hover. Set at hover time, since the
             // grid recycles cells while scrolling.
@@ -832,13 +828,604 @@
                 cell.title = cellTextWithout(cell, btn).trim();
             });
 
-            cell.appendChild(btn);
+            pinButtons(cell, btn);
         });
+    }
+
+    // Pin one or more small buttons to the right edge of a cell
+    function pinButtons(cell, ...buttons) {
+        const group = document.createElement('span');
+        Object.assign(group.style, {
+            position: 'absolute',
+            right: '4px',
+            top: '50%',
+            transform: 'translateY(-50%)',
+            display: 'flex',
+            gap: '2px',
+        });
+        group.append(...buttons);
+
+        // Positioning context for the buttons, unless the cell already is
+        // one (AG Grid cells; sticky list headers). The list's own cells
+        // get it from the CSS, as they aren't on the page yet here.
+        if (getComputedStyle(cell).position === 'static') cell.style.position = 'relative';
+
+        // Reserve room so long names end in "..." before the buttons
+        cell.style.paddingRight = `${8 + 28 * buttons.length}px`;
+
+        cell.appendChild(group);
     }
 
     function addCopyButtons() {
         addSystemTileCopyButtons();
         addRuleGridCopyButtons();
+    }
+
+    // =====================================================================
+    // Target systems overview: list view
+    // =====================================================================
+    // Shows the target system tiles as a table: one row per system, with
+    // resizable columns and a search on name. The tiles stay on the page
+    // (hidden) and are the data source: the list is rebuilt whenever
+    // HelloID updates them, and the list's Configure button clicks the
+    // tile's own button. A toggle switches back to the tiles.
+
+    const SYSTEM_TILE = 'helloid-provisioning-system-tile';
+    const SYSTEM_LIST_CLASS = 'tm-system-list';
+    const RESIZE_HANDLE_CLASS = 'tm-col-resize';
+    const VIEW_KEY = 'systemsView'; // 'list' or 'tiles'
+
+    // Shorter column headers for some of the tile's labels
+    const LABEL_RENAMES = { 'Actions completed': 'Actions' };
+
+    // Starting widths (px); the name column takes the remaining space,
+    // but never less than nameMin. The info columns (Summary since, ...)
+    // start small and grow to their widest header or value.
+    const COLUMN_WIDTHS = { nameMin: 250, info: 40, progress: 120, action: 45 };
+
+    // Info columns shown centered, without "..." (after LABEL_RENAMES)
+    const CENTERED_LABELS = new Set(['Actions']);
+
+    const FIT_CLASS = 'tm-fit'; // header of a column that fits its content
+
+    // Symbols HelloID shows next to a system's name. Each gets a filter
+    // button in the Name header: grey = off, black = only systems with
+    // that symbol (same colors as the Entitlements filters). With several
+    // on, a system needs all of them.
+    const SYSTEM_FLAGS = [
+        { key: 'warning',  icon: 'fa-solid fa-warning',   match: '.fa-warning',   label: 'systems with warnings' },
+        { key: 'disabled', icon: 'fa-solid fa-power-off', match: '.fa-power-off', label: 'disabled systems' },
+    ];
+    const FLAG_FILTERS_KEY = 'systemFlagFilters';
+
+    const activeFlags = () => GM_getValue(FLAG_FILTERS_KEY, []);
+
+    // Keys of the SYSTEM_FLAGS shown on a tile
+    function tileFlags(tile) {
+        const extras = tile.querySelector('h5.system-header')?.parentElement?.nextElementSibling;
+        return SYSTEM_FLAGS.filter(f => extras?.querySelector(f.match)).map(f => f.key);
+    }
+
+    const matchesFlags = (flags, active) => active.every(k => flags.includes(k));
+
+    let systemList = null; // { container, wrapper, table, search, count, observer, signature, headSignature }
+
+    const isListView = () => GM_getValue(VIEW_KEY, 'list') === 'list';
+    const uniqueBy = (arr, key) => [...new Map(arr.map(x => [key(x), x])).values()];
+
+    // Everything shown on a tile, read from its DOM
+    function readTile(tile) {
+        const nameEl = tile.querySelector('h5.system-header');
+
+        // "Summary since:", "Last updated:", ... label/value pairs
+        const info = [];
+        tile.querySelectorAll('.card-body small').forEach(label => {
+            const text = label.textContent.trim();
+            const value = label.nextElementSibling;
+            if (text.endsWith(':') && value?.tagName === 'SMALL') {
+                info.push({ label: text.slice(0, -1), value: value.textContent.trim() });
+            }
+        });
+
+        const actions = [...tile.querySelectorAll('.recent-actions .badge')].map(badge => {
+            const texts = badge.querySelector('.flex-col')?.children ?? [];
+            // Status icon on the right of the badge, e.g. the green check
+            // "Action(s) are completed"
+            const status = badge.querySelector('.justify-end i');
+            return {
+                name: texts[0]?.textContent.trim() ?? '',
+                count: texts[1]?.textContent.trim() ?? '',
+                icon: badge.querySelector('i.fa-fw')?.className ?? '',
+                statusTitle: status?.title ?? '',
+                // Its color (text-success, ...), used for the number
+                statusClass: [...(status?.classList ?? [])].filter(c => c.startsWith('text-')).join(' '),
+            };
+        });
+
+        return {
+            name: nameEl?.textContent.trim() ?? '',
+            // Extra symbols next to the name (warning, disabled)
+            extras: nameEl?.parentElement?.nextElementSibling ?? null,
+            flags: tileFlags(tile),
+            icon: tile.querySelector('helloid-connector-icon img')?.src ?? '',
+            info,
+            progress: tile.querySelector('circle-progress tspan')?.textContent.trim() ?? '',
+            progressColor: tile.querySelector('circle-progress path')?.getAttribute('stroke') ?? '',
+            actions,
+            // "Recent actions" and the explanation behind its (i) icon
+            recentLabel: tile.querySelector('.recent-actions > span strong')?.textContent.trim() ?? '',
+            recentInfo: tile.querySelector('.recent-actions > span i')?.title ?? '',
+        };
+    }
+
+    // Changes when anything shown in the list changes
+    function systemsSignature(rows) {
+        return JSON.stringify(rows.map(r => [
+            r.name, r.icon, r.info, r.progress, r.progressColor, r.extras?.innerHTML, r.actions,
+        ]));
+    }
+
+    function columnModel(rows) {
+        const withRecent = rows.find(r => r.recentLabel);
+        return {
+            infoLabels: [...new Set(rows.flatMap(r => r.info.map(i => i.label)))],
+            actions: uniqueBy(rows.flatMap(r => r.actions), a => a.name)
+                .map(a => ({ name: a.name, icon: a.icon })),
+            recentLabel: withRecent?.recentLabel || 'Recent actions',
+            recentInfo: withRecent?.recentInfo ?? '',
+        };
+    }
+
+    // --- Column resizing ---
+
+    // Before the first resize: fix every column at its current width, so
+    // dragging one column doesn't redistribute the others
+    function freezeColumnWidths(table) {
+        if (table.dataset.frozen) return;
+        const cols = [...table.querySelectorAll('col')];
+        const ths = [...table.querySelectorAll('thead th')];
+        cols.forEach((col, i) => { col.style.width = `${ths[i].offsetWidth}px`; });
+        table.dataset.frozen = '1';
+        // From now on the column widths decide
+        updateTableWidth(table);
+    }
+
+    function updateTableWidth(table) {
+        const total = [...table.querySelectorAll('col')]
+            .reduce((sum, col) => sum + parseFloat(col.style.width || 0), 0);
+        table.style.width = `${total}px`;
+    }
+
+    // Until the first resize: full width, but always room for the names;
+    // on narrow screens the table scrolls sideways. (min-width doesn't
+    // work reliably on tables, so this goes in width itself.)
+    function setAutoTableWidth(table) {
+        const fixed = [...table.querySelectorAll('col')].slice(1) // all but the name
+            .reduce((sum, col) => sum + parseFloat(col.style.width || 0), 0);
+        table.style.width = `max(100%, ${fixed + COLUMN_WIDTHS.nameMin}px)`;
+    }
+
+    // Widen the fit-to-content columns to their widest header or value.
+    // Skipped once the user resized a column, and while the list is hidden
+    // (nothing to measure).
+    function fitColumnsToContent(table) {
+        if (table.dataset.frozen) return;
+        const cols = [...table.querySelectorAll('col')];
+        const rows = [...table.querySelectorAll('tbody tr')];
+        let changed = false;
+        table.querySelectorAll('thead th').forEach((th, i) => {
+            if (!th.classList.contains(FIT_CLASS)) return;
+            // scrollWidth: the full content width, also when cut off
+            const cells = [th, ...rows.map(r => r.children[i]).filter(Boolean)];
+            const needed = Math.max(...cells.map(c => c.scrollWidth));
+            if (!needed) return;
+            if (needed > (parseFloat(cols[i].style.width) || 0)) {
+                cols[i].style.width = `${needed}px`;
+                changed = true;
+            }
+        });
+        if (changed) setAutoTableWidth(table);
+    }
+
+    function addResizeHandle(table, th, index) {
+        const handle = document.createElement('div');
+        handle.className = RESIZE_HANDLE_CLASS;
+        handle.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            freezeColumnWidths(table);
+            const col = table.querySelectorAll('col')[index];
+            const startX = e.clientX;
+            const startWidth = parseFloat(col.style.width);
+
+            const onMove = (ev) => {
+                col.style.width = `${Math.max(30, startWidth + ev.clientX - startX)}px`;
+                updateTableWidth(table);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', () => {
+                document.removeEventListener('mousemove', onMove);
+            }, { once: true });
+        });
+        th.appendChild(handle);
+    }
+
+    // --- Table ---
+
+    function buildSystemsHead(table, model) {
+        table.querySelector('colgroup')?.remove();
+        table.querySelector('thead')?.remove();
+        delete table.dataset.frozen;
+
+        // Column widths
+        const colgroup = document.createElement('colgroup');
+        const hasActions = model.actions.length > 0;
+        const widths = [
+            ...model.infoLabels.map(() => COLUMN_WIDTHS.info),
+            COLUMN_WIDTHS.progress,
+            ...(hasActions ? [COLUMN_WIDTHS.action] : []), // recent actions total
+            ...model.actions.map(() => COLUMN_WIDTHS.action),
+        ];
+        [null, ...widths].forEach(w => { // null: name, takes the remaining space
+            const col = document.createElement('col');
+            if (w) col.style.width = `${w}px`;
+            colgroup.appendChild(col);
+        });
+        const th = (content, title) => {
+            const cell = document.createElement('th');
+            if (content instanceof Node) cell.appendChild(content);
+            else cell.textContent = content ?? '';
+            if (title) cell.title = title;
+            return cell;
+        };
+        // Header with only an icon; the title shows on hover
+        const iconTh = (iconClass, title) => {
+            const icon = document.createElement('i');
+            icon.className = iconClass;
+            const cell = th(icon, title);
+            cell.classList.add('tm-center');
+            return cell;
+        };
+
+        const thead = document.createElement('thead');
+        const headRow = document.createElement('tr');
+
+        // Name, with the symbol filter buttons pinned right
+        const nameTh = th('Name');
+        pinButtons(nameTh, ...SYSTEM_FLAGS.map(createFlagButton));
+        nameTh.style.paddingRight = '110px'; // room for the buttons with their counts
+        headRow.appendChild(nameTh);
+        model.infoLabels.forEach(l => {
+            const label = LABEL_RENAMES[l] ?? l;
+            const cell = th(label, l);
+            cell.classList.add(FIT_CLASS);
+            if (CENTERED_LABELS.has(label)) cell.classList.add('tm-center');
+            headRow.appendChild(cell);
+        });
+        headRow.appendChild(th('Progress'));
+        if (hasActions) {
+            // Recent actions: (i) icon, with the tile's explanation on hover
+            const info = [model.recentLabel, model.recentInfo].filter(Boolean).join('\n\n');
+            headRow.appendChild(iconTh('fa-solid fa-info-circle', info));
+        }
+        model.actions.forEach(a => headRow.appendChild(iconTh(a.icon, a.name)));
+        thead.appendChild(headRow);
+
+        [...headRow.children].forEach((cell, i) => addResizeHandle(table, cell, i));
+
+        table.prepend(colgroup, thead);
+        setAutoTableWidth(table);
+    }
+
+    // Filter button for one of the SYSTEM_FLAGS; its look and count are
+    // updated in applySystemsView()
+    function createFlagButton(flag) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-default btn-xs';
+        btn.dataset.flag = flag.key;
+        const icon = document.createElement('i');
+        icon.className = flag.icon;
+        btn.append(icon, ' ', document.createElement('span'));
+        btn.addEventListener('mousedown', (e) => e.stopPropagation());
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const active = activeFlags();
+            GM_setValue(FLAG_FILTERS_KEY, active.includes(flag.key)
+                ? active.filter(k => k !== flag.key)
+                : [...active, flag.key]);
+            applySystemsView();
+        });
+        return btn;
+    }
+
+    function findTileByName(name) {
+        return [...document.querySelectorAll(SYSTEM_TILE)]
+            .find(t => t.querySelector('h5.system-header')?.textContent.trim() === name);
+    }
+
+    function buildSystemRow(row, model) {
+        const tr = document.createElement('tr');
+        tr.dataset.name = row.name;
+        tr.dataset.flags = row.flags.join(' ');
+        const td = (text) => {
+            const cell = document.createElement('td');
+            if (text != null) {
+                cell.textContent = text;
+                cell.title = text;
+            }
+            tr.appendChild(cell);
+            return cell;
+        };
+
+        // Name: icon, name, extra labels; copy and configure buttons pinned
+        // right. Plain inline content, so the cell's own "..." cuts it off.
+        const nameCell = td();
+        nameCell.title = row.name;
+        if (row.icon) {
+            const img = document.createElement('img');
+            img.src = row.icon;
+            img.className = 'tm-system-icon';
+            nameCell.appendChild(img);
+        }
+        nameCell.append(row.name);
+        if (row.extras?.children.length) {
+            const extras = row.extras.cloneNode(true);
+            extras.classList.add('tm-system-extras');
+            nameCell.appendChild(extras);
+        }
+
+        // Configure: clicks the tile's own button, so HelloID handles it
+        const configure = document.createElement('button');
+        configure.type = 'button';
+        configure.className = 'btn btn-default btn-xs';
+        configure.title = 'Configure';
+        configure.innerHTML = '<i aria-hidden="true" class="fa-solid fa-wrench"></i>';
+        configure.addEventListener('click', () => {
+            findTileByName(row.name)?.querySelector('button[title="Configure" i]')?.click();
+        });
+
+        pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'), configure);
+
+        // Summary since, Last updated, Actions, ...
+        model.infoLabels.forEach(label => {
+            const cell = td(row.info.find(i => i.label === label)?.value ?? '');
+            if (CENTERED_LABELS.has(LABEL_RENAMES[label] ?? label)) cell.classList.add('tm-center');
+        });
+
+        // Progress: HelloID's progress bar instead of the circle
+        const progressCell = td();
+        if (row.progress) {
+            const pct = parseFloat(row.progress) || 0;
+            progressCell.title = `${row.progress}%`;
+            progressCell.innerHTML = `
+                <div class="tm-progress">
+                    <div class="progress"><div class="progress-bar"></div></div>
+                    <small></small>
+                </div>`;
+            const bar = progressCell.querySelector('.progress-bar');
+            bar.style.width = `${pct}%`;
+            if (row.progressColor) bar.style.backgroundColor = row.progressColor;
+            progressCell.querySelector('small').textContent = `${row.progress}%`;
+        }
+
+        // Recent actions: the total, then one number per action. A number
+        // gets the color of the tile's status icon (e.g. green when
+        // completed); the status shows on hover.
+        if (model.actions.length) {
+            const total = row.actions.reduce((sum, a) => sum + (parseInt(a.count, 10) || 0), 0);
+            const totalCell = td(String(total));
+            totalCell.classList.add('tm-center');
+            totalCell.title = `${model.recentLabel}: ${total}`;
+        }
+        model.actions.forEach(({ name }) => {
+            const action = row.actions.find(a => a.name === name);
+            const cell = td(action?.count ?? '');
+            cell.classList.add('tm-center');
+            if (!action) return;
+            if (action.statusClass) cell.className += ` ${action.statusClass}`;
+            cell.title = `${name}: ${action.count}` + (action.statusTitle ? `\n${action.statusTitle}` : '');
+        });
+
+        return tr;
+    }
+
+    // --- Search, view toggle ---
+
+    function applySystemsView() {
+        if (!systemList) return;
+        const { wrapper, table, search, count } = systemList;
+        const list = isListView();
+        const words = toWords(search.value);
+        const active = activeFlags();
+
+        let shown = 0;
+        let total = 0;
+        const flagCounts = {};
+        table.querySelectorAll('tbody tr').forEach(tr => {
+            total++;
+            const flags = tr.dataset.flags.split(' ').filter(Boolean);
+            flags.forEach(k => { flagCounts[k] = (flagCounts[k] ?? 0) + 1; });
+            const match = matchesWords(tr.dataset.name, words) && matchesFlags(flags, active);
+            if (match) shown++;
+            const display = match ? '' : 'none';
+            if (tr.style.display !== display) tr.style.display = display;
+        });
+
+        // Tiles: hidden in list view, filtered the same way otherwise
+        document.querySelectorAll(SYSTEM_TILE).forEach(tile => {
+            const name = tile.querySelector('h5.system-header')?.textContent ?? '';
+            const match = matchesWords(name, words) && matchesFlags(tileFlags(tile), active);
+            const display = !list && match ? '' : 'none';
+            if (tile.style.display !== display) tile.style.display = display;
+        });
+
+        // Symbol filter buttons: color (off/on) and how many systems match
+        table.querySelectorAll('thead button[data-flag]').forEach(btn => {
+            const flag = SYSTEM_FLAGS.find(f => f.key === btn.dataset.flag);
+            const on = active.includes(flag.key);
+            const n = flagCounts[flag.key] ?? 0;
+            const color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
+            if (btn.style.color !== color) btn.style.color = color;
+            setText(btn.querySelector('span'), String(n));
+            const title = on
+                ? `Showing only ${flag.label} (${n}). Click to show all.`
+                : `Show only ${flag.label} (${n})`;
+            if (btn.title !== title) btn.title = title;
+        });
+
+        wrapper.querySelector('.tm-system-table-card').style.display = list ? '' : 'none';
+        const filtering = words.length > 0 || active.length > 0;
+        setText(count, filtering ? `${shown} of ${total} systems` : `${total} systems`);
+
+        const toggle = wrapper.querySelector('.tm-view-toggle');
+        const icon = toggle.querySelector('i');
+        const iconClass = list ? 'fa-solid fa-grip' : 'fa-solid fa-list';
+        if (icon.className !== iconClass) icon.className = iconClass;
+        setText(toggle.querySelector('span'), list ? 'Tile view' : 'List view');
+
+        if (list) {
+            fitColumnsToContent(table);
+            fitListHeight();
+        }
+    }
+
+    // The page area has a fixed height and doesn't scroll along with the
+    // list, so the list scrolls itself: as tall as the space from its top
+    // to the bottom of the visible page area (or the window).
+    function fitListHeight() {
+        if (!systemList) return;
+        const scroller = systemList.wrapper.querySelector('.tm-system-scroller');
+        const top = scroller.getBoundingClientRect().top;
+
+        let bottom = window.innerHeight;
+        for (let el = systemList.wrapper.parentElement; el && el !== document.body; el = el.parentElement) {
+            const style = getComputedStyle(el);
+            if (style.overflowY !== 'visible') {
+                const rect = el.getBoundingClientRect();
+                bottom = Math.min(bottom, rect.bottom - (parseFloat(style.paddingBottom) || 0));
+                break;
+            }
+        }
+
+        const margin = 12; // card margin + border
+        const height = `${Math.max(200, Math.floor(bottom - top - margin))}px`;
+        if (scroller.style.maxHeight !== height) scroller.style.maxHeight = height;
+    }
+
+    function createSystemListWrapper() {
+        const wrapper = document.createElement('div');
+        wrapper.className = SYSTEM_LIST_CLASS;
+
+        const toolbar = document.createElement('div');
+        toolbar.className = 'tm-system-toolbar';
+
+        const search = createSearchInput(applySystemsView);
+        search.style.width = '250px';
+
+        const count = document.createElement('small');
+        count.className = 'text-muted';
+
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-default btn-xs tm-view-toggle';
+        toggle.append(document.createElement('i'), ' ', document.createElement('span'));
+        toggle.addEventListener('click', () => {
+            GM_setValue(VIEW_KEY, isListView() ? 'tiles' : 'list');
+            applySystemsView();
+        });
+
+        toolbar.append(search, count, toggle);
+
+        const card = document.createElement('div');
+        card.className = 'card tm-system-table-card';
+        const scroller = document.createElement('div');
+        scroller.className = 'tm-system-scroller';
+        const table = document.createElement('table');
+        table.className = 'table table-hover';
+        table.appendChild(document.createElement('tbody'));
+        scroller.appendChild(table);
+        card.appendChild(scroller);
+
+        wrapper.append(toolbar, card);
+        return { wrapper, table, search, count };
+    }
+
+    // Rebuild the rows (and the header, if the columns changed) from the tiles
+    function renderSystemList() {
+        if (!systemList) return;
+        const rows = [...document.querySelectorAll(SYSTEM_TILE)].map(readTile);
+        const signature = systemsSignature(rows);
+
+        if (signature !== systemList.signature) {
+            systemList.signature = signature;
+            const model = columnModel(rows);
+            const headSignature = JSON.stringify([model.infoLabels, model.actions]);
+            if (headSignature !== systemList.headSignature) {
+                systemList.headSignature = headSignature;
+                buildSystemsHead(systemList.table, model);
+            }
+            const tbody = document.createElement('tbody');
+            rows.forEach(r => tbody.appendChild(buildSystemRow(r, model)));
+            systemList.table.querySelector('tbody').replaceWith(tbody);
+        }
+
+        applySystemsView();
+    }
+
+    function removeSystemList() {
+        window.removeEventListener('resize', fitListHeight);
+        systemList.observer.disconnect();
+        systemList.wrapper.remove();
+        systemList = null;
+    }
+
+    function setupSystemList() {
+        // Left the page: clean up
+        if (systemList && !systemList.container.isConnected) removeSystemList();
+
+        const firstTile = document.querySelector(SYSTEM_TILE);
+        if (!firstTile) return;
+        const container = firstTile.parentElement;
+        if (systemList?.container === container) return;
+        if (systemList) removeSystemList();
+
+        const parts = createSystemListWrapper();
+        container.before(parts.wrapper);
+
+        // If the tiles sit in a flex row, the list takes a full row of its
+        // own, and the row may wrap so the list doesn't squeeze the tiles.
+        // (Not in a flex column: there flex-basis 100% would mean the full
+        // height, pushing the tiles out of view in tile view.)
+        const parentStyle = getComputedStyle(container.parentElement);
+        if (parentStyle.display.includes('flex') && parentStyle.flexDirection.startsWith('row')) {
+            parts.wrapper.style.flexBasis = '100%';
+            if (parentStyle.flexWrap === 'nowrap') container.parentElement.style.flexWrap = 'wrap';
+        }
+
+        // Re-read the tiles whenever HelloID changes them (counts, dates,
+        // progress). Text changes don't show up in the page-wide observer.
+        let pending = false;
+        const observer = new MutationObserver(() => {
+            if (pending) return;
+            pending = true;
+            requestAnimationFrame(() => {
+                pending = false;
+                renderSystemList();
+            });
+        });
+        observer.observe(container, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributes: true,
+            attributeFilter: ['src', 'd', 'title', 'class'],
+        });
+
+        systemList = { container, observer, signature: null, headSignature: null, ...parts };
+        window.addEventListener('resize', fitListHeight);
+        renderSystemList();
     }
 
     // =====================================================================
@@ -927,13 +1514,96 @@
     }
 
     const STYLE_ID = 'tm-helloid-ux-styles';
+
+    // Line on the right edge of each header cell, where the resize handle
+    // is. An inset shadow instead of a border, so the cell size doesn't change.
+    const HEADER_SEPARATOR = 'inset -1px 0 0 #f0f0f0';
+
     const STYLES = `
-        /* Line on the right edge of each header cell, where the resize
-           handle is. An inset shadow instead of a border, so the cell size
-           doesn't change. */
         ${AG_GRIDS} .ag-header-cell {
-            box-shadow: inset -1px 0 0 #f0f0f0;
+            box-shadow: ${HEADER_SEPARATOR};
         }
+
+        /* Target systems list view: full width, only as tall as its content
+           (in a flex row, setupSystemList() also gives it a row of its own) */
+        .${SYSTEM_LIST_CLASS} {
+            width: 100%;
+            flex: 0 0 auto;
+        }
+        .tm-system-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .tm-system-toolbar .tm-view-toggle { margin-left: auto; }
+        /* Two classes, so it wins over HelloID's own .card width */
+        .${SYSTEM_LIST_CLASS} .tm-system-table-card {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0;
+            margin-bottom: 10px;
+        }
+        /* Scrolls both ways; the height is set by fitListHeight() */
+        .tm-system-scroller { overflow: auto; }
+        .${SYSTEM_LIST_CLASS} table {
+            table-layout: fixed;
+            width: 100%;
+            margin-bottom: 0;
+        }
+        /* Positioning context for the pinned buttons */
+        .${SYSTEM_LIST_CLASS} td { position: relative; }
+        .${SYSTEM_LIST_CLASS} th,
+        .${SYSTEM_LIST_CLASS} td {
+            vertical-align: middle !important;
+            text-align: left;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Narrow number/icon columns: centered, little side padding, and
+           no "..." (a short number never needs it) */
+        .${SYSTEM_LIST_CLASS} th.tm-center,
+        .${SYSTEM_LIST_CLASS} td.tm-center {
+            text-align: center !important;
+            padding-left: 2px !important;
+            padding-right: 2px !important;
+            text-overflow: clip;
+        }
+        /* Header stays visible while scrolling. Sticky is also the
+           positioning context for the resize handles. The bottom line is
+           a shadow too: a table border would scroll away with the rows. */
+        .${SYSTEM_LIST_CLASS} th {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            color: #000 !important; /* HelloID's table headers are grey */
+            background-color: #fff;
+            box-shadow: ${HEADER_SEPARATOR}, inset 0 -2px 0 #ddd;
+        }
+        .${RESIZE_HANDLE_CLASS} {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 6px;
+            height: 100%;
+            cursor: col-resize;
+            z-index: 1;
+        }
+        .${SYSTEM_LIST_CLASS} .tm-system-icon {
+            width: 20px !important;
+            height: 20px !important;
+            object-fit: contain;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        .${SYSTEM_LIST_CLASS} .tm-system-extras {
+            display: inline-flex;
+            vertical-align: middle;
+            margin-left: 6px;
+        }
+        .tm-progress { display: flex; align-items: center; gap: 6px; }
+        .tm-progress .progress { flex: 1; height: 10px; margin: 0; }
 
         /* Filter panels show all items now (see the slice patch), so the
            "Maximum of 50 entries shown" warning no longer applies. */
@@ -978,6 +1648,7 @@
                 if (isEntitlementsPage()) addFilterOptions();
                 addStyles();
                 addCopyButtons();
+                setupSystemList();
                 addFilterPanelSearch();
                 makeGridsResizable();
             });
