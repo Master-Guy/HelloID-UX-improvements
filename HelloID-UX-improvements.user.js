@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-30.3
+// @version      2026-09-30.4
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -838,9 +838,12 @@
         });
     }
 
+    const PINNED_CLASS = 'tm-pinned-buttons';
+
     // Pin one or more small buttons to the right edge of a cell
     function pinButtons(cell, ...buttons) {
         const group = document.createElement('span');
+        group.className = PINNED_CLASS;
         Object.assign(group.style, {
             position: 'absolute',
             right: '4px',
@@ -931,6 +934,117 @@
 
     const matchesFlags = (flags, active) => active.every(k => flags.includes(k));
 
+    // Sortable columns: the name, and these info columns (dates). Each has
+    // a sort button in its header: "-" (not sorted on this column), ▼ or ▲.
+    // HelloID's own order is by name, ascending: that's the default.
+    const SORTABLE_LABELS = new Set(['Summary since', 'Last updated']);
+    const NAME_SORT_KEY = 'name';
+    const DEFAULT_SORT = Object.freeze({ column: NAME_SORT_KEY, dir: 'asc' });
+    const SORT_KEY = 'tm-helloid-system-sort'; // in sessionStorage: { column, dir }, null = default
+
+    const getSort = () => {
+        const sort = sessionGet(SORT_KEY, null);
+        return isPlainObject(sort) && sort.column && sort.dir ? sort : null;
+    };
+    const effectiveSort = () => getSort() ?? DEFAULT_SORT;
+
+    // Dates like "04/09/2026, 7:26" or "4/9/26 7:26 PM" (or year first)
+    const DATE_RE = /(\d{1,4})\D(\d{1,2})\D(\d{2,4})(?:\D+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap])?\.?m?\.?)?/i;
+
+    // Day-month or month-day: from the dates themselves when one gives it
+    // away (a number above 12), otherwise from the browser's locale
+    function detectDateOrder(values) {
+        for (const value of values) {
+            const m = value.match(DATE_RE);
+            if (!m || m[1].length === 4) continue;
+            if (+m[1] > 12) return 'dmy';
+            if (+m[2] > 12) return 'mdy';
+        }
+        const parts = new Intl.DateTimeFormat().formatToParts(new Date(2000, 11, 31))
+            .map(p => p.type).filter(t => t === 'day' || t === 'month');
+        return parts[0] === 'month' ? 'mdy' : 'dmy';
+    }
+
+    // Timestamp, or null for no date (e.g. "-")
+    function parseDate(text, order) {
+        const m = text.match(DATE_RE);
+        if (!m) return null;
+        const [, a, b, c, hour = '0', minute = '0', second = '0', ampm] = m;
+        let [year, month, day] = a.length === 4 ? [a, b, c]
+            : order === 'mdy' ? [c, a, b]
+            : [c, b, a];
+        year = +year < 100 ? 2000 + +year : +year;
+        let h = +hour;
+        if (ampm) h = (h % 12) + (/p/i.test(ampm) ? 12 : 0);
+        return new Date(year, month - 1, +day, h, +minute, +second).getTime();
+    }
+
+    // Sort button. Dates: first click descending, then ascending, then back
+    // to the default (name ascending). Name: ascending (the default, also
+    // the first click while a date is sorted), then descending, then
+    // ascending again; never back to "-". The look is updated in
+    // applySystemsView().
+    function createSortButton(key) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-default btn-xs';
+        btn.dataset.sort = key;
+        // Fixed width: "-" is narrower than ▲/▼
+        Object.assign(btn.style, {
+            width: '22px',
+            paddingLeft: '0',
+            paddingRight: '0',
+            textAlign: 'center',
+        });
+        btn.addEventListener('mousedown', (e) => e.stopPropagation());
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const current = effectiveSort();
+            let next = current.column !== key
+                    ? { column: key, dir: key === NAME_SORT_KEY ? 'asc' : 'desc' }
+                : current.dir === 'desc' ? { column: key, dir: 'asc' }
+                : key === NAME_SORT_KEY ? { column: key, dir: 'desc' }
+                : null;
+            // Name ascending is the default; stored as "no sort"
+            if (next?.column === DEFAULT_SORT.column && next.dir === DEFAULT_SORT.dir) next = null;
+            sessionSet(SORT_KEY, next);
+            applySystemsView();
+        });
+        return btn;
+    }
+
+    // Put the rows in the chosen order. By name: HelloID's order (which is
+    // by name), or exactly that reversed. By date: empty values (no date)
+    // always last, ties in HelloID's order. Only touches the DOM when the
+    // order changes.
+    function sortSystemRows(table) {
+        const tbody = table.querySelector('tbody');
+        const rows = [...tbody.children];
+        const sort = effectiveSort();
+        const byName = sort.column === NAME_SORT_KEY;
+        const column = byName ? -1
+            : [...table.querySelectorAll('thead th')].findIndex(th => th.dataset.sortKey === sort.column);
+
+        const sorted = [...rows].sort((a, b) => {
+            const ia = +a.dataset.index;
+            const ib = +b.dataset.index;
+            if (byName) return sort.dir === 'desc' ? ib - ia : ia - ib;
+            if (column >= 0) {
+                const va = a.children[column]?.dataset.sortValue ?? '';
+                const vb = b.children[column]?.dataset.sortValue ?? '';
+                if (!va !== !vb) return va ? -1 : 1;
+                if (va) {
+                    const c = Number(va) - Number(vb);
+                    if (c) return sort.dir === 'desc' ? -c : c;
+                }
+            }
+            return ia - ib;
+        });
+
+        if (sorted.some((tr, i) => tr !== rows[i])) tbody.append(...sorted);
+    }
+
     let systemList = null; // { container, wrapper, table, search, count, observer, signature, headSignature }
 
     const isListView = () => GM_getValue(VIEW_KEY, 'list') === 'list';
@@ -1006,6 +1120,8 @@
                 })),
             recentLabel: withRecent?.recentLabel || 'Recent actions',
             recentInfo: withRecent?.recentInfo ?? '',
+            dateOrder: detectDateOrder(rows.flatMap(r => r.info
+                .filter(i => SORTABLE_LABELS.has(i.label)).map(i => i.value))),
         };
     }
 
@@ -1038,19 +1154,60 @@
         table.style.width = `max(100%, ${fixed + COLUMN_WIDTHS.nameMin}px)`;
     }
 
+    // Width a cell needs for its text on one line, plus its padding (which
+    // includes the room reserved for pinned buttons). The text is measured
+    // as laid out in the cell: the "..." is only drawn over that, so this is
+    // the full width, also when cut off. (scrollWidth leaves out the right
+    // padding then.)
+    const measureRange = document.createRange();
+
+    function neededWidth(cell) {
+        let textWidth = 0;
+        cell.childNodes.forEach(n => {
+            if (n.nodeType !== Node.TEXT_NODE || !n.textContent.trim()) return;
+            measureRange.selectNodeContents(n);
+            textWidth += measureRange.getBoundingClientRect().width;
+        });
+        const style = getComputedStyle(cell);
+        const extra = ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth']
+            .reduce((sum, p) => sum + (parseFloat(style[p]) || 0), 0);
+        return Math.ceil(textWidth + extra) + 2; // +2: rounding
+    }
+
+    // Line the header buttons up with the header text: the text doesn't sit
+    // in the middle of the cell, so centering the buttons on the cell puts
+    // them off. Measure where the buttons actually are and move them by the
+    // difference, which also covers any margins HelloID's button styles add.
+    function alignHeaderButtons(table) {
+        table.querySelectorAll('thead th').forEach(th => {
+            const group = th.querySelector(`.${PINNED_CLASS}`);
+            const button = group?.querySelector('button');
+            const text = [...th.childNodes]
+                .find(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim());
+            if (!button || !text) return;
+            measureRange.selectNodeContents(text);
+            const textRect = measureRange.getBoundingClientRect();
+            const buttonRect = button.getBoundingClientRect();
+            if (!textRect.height || !buttonRect.height) return; // not visible
+            const delta = (textRect.top + textRect.height / 2) - (buttonRect.top + buttonRect.height / 2);
+            if (Math.abs(delta) < 0.5) return;
+            // offsetTop: the current "top" in px (transforms not included)
+            group.style.top = `${Math.round((group.offsetTop + delta) * 2) / 2}px`;
+        });
+    }
+
     // Widen the fit-to-content columns to their widest header or value.
     // Skipped once the user resized a column, and while the list is hidden
     // (nothing to measure).
     function fitColumnsToContent(table) {
-        if (table.dataset.frozen) return;
+        if (table.dataset.frozen || !table.offsetParent) return;
         const cols = [...table.querySelectorAll('col')];
         const rows = [...table.querySelectorAll('tbody tr')];
         let changed = false;
         table.querySelectorAll('thead th').forEach((th, i) => {
             if (!th.classList.contains(FIT_CLASS)) return;
-            // scrollWidth: the full content width, also when cut off
             const cells = [th, ...rows.map(r => r.children[i]).filter(Boolean)];
-            const needed = Math.max(...cells.map(c => c.scrollWidth));
+            const needed = Math.max(...cells.map(neededWidth));
             if (!needed) return;
             if (needed > (parseFloat(cols[i].style.width) || 0)) {
                 cols[i].style.width = `${needed}px`;
@@ -1123,16 +1280,23 @@
         const thead = document.createElement('thead');
         const headRow = document.createElement('tr');
 
-        // Name, with the symbol filter buttons pinned right
+        // Name, with the symbol filter and sort buttons pinned right
         const nameTh = th('Name');
-        pinButtons(nameTh, ...SYSTEM_FLAGS.map(createFlagButton));
-        nameTh.style.paddingRight = '110px'; // room for the buttons with their counts
+        nameTh.dataset.sortKey = NAME_SORT_KEY;
+        pinButtons(nameTh, ...SYSTEM_FLAGS.map(createFlagButton), createSortButton(NAME_SORT_KEY));
+        nameTh.style.paddingRight = '140px'; // room for the buttons with their counts
         headRow.appendChild(nameTh);
         model.infoLabels.forEach(l => {
             const label = LABEL_RENAMES[l] ?? l;
             const cell = th(label, l);
             cell.classList.add(FIT_CLASS);
             if (CENTERED_LABELS.has(label)) cell.classList.add('tm-center');
+            if (SORTABLE_LABELS.has(l)) {
+                // The button's room is reserved as padding, so fitting the
+                // column to its header makes room for the button too
+                cell.dataset.sortKey = l;
+                pinButtons(cell, createSortButton(l));
+            }
             headRow.appendChild(cell);
         });
         headRow.appendChild(th('Progress'));
@@ -1178,8 +1342,9 @@
             .find(t => t.querySelector('h5.system-header')?.textContent.trim() === name);
     }
 
-    function buildSystemRow(row, model) {
+    function buildSystemRow(row, model, index) {
         const tr = document.createElement('tr');
+        tr.dataset.index = index; // HelloID's order, for "no sort" and ties
         tr.dataset.name = row.name;
         tr.dataset.flags = row.flags.join(' ');
         const td = (text) => {
@@ -1223,8 +1388,12 @@
 
         // Summary since, Last updated, Actions, ...
         model.infoLabels.forEach(label => {
-            const cell = td(row.info.find(i => i.label === label)?.value ?? '');
+            const value = row.info.find(i => i.label === label)?.value ?? '';
+            const cell = td(value);
             if (CENTERED_LABELS.has(LABEL_RENAMES[label] ?? label)) cell.classList.add('tm-center');
+            if (SORTABLE_LABELS.has(label)) {
+                cell.dataset.sortValue = parseDate(value, model.dateOrder) ?? '';
+            }
         });
 
         // Progress: HelloID's progress bar instead of the circle
@@ -1308,6 +1477,27 @@
             if (btn.title !== title) btn.title = title;
         });
 
+        // Sort buttons: black ▲/▼ for the column that's sorted on, grey "-"
+        // for the others; and the rows in that order
+        const sort = effectiveSort();
+        table.querySelectorAll('thead button[data-sort]').forEach(btn => {
+            const isName = btn.dataset.sort === NAME_SORT_KEY;
+            const active = sort.column === btn.dataset.sort;
+            const dir = active ? sort.dir : null;
+            setText(btn, dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '-');
+            const color = statusColor[active ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
+            if (btn.style.color !== color) btn.style.color = color;
+            const title = isName
+                ? (active && dir === 'asc' ? 'Sorted by name, A-Z (default). Click for Z-A.'
+                    : active ? 'Sorted by name, Z-A. Click for A-Z.'
+                    : 'Click to sort by name, A-Z (default)')
+                : (dir === 'desc' ? 'Sorted descending. Click to sort ascending.'
+                    : dir === 'asc' ? 'Sorted ascending. Click for the default order (by name).'
+                    : 'Click to sort descending');
+            if (btn.title !== title) btn.title = title;
+        });
+        sortSystemRows(table);
+
         wrapper.querySelector('.tm-system-table-card').style.display = list ? '' : 'none';
         const filtering = words.length > 0 || active.length > 0;
         setText(count, filtering ? `${shown} of ${total} systems` : `${total} systems`);
@@ -1320,6 +1510,7 @@
 
         if (list) {
             fitColumnsToContent(table);
+            alignHeaderButtons(table);
             fitListHeight();
         }
     }
@@ -1400,7 +1591,7 @@
                 buildSystemsHead(systemList.table, model);
             }
             const tbody = document.createElement('tbody');
-            rows.forEach(r => tbody.appendChild(buildSystemRow(r, model)));
+            rows.forEach((r, i) => tbody.appendChild(buildSystemRow(r, model, i)));
             systemList.table.querySelector('tbody').replaceWith(tbody);
         }
 
@@ -1701,9 +1892,10 @@
             document.getElementById(FILTER_DIV_ID)?.remove();
         }
 
-        // Target systems list: symbol filters
-        if (activeFlags().length) {
+        // Target systems list: symbol filters and sort order
+        if (activeFlags().length || getSort()) {
             sessionSet(FLAG_FILTERS_KEY, []);
+            sessionSet(SORT_KEY, null);
             applySystemsView();
         }
     }
