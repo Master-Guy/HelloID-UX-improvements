@@ -8,7 +8,7 @@
 // @homepageURL  https://github.com/Master-Guy/HelloID-UX-improvements
 // @match        https://*.helloid.com/*
 // @match        https://*.helloid.training/*
-// @match        https://helloid.*
+// @include      /^https:\/\/[^\/]*helloid[^\/]*\//
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
 // @run-at       document-start
 // @grant        GM_getValue
