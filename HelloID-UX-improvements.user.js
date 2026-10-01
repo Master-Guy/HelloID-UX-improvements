@@ -2326,7 +2326,13 @@
             }),
         });
         const current = await loadCurrent();
-        const configuration = { ...restoreSecrets(data.configuration, current), resources: data.resources };
+        const configuration = {
+            ...restoreSecrets(data.configuration, current),
+            resources: data.resources,
+            // A new system starts disabled, whatever the file says, so it
+            // does nothing before it has been checked
+            ...(created ? { isDisabled: true } : {}),
+        };
         const notCompared = !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
             : !resourcesRead ? 'HelloID did not return the resources of the system'
             : null;
@@ -2423,7 +2429,9 @@
               (created ? 'They are empty in the new system' : 'They kept the values the system already had') +
               (masked.length ? ` (${masked.join(', ')})` : '') +
               (created ? ': set them by hand.' : ': check them, and set them by hand where needed.');
-        await showDialog('Import finished', `${created ? 'Created' : 'Imported into'} "${system.displayName}":\n\n${done.map(d => `  - ${d}`).join('\n')}${secrets}\n\n` +
+        const disabled = !created ? ''
+            : '\n\nThe new system is DISABLED. Check it, and enable it yourself when it is ready.';
+        await showDialog('Import finished', `${created ? 'Created' : 'Imported into'} "${system.displayName}":\n\n${done.map(d => `  - ${d}`).join('\n')}${disabled}${secrets}\n\n` +
               'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
@@ -2456,7 +2464,9 @@
             `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}\n\n` +
             `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n` +
             `A NEW target system "${name}" (type ${data.templateIdentifier}) will be created, and the ` +
-            'configuration of the file is then imported into it.' +
+            'configuration of the file is then imported into it.\n\n' +
+            'The new system will be DISABLED, also when the system of the file is enabled, so it does ' +
+            'nothing before you have checked it. Enable it yourself when it is ready.' +
             (data.secretsIncluded === false
                 ? '\n\nThe file has no secrets: those will be empty in the new system.' : ''),
             { confirm: true })) {
