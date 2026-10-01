@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.1
+// @version      2026-10-01.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -28,11 +28,12 @@
     // toolbar menu, are stored by Tampermonkey and survive script updates.
 
     const DEFAULTS = Object.freeze({
-        // Entitlements tabs: number of rows requested from the server in one go.
+        // Grids that are fetched in full (see INTERCEPTS): number of rows
+        // requested from the server in one go.
         // Must be higher than the number of rows in any of these grids.
         fetchAllTake: 999999,
 
-        // Entitlements tabs: how long fetched rows are reused (minutes)
+        // The same grids: how long fetched rows are reused (minutes)
         // before they are fetched again
         cacheMaxAgeMinutes: 5,
 
@@ -110,16 +111,16 @@
         },
         {
             path: 'fetchAllTake',
-            label: 'Entitlements: max rules to fetch',
-            description: 'Number of rows requested from the server in one go on the Entitlements tabs ' +
-                         '(target systems and business rules). Must be higher than the number of rows in any of them.',
+            label: 'Grids: max rows to fetch',
+            description: 'Number of rows requested from the server in one go, for the grids that are fetched ' +
+                         'in full (entitlements, evaluation actions). Must be higher than the number of rows in any of them.',
             parse: parsePositiveInt,
             hint: 'a whole number',
         },
         {
             path: 'cacheMaxAgeMinutes',
-            label: 'Entitlements: cache duration (minutes)',
-            description: 'How long the fetched rows on the Entitlements tabs are reused while scrolling and ' +
+            label: 'Grids: cache duration (minutes)',
+            description: 'How long the rows of the grids that are fetched in full are reused while scrolling and ' +
                          'filtering, before they are fetched from the server again. ' +
                          'Navigating to another page always fetches fresh rows.',
             parse: parsePositiveInt,
@@ -277,14 +278,28 @@
     // filtered here; the app then gets only the page it asked for.
     // filter: all rows -> the rows to show
     // grid: the grid showing these rows, if known (for its loading overlay)
+    // limitWarning: text of the page's "only the first N rows" warning,
+    //   which no longer applies once all rows are fetched
     const INTERCEPTS = [
         // Target system > Entitlements tab
         { pattern: /\/entitlements-overview(\?|$)/, filter: (all) => all.filter(matchesFilters) },
         // Business rules > Entitlements tab
         {
             pattern: /\/rules\/api\/entitlements(\?|$)/,
-            filter: (all) => filterEntitlements(all),
+            filter: (all) => filterByFlags(FLAG_GRIDS.entitlements, all),
             grid: 'helloid-entitlement-grid ag-grid-angular',
+        },
+        // Business rules > Evaluations: actions of the selected evaluation
+        {
+            pattern: /\/rule-enforcement\/api\/evaluation-report\/[^/?]+(\?|$)/,
+            filter: (all) => filterByFlags(FLAG_GRIDS.actions, all),
+            grid: 'helloid-tab-control ag-grid-angular',
+        },
+        // Entitlements > Granted tab
+        {
+            pattern: new RegExp('/rule-enforcement/api/enforcedstate/granted([?]|$)'),
+            filter: (all) => all,
+            limitWarning: 'will only show the first',
         },
     ];
     const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url));
@@ -404,6 +419,15 @@
     function modifyData(data, page) {
         if (!Array.isArray(data?.pageData)) return data;
 
+        // Fewer rows than asked for: that's all of them
+        const { intercept } = page;
+        if (intercept.limitWarning) {
+            intercept.complete = data.pageData.length < SETTINGS.fetchAllTake;
+            if (intercept.complete && data.exceededTotalRowCountLimit === true) {
+                data.exceededTotalRowCountLimit = false;
+            }
+        }
+
         const filtered = page.intercept.filter(data.pageData);
         data.pageData = filtered.slice(page.skip, page.skip + page.take);
 
@@ -411,6 +435,17 @@
             if (typeof data[key] === 'number') data[key] = filtered.length;
         }
         return data;
+    }
+
+    // Hide the page's "only the first N rows" warnings that no longer apply
+    function hideLimitWarnings() {
+        const texts = INTERCEPTS.filter(i => i.limitWarning && i.complete).map(i => i.limitWarning);
+        if (!texts.length) return;
+        document.querySelectorAll('.alert.alert-warning').forEach(alert => {
+            if (alert.style.display !== 'none' && texts.some(t => alert.textContent.includes(t))) {
+                alert.style.display = 'none';
+            }
+        });
     }
 
     // --- fetch ---
@@ -943,28 +978,47 @@
     // --- Business rules: name columns in grids ---
     // Grids (by their host element) and the column that gets a copy
     // button: by column ID, or by header text when the ID isn't known.
+    // route: only on pages with this in their address (for hosts that
+    // are used on many pages). Without host: any grid on that page.
+    const ENTITLEMENTS_ROUTE = '/business/entitlements';
+    const EVALUATIONS_ROUTE = '/business/evaluations';
     const NAME_COLUMNS = [
         { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
+        // Its persons: a single column without a header, so any column
+        { host: 'helloid-stored-persons-in-rule', header: null },
         // Entitlements tab, details of the selected entitlement
         { host: 'helloid-entitlement-details', colId: 'name' }, // its Rules tab
         { host: 'helloid-entitlement-details', header: 'Person' }, // its Persons tab
+        // Evaluations: actions of the selected evaluation
+        ...['System', 'Person', 'Entitlement name'].map(header => (
+            { host: 'helloid-tab-control', header, route: EVALUATIONS_ROUTE })),
+        // Entitlements: Granted and History tabs
+        ...['System', 'Person', 'Entitlement name'].map(header => (
+            { header, route: ENTITLEMENTS_ROUTE })),
     ];
 
     // Body cells of the name columns, in all grids on the page
     function nameCells() {
-        return NAME_COLUMNS.flatMap(({ host, colId, header }) =>
-            [...document.querySelectorAll(`${host} ag-grid-angular`)].flatMap(grid => {
+        const here = NAME_COLUMNS.filter(c => !c.route || location.hash.includes(c.route));
+        return here.flatMap(({ host, colId, header }) =>
+            [...document.querySelectorAll(`${host ?? ''} ag-grid-angular`)].flatMap(grid => {
+                const rows = 'div.ag-body-viewport div[role="row"]';
+                // Any column: the grid may have no header at all
+                if (!colId && header == null) return [...grid.querySelectorAll(`${rows} div[col-id]`)];
                 const ids = colId ? [colId]
                     : [...grid.querySelectorAll('.ag-header-cell')]
                         .filter(h => h.textContent.trim().toLowerCase() === header.toLowerCase())
                         .map(h => h.getAttribute('col-id'));
                 return ids.flatMap(id => [...grid.querySelectorAll(
-                    `div.ag-body-viewport div[role="row"] div[col-id="${CSS.escape(id)}"]`)]);
+                    `${rows} div[col-id="${CSS.escape(id)}"]`)]);
             }));
     }
 
-    // Text of the cell without our own button
+    // Text of the cell without our own button. Cells with a second,
+    // smaller line (a description under the name): only the first line.
     function cellTextWithout(cell, btn) {
+        const firstLine = cell.querySelector('.truncate-ellipse');
+        if (firstLine) return firstLine.innerText ?? firstLine.textContent;
         return [...cell.childNodes]
             .filter(n => n !== btn)
             .map(n => n.innerText ?? n.textContent)
@@ -1805,66 +1859,109 @@
     }
 
     // =====================================================================
-    // Business rules > Entitlements: filter on the warning / info icon
+    // Grids: filter buttons on the icon of a row
     // =====================================================================
-    // The grid's last (nameless) column shows an icon for entitlements the
-    // target system no longer returns: a warning when business rules still
-    // use them, an info icon when not. Its header gets a filter button for
-    // each, with the number of entitlements that have that icon; grey =
-    // off, black = only those. A row never has both icons, so with both
-    // on, a row needs either.
-    // The grid loads its rows page by page from the server, so the
+    // Some grids have a nameless column with an icon per row. Its header
+    // gets a filter button for each icon, with the number of rows that
+    // have it; grey = off, black = only those. A row has one icon at
+    // most, so with several buttons on, a row needs any of them.
+    // These grids load their rows page by page from the server, so the
     // filtering happens on the request (see Response interception), and a
     // click makes the grid load its rows again.
+    //   grid:    the grid
+    //   route:   only on pages with this in their address
+    //   header:  only grids with this column (the host can hold others)
+    //   flags:   the buttons; test: does this row have the icon?
 
-    const ENTITLEMENT_GRID = 'helloid-entitlement-grid ag-grid-angular';
-    const ENTITLEMENT_FLAG_CLASS = 'tm-entitlement-flags';
-    const ENTITLEMENT_FLAGS_KEY = 'tm-helloid-entitlement-flags'; // in sessionStorage
+    const FLAG_GROUP_CLASS = 'tm-grid-flags';
 
     const notInTargetSystem = (e) => e.inTargetSystem === false;
-    const ENTITLEMENT_FLAGS = [
-        {
-            key: 'warning',
-            icon: 'fa-solid fa-warning',
-            label: 'entitlements no longer in the target system, but still used in business rules',
-            test: (e) => notInTargetSystem(e) && e.ruleCount > 0,
-        },
-        {
-            key: 'info',
-            icon: 'fa-solid fa-info-circle',
-            label: 'entitlements no longer in the target system, not used in business rules',
-            test: (e) => notInTargetSystem(e) && !(e.ruleCount > 0),
-        },
-    ];
 
-    const activeEntitlementFlags = () => {
-        const flags = sessionGet(ENTITLEMENT_FLAGS_KEY, []);
+    // Evaluation actions: entitlementType of a row
+    const EntitlementType = Object.freeze({ ACCOUNT: 1, ACCOUNT_ACCESS: 2, PERMISSION: 3 });
+
+    const FLAG_GRIDS = {
+        // Business rules > Entitlements: entitlements the target system no
+        // longer returns; a warning when business rules still use them, an
+        // info icon when not
+        entitlements: {
+            grid: 'helloid-entitlement-grid ag-grid-angular',
+            storageKey: 'tm-helloid-entitlement-flags', // in sessionStorage
+            flags: [
+                {
+                    key: 'warning',
+                    icon: 'fa-solid fa-warning',
+                    label: 'entitlements no longer in the target system, but still used in business rules',
+                    test: (e) => notInTargetSystem(e) && e.ruleCount > 0,
+                },
+                {
+                    key: 'info',
+                    icon: 'fa-solid fa-info-circle',
+                    label: 'entitlements no longer in the target system, not used in business rules',
+                    test: (e) => notInTargetSystem(e) && !(e.ruleCount > 0),
+                },
+            ],
+        },
+        // Business rules > Evaluations > Actions: the type of entitlement
+        actions: {
+            grid: 'helloid-tab-control ag-grid-angular',
+            route: EVALUATIONS_ROUTE,
+            header: 'Operation',
+            storageKey: 'tm-helloid-action-flags',
+            flags: [
+                {
+                    key: 'account',
+                    icon: 'fa-solid fa-user',
+                    label: 'actions on accounts',
+                    test: (a) => a.entitlementType === EntitlementType.ACCOUNT,
+                },
+                {
+                    key: 'access',
+                    icon: 'fa-solid fa-unlock',
+                    label: 'actions on account access',
+                    test: (a) => a.entitlementType === EntitlementType.ACCOUNT_ACCESS,
+                },
+                {
+                    key: 'permission',
+                    icon: 'fa-solid fa-users',
+                    label: 'actions on permissions',
+                    test: (a) => a.entitlementType === EntitlementType.PERMISSION,
+                },
+            ],
+        },
+    };
+    // Counts per flag, from the last full set of rows; counted once per
+    // set (the same cached set comes by for every page of the grid)
+    Object.entries(FLAG_GRIDS).forEach(([name, config]) =>
+        Object.assign(config, { name, counts: {}, counted: null }));
+
+    const activeGridFlags = (config) => {
+        const flags = sessionGet(config.storageKey, []);
         return Array.isArray(flags) ? flags : [];
     };
 
-    // Counts per flag, from the last full set of entitlements; counted once
-    // per set (the same cached set comes by for every page of the grid)
-    let entitlementFlagCounts = {};
-    let countedEntitlements = null;
-
-    // Called with all entitlements (see INTERCEPTS): count, then filter
-    function filterEntitlements(all) {
-        if (all !== countedEntitlements) {
-            countedEntitlements = all;
-            entitlementFlagCounts = Object.fromEntries(
-                ENTITLEMENT_FLAGS.map(f => [f.key, all.filter(f.test).length]));
-            setTimeout(updateEntitlementFlagButtons); // not while the app reads the response
+    // Called with all rows (see INTERCEPTS): count, then filter
+    function filterByFlags(config, all) {
+        if (all !== config.counted) {
+            config.counted = all;
+            config.counts = Object.fromEntries(
+                config.flags.map(f => [f.key, all.filter(f.test).length]));
+            setTimeout(() => updateGridFlagButtons(config)); // not while the app reads the response
         }
 
-        const active = ENTITLEMENT_FLAGS.filter(f => activeEntitlementFlags().includes(f.key));
-        return active.length ? all.filter(e => active.some(f => f.test(e))) : all;
+        const on = activeGridFlags(config);
+        const active = config.flags.filter(f => on.includes(f.key));
+        return active.length ? all.filter(row => active.some(f => f.test(row))) : all;
     }
 
-    function createEntitlementFlagButton(flag, gridEl) {
+    const flagGroup = (config) =>
+        document.querySelector(`.${FLAG_GROUP_CLASS}[data-flag-grid="${config.name}"]`);
+
+    function createGridFlagButton(config, flag, gridEl) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'btn btn-default btn-xs';
-        btn.dataset.entitlementFlag = flag.key;
+        btn.dataset.gridFlag = flag.key;
         const icon = document.createElement('i');
         icon.className = flag.icon;
         btn.append(icon, ' ', document.createElement('span'));
@@ -1872,11 +1969,11 @@
         btn.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            const active = activeEntitlementFlags();
-            sessionSet(ENTITLEMENT_FLAGS_KEY, active.includes(flag.key)
+            const active = activeGridFlags(config);
+            sessionSet(config.storageKey, active.includes(flag.key)
                 ? active.filter(k => k !== flag.key)
                 : [...active, flag.key]);
-            updateEntitlementFlagButtons();
+            updateGridFlagButtons(config);
             // Load the rows again, through the filter
             const api = findGridApi(gridEl);
             if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
@@ -1886,12 +1983,12 @@
     }
 
     // Look and count of the buttons
-    function updateEntitlementFlagButtons() {
-        const active = activeEntitlementFlags();
-        document.querySelectorAll('button[data-entitlement-flag]').forEach(btn => {
-            const flag = ENTITLEMENT_FLAGS.find(f => f.key === btn.dataset.entitlementFlag);
+    function updateGridFlagButtons(config) {
+        const active = activeGridFlags(config);
+        flagGroup(config)?.querySelectorAll('button[data-grid-flag]').forEach(btn => {
+            const flag = config.flags.find(f => f.key === btn.dataset.gridFlag);
             const on = active.includes(flag.key);
-            const n = entitlementFlagCounts[flag.key];
+            const n = config.counts[flag.key];
             const color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
             if (btn.style.color !== color) btn.style.color = color;
             setText(btn.querySelector('span'), n == null ? '' : String(n));
@@ -1901,32 +1998,39 @@
                 : `Show only ${flag.label}${count}`;
             if (btn.title !== title) btn.title = title;
         });
-        fitEntitlementFlagColumn();
+        fitFlagColumn(config);
     }
 
-    function addEntitlementFlagButtons() {
-        const gridEl = document.querySelector(ENTITLEMENT_GRID);
-        if (!gridEl) return;
+    function addGridFlagButtons() {
+        Object.values(FLAG_GRIDS).forEach(config => {
+            if (config.route && !location.hash.includes(config.route)) return;
 
-        // The nameless column: the last header without text
-        const header = [...gridEl.querySelectorAll('.ag-header-cell')]
-            .filter(h => !h.textContent.trim() || h.querySelector(`.${ENTITLEMENT_FLAG_CLASS}`))
-            .pop();
-        if (!header || header.querySelector(`.${ENTITLEMENT_FLAG_CLASS}`)) return;
+            const headersOf = (g) => [...g.querySelectorAll('.ag-header-cell')];
+            const gridEl = [...document.querySelectorAll(config.grid)].find(g => !config.header ||
+                headersOf(g).some(h => h.textContent.trim().toLowerCase() === config.header.toLowerCase()));
+            if (!gridEl) return;
 
-        const group = document.createElement('span');
-        group.className = ENTITLEMENT_FLAG_CLASS;
-        Object.assign(group.style, { display: 'flex', gap: '2px', flexShrink: '0' });
-        ENTITLEMENT_FLAGS.forEach(f => group.appendChild(createEntitlementFlagButton(f, gridEl)));
-        (header.querySelector('.ag-header-cell-comp-wrapper') ?? header).appendChild(group);
-        updateEntitlementFlagButtons();
+            // The nameless column: the last header without text
+            const header = headersOf(gridEl)
+                .filter(h => !h.textContent.trim() || h.querySelector(`.${FLAG_GROUP_CLASS}`))
+                .pop();
+            if (!header || header.querySelector(`.${FLAG_GROUP_CLASS}`)) return;
+
+            const group = document.createElement('span');
+            group.className = FLAG_GROUP_CLASS;
+            group.dataset.flagGrid = config.name;
+            Object.assign(group.style, { display: 'flex', gap: '2px', flexShrink: '0' });
+            config.flags.forEach(f => group.appendChild(createGridFlagButton(config, f, gridEl)));
+            (header.querySelector('.ag-header-cell-comp-wrapper') ?? header).appendChild(group);
+            updateGridFlagButtons(config);
+        });
     }
 
     // Make the column at least as wide as its buttons need. Done again when
     // the counts change (more digits, wider buttons); a minimum width only
     // grows, so this settles.
-    function fitEntitlementFlagColumn() {
-        const group = document.querySelector(`${ENTITLEMENT_GRID} .${ENTITLEMENT_FLAG_CLASS}`);
+    function fitFlagColumn(config) {
+        const group = flagGroup(config);
         const header = group?.closest('.ag-header-cell');
         const api = header && findGridApi(header.closest('ag-grid-angular'));
         if (!api || !group.offsetWidth) return;
@@ -2213,11 +2317,12 @@
             applySystemsView();
         }
 
-        // Business rules > Entitlements: icon filters
-        if (activeEntitlementFlags().length) {
-            sessionSet(ENTITLEMENT_FLAGS_KEY, []);
-            updateEntitlementFlagButtons();
-        }
+        // Grids: icon filters
+        Object.values(FLAG_GRIDS).forEach(config => {
+            if (!activeGridFlags(config).length) return;
+            sessionSet(config.storageKey, []);
+            updateGridFlagButtons(config);
+        });
     }
 
     // Watch the DOM: whenever a page is (re)rendered without our buttons,
@@ -2234,7 +2339,8 @@
                 addStyles();
                 addCopyButtons();
                 setupSystemList();
-                addEntitlementFlagButtons();
+                addGridFlagButtons();
+                hideLimitWarnings();
                 addFilterPanelSearch();
                 makeGridsResizable();
             });
