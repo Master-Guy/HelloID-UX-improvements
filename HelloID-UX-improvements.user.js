@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.4
+// @version      2026-10-01.5
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -1205,7 +1205,7 @@
     const matchesFlags = (flags, active) => active.every(k => flags.includes(k));
 
     // Sortable columns: the name, and these info columns (dates). Each has
-    // a sort button in its header: "-" (not sorted on this column), ▼ or ▲.
+    // a sort button in its header: an up-down arrows icon (not sorted on this column), ▼ or ▲.
     // HelloID's own order is by name, ascending: that's the default.
     const SORTABLE_LABELS = new Set(['Summary since', 'Last updated']);
     const NAME_SORT_KEY = 'name';
@@ -1249,17 +1249,16 @@
         return new Date(year, month - 1, +day, h, +minute, +second).getTime();
     }
 
-    // Sort button. Dates: first click descending, then ascending, then back
-    // to the default (name ascending). Name: ascending (the default, also
-    // the first click while a date is sorted), then descending, then
-    // ascending again; never back to "-". The look is updated in
+    // Sort button. The first click on a date sorts descending, on the name
+    // ascending (the default); every next click reverses the direction.
+    // Back to the default: sort on the name. The look is updated in
     // applySystemsView().
     function createSortButton(key) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'btn btn-default btn-xs';
         btn.dataset.sort = key;
-        // Fixed width: "-" is narrower than ▲/▼
+        // Fixed width: the icon and ▲/▼ differ in width
         Object.assign(btn.style, {
             width: '22px',
             paddingLeft: '0',
@@ -1272,16 +1271,42 @@
             e.stopPropagation();
             const current = effectiveSort();
             let next = current.column !== key
-                    ? { column: key, dir: key === NAME_SORT_KEY ? 'asc' : 'desc' }
-                : current.dir === 'desc' ? { column: key, dir: 'asc' }
-                : key === NAME_SORT_KEY ? { column: key, dir: 'desc' }
-                : null;
+                ? { column: key, dir: key === NAME_SORT_KEY ? 'asc' : 'desc' }
+                : { column: key, dir: current.dir === 'desc' ? 'asc' : 'desc' };
             // Name ascending is the default; stored as "no sort"
             if (next?.column === DEFAULT_SORT.column && next.dir === DEFAULT_SORT.dir) next = null;
             sessionSet(SORT_KEY, next);
             applySystemsView();
         });
         return btn;
+    }
+
+    // What a sort button shows: the up-down arrows icon. Not sorted on its
+    // column: both arrows the same. Sorted: the duotone version, with the
+    // arrow of the direction dark and the other one light. Without the
+    // duotone font on the page: ▲ or ▼ instead.
+    const SORT_ICON = 'fa-arrow-down-arrow-up';
+    // The direction of the arrow that the duotone icon shows dark by
+    // default (its "primary" layer); fa-swap-opacity shows the other dark
+    const SORT_ICON_PRIMARY = 'asc';
+
+    let duotoneFont; // is there a Font Awesome duotone font? Remembered once found
+    const hasDuotoneFont = () =>
+        duotoneFont ||= [...document.fonts].some(f => /duotone/i.test(f.family));
+
+    function setSortIndicator(btn, dir) {
+        if (dir && !hasDuotoneFont()) {
+            setText(btn, dir === 'asc' ? '▲' : '▼');
+            return;
+        }
+        const className = !dir ? `fa-solid ${SORT_ICON}`
+            : `fa-duotone ${SORT_ICON}${dir === SORT_ICON_PRIMARY ? '' : ' fa-swap-opacity'}`;
+        let icon = btn.querySelector('i');
+        if (!icon) {
+            icon = document.createElement('i');
+            btn.replaceChildren(icon);
+        }
+        if (icon.className !== className) icon.className = className;
     }
 
     // Put the rows in the chosen order. By name: HelloID's order (which is
@@ -1747,14 +1772,14 @@
             if (btn.title !== title) btn.title = title;
         });
 
-        // Sort buttons: black ▲/▼ for the column that's sorted on, grey "-"
+        // Sort buttons: black ▲/▼ for the column that's sorted on, a grey icon
         // for the others; and the rows in that order
         const sort = effectiveSort();
         table.querySelectorAll('thead button[data-sort]').forEach(btn => {
             const isName = btn.dataset.sort === NAME_SORT_KEY;
             const active = sort.column === btn.dataset.sort;
             const dir = active ? sort.dir : null;
-            setText(btn, dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '-');
+            setSortIndicator(btn, dir);
             const color = statusColor[active ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
             if (btn.style.color !== color) btn.style.color = color;
             const title = isName
@@ -1762,7 +1787,7 @@
                     : active ? 'Sorted by name, Z-A. Click for A-Z.'
                     : 'Click to sort by name, A-Z (default)')
                 : (dir === 'desc' ? 'Sorted descending. Click to sort ascending.'
-                    : dir === 'asc' ? 'Sorted ascending. Click for the default order (by name).'
+                    : dir === 'asc' ? 'Sorted ascending. Click to sort descending.'
                     : 'Click to sort descending');
             if (btn.title !== title) btn.title = title;
         });
