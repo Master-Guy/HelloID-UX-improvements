@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.7
+// @version      2026-10-01.8
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -1891,6 +1891,75 @@
         });
     }
 
+    // The same card for a job in steps: lists the steps with their state,
+    // updated while they run. It can't be closed until the job is over.
+    //   set(index, state): waiting, busy, done, failed or skipped
+    //   finish(message): adds the closing text, lets the user close the
+    //                    card; resolves when that happens
+    const PROGRESS_ICONS = { waiting: '•', busy: '⏳', done: '✅', failed: '❌', skipped: '–' };
+
+    function showProgress(title, names) {
+        const states = names.map(() => 'waiting');
+        let closing = '';
+        const text = () => names.map((name, i) => `${PROGRESS_ICONS[states[i]]} ${name}`).join('\n') + closing;
+
+        const dialog = document.createElement('dialog');
+        dialog.className = DIALOG_CLASS;
+        const heading = document.createElement('h5');
+        heading.textContent = title;
+        const body = document.createElement('pre');
+        body.tabIndex = 0;
+        const render = () => { body.textContent = text(); };
+
+        const footer = document.createElement('div');
+        footer.className = 'tm-dialog-footer';
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.className = 'btn btn-sm btn-primary tm-dialog-copy';
+        copy.textContent = 'Copy text';
+        copy.style.marginRight = 'auto';
+        copy.addEventListener('click', async () => {
+            copy.textContent = await copyToClipboard(text()) ? 'Copied' : 'Copy failed';
+            setTimeout(() => { copy.textContent = 'Copy text'; }, SETTINGS.copyFeedbackMs);
+        });
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'btn btn-sm btn-primary';
+        close.textContent = 'Close';
+        close.disabled = true; // until the job is over
+        close.addEventListener('click', () => dialog.close());
+        footer.append(copy, close);
+
+        // Escape closes a dialog: not while the job runs
+        dialog.addEventListener('cancel', (e) => { if (close.disabled) e.preventDefault(); });
+        dialog.addEventListener('keydown', (e) => e.stopPropagation());
+        const closed = new Promise(resolve => dialog.addEventListener('close', () => {
+            dialog.remove();
+            resolve();
+        }));
+
+        dialog.append(heading, body, footer);
+        render();
+        addStyles();
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        body.focus();
+
+        return {
+            set(index, state) {
+                states[index] = state;
+                render();
+            },
+            finish(message) {
+                closing = `\n\n${message}`;
+                render();
+                close.disabled = false;
+                close.focus();
+                return closed;
+            },
+        };
+    }
+
     // --- Import of a system's configuration ---
     // The Import button (next to HelloID's "Add new system" button) reads
     // a file made by the Export button and compares it with the system it
@@ -2398,27 +2467,38 @@
             await downloadBackup(system.displayName.trim());
         }
 
-        // Send, in order; the first error stops the import
-        const done = created ? ['Create new system'] : [];
+        // Send, in order, showing each request and how it went; the first
+        // error stops the import
+        const requests = plan.flatMap(step => [...(step.before ?? []), step]);
+        const first = created ? 1 : 0; // a new system: it was made before this
+        const progress = showProgress(
+            `${created ? 'Creating' : 'Importing into'} "${system.displayName}"`,
+            [...(created ? ['Create new system'] : []), ...requests.map(r => r.name)]);
+        if (created) progress.set(0, 'done');
+
         let latest = current;
-        const send = async (request) => {
-            await sendToGateway(request.path(id), request.method, request.body?.(configuration, latest, systems));
-            done.push(request.name);
-        };
+        let index = first;
         try {
-            for (const step of plan) {
-                for (const request of step.before ?? []) {
-                    if (!request.when || request.when(latest)) await send(request);
+            for (const request of requests) {
+                if (request.when && !request.when(latest)) {
+                    progress.set(index++, 'skipped'); // not needed
+                    continue;
                 }
-                await send(step);
-                if (step.resetsFieldIds) latest = await loadImportedFields(loadCurrent, fileFields);
+                progress.set(index, 'busy');
+                await sendToGateway(request.path(id), request.method, request.body?.(configuration, latest, systems));
+                if (request.resetsFieldIds) latest = await loadImportedFields(loadCurrent, fileFields);
+                progress.set(index++, 'done');
             }
         } catch (e) {
-            throw new Error(`${e?.message ?? e}\n\n` +
-                (done.length ? `Done before the error:\n${done.map(d => `  - ${d}`).join('\n')}\n\n`
-                    : 'Nothing was changed yet.\n\n') +
-                'The import stopped there. ' + (created ? 'The new system is in the list of target systems.'
+            console.warn('[HelloID UX] Import failed', e);
+            progress.set(index, 'failed');
+            await progress.finish(`Import failed: ${e?.message ?? e}\n\n` +
+                (index > first ? 'The steps before it were done; the ones after it were not. '
+                    : created ? 'Only the new system was made. ' : 'Nothing was changed. ') +
+                (created ? 'The new system is in the list of target systems.'
                     : 'The backup file has the configuration from before the import.'));
+            // Already shown to the user
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
         }
 
         // A file without secrets: those kept the values the system had
@@ -2431,8 +2511,8 @@
               (created ? ': set them by hand.' : ': check them, and set them by hand where needed.');
         const disabled = !created ? ''
             : '\n\nThe new system is DISABLED. Check it, and enable it yourself when it is ready.';
-        await showDialog('Import finished', `${created ? 'Created' : 'Imported into'} "${system.displayName}":\n\n${done.map(d => `  - ${d}`).join('\n')}${disabled}${secrets}\n\n` +
-              'The page reloads when you close this message.');
+        await progress.finish(`Import finished.${disabled}${secrets}\n\n` +
+                              'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
     }
@@ -2547,9 +2627,9 @@
             try {
                 if (await importSystem()) result = 'fa-solid fa-check';
             } catch (err) {
-                console.warn('[HelloID UX] Import failed', err);
+                if (!err?.shown) console.warn('[HelloID UX] Import failed', err);
                 result = 'fa-solid fa-xmark';
-                await showDialog('Import failed', String(err?.message ?? err));
+                if (!err?.shown) await showDialog('Import failed', String(err?.message ?? err));
             }
             icon.className = result;
             btn.disabled = false;
