@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.6
+// @version      2026-10-01.7
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -1659,11 +1659,19 @@
     // name in the export -> path. "configuration" replaces the system's
     // entry from SYSTEMS_PATH (it has the same, and more). Other types
     // are exported with what all types have.
+    const POWERSHELL_RESOURCES_PATH = (id) => `/connector/powershell-target/api/resources/${id}`;
+    const powershellExport = (id) => ({
+        configuration: `/connector/powershell-target/api/configuration/${id}`,
+        defaultScripts: `/connector/powershell-target/api/configuration/${id}/default`,
+        resources: POWERSHELL_RESOURCES_PATH(id),
+    });
+    // Parts that may fail to load without stopping the export: the file
+    // then says which ones are missing (couldNotRead)
+    const OPTIONAL_EXPORTS = new Set(['resources']);
+    // PowerShell systems come in two types that work the same
     const CONNECTOR_EXPORTS = {
-        'powershell-onpremise': (id) => ({
-            configuration: `/connector/powershell-target/api/configuration/${id}`,
-            defaultScripts: `/connector/powershell-target/api/configuration/${id}/default`,
-        }),
+        'powershell-onpremise': powershellExport,
+        'powershell-target': powershellExport,
     };
 
     // Message shown after saving the export, per type of target system
@@ -1681,19 +1689,27 @@
 
     const RULE_ENTITLEMENT_FIELDS = FILTERS.map(f => f.field);
 
-    // Password fields of the configuration form: their values are secrets
+    // Values that are secrets: the password fields of the configuration
+    // form, and any value whose name says so. The latter also covers
+    // values of fields that are no longer in the form, which HelloID keeps.
+    const SECRET_NAME = /secret|passw|pwd|token|api[-_]?key|private[-_]?key|certificate|credential/i;
+
     function maskSecrets(configuration) {
-        const secretKeys = (configuration.scriptConfigurationForm?.fields ?? [])
+        if (!isPlainObject(configuration.scriptConfiguration)) return configuration;
+        const passwordKeys = new Set((configuration.scriptConfigurationForm?.fields ?? [])
             .filter(f => f.templateOptions?.type === 'password')
-            .map(f => f.key);
-        if (!secretKeys.length || !isPlainObject(configuration.scriptConfiguration)) return configuration;
+            .map(f => f.key));
         const values = { ...configuration.scriptConfiguration };
-        secretKeys.forEach(key => { if (values[key] != null && values[key] !== '') values[key] = EXPORT_MASK; });
+        Object.keys(values).forEach(key => {
+            const filled = typeof values[key] === 'string' && values[key] !== '';
+            if (filled && (passwordKeys.has(key) || SECRET_NAME.test(key))) values[key] = EXPORT_MASK;
+        });
         return { ...configuration, scriptConfiguration: values };
     }
 
     async function fetchFromGateway(path) {
         const response = await origFetch.call(pageWindow, gateway.origin + path, {
+            cache: 'no-store', // always HelloID's current state
             headers: gateway.headers,
             credentials: gateway.withCredentials ? 'include' : 'same-origin',
         });
@@ -1701,21 +1717,30 @@
         return response.json();
     }
 
-    async function collectSystemExport(name) {
+    // HelloID's list of target systems
+    async function fetchSystems() {
         if (!gateway) throw new Error('No request of HelloID seen yet. Reload the page and try again.');
-
         const systems = await fetchFromGateway(SYSTEMS_PATH);
-        const system = (Array.isArray(systems) ? systems : [])
+        return Array.isArray(systems) ? systems : [];
+    }
+
+    async function collectSystemExport(name) {
+        const system = (await fetchSystems())
             .find(s => typeof s?.displayName === 'string' && s.displayName.trim() === name);
         if (!system) throw new Error(`"${name}" was not found in HelloID's list of target systems.`);
 
         const id = encodeURIComponent(system.systemId);
         const paths = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id) ?? {};
         const names = Object.keys(paths);
+        const couldNotRead = [];
         const [rules, ...answers] = await Promise.all([
             fetchFromGateway(`/api/connectors/shared/rules/published/${id}/entitlements-overview` +
                              `?skip=0&take=${SETTINGS.fetchAllTake}`),
-            ...names.map(n => fetchFromGateway(paths[n])),
+            ...names.map(n => fetchFromGateway(paths[n]).catch(e => {
+                if (!OPTIONAL_EXPORTS.has(n)) throw e;
+                console.warn(`[HelloID UX] Export: could not read "${n}"`, e);
+                couldNotRead.push(n);
+            })),
         ]);
         const { configuration = system, ...others } = Object.fromEntries(names.map((n, i) => [n, answers[i]]));
 
@@ -1724,9 +1749,12 @@
             exportedFrom: location.origin,
             exportedBy: `HelloID UX improvements ${typeof GM_info !== 'undefined' ? GM_info.script.version : ''}`.trim(),
             secretsIncluded: SETTINGS.exportSecrets,
+            systemId: system.systemId,
+            displayName: system.displayName,
             templateIdentifier: system.templateIdentifier,
             configuration: SETTINGS.exportSecrets ? configuration : maskSecrets(configuration),
             ...others,
+            ...(couldNotRead.length ? { couldNotRead } : {}),
             // Only the rules that have an entitlement for this system
             rules: (rules.pageData ?? []).filter(r => RULE_ENTITLEMENT_FIELDS.some(f => r[f] === true)),
         };
@@ -1768,7 +1796,9 @@
         }
 
         // After the button shows its check mark
-        const notice = EXPORT_NOTICES[data.templateIdentifier];
+        const notice = data.couldNotRead
+            ? `The file was saved without: ${data.couldNotRead.join(', ')}. HelloID did not return that part.`
+            : EXPORT_NOTICES[data.templateIdentifier];
         if (notice) setTimeout(() => alert(notice), 100);
         return true;
     }
@@ -1803,6 +1833,719 @@
             setTimeout(() => { icon.className = 'fa-solid fa-download'; }, SETTINGS.copyFeedbackMs);
         });
         return btn;
+    }
+
+    // --- Dialog ---
+    // A message in a card on top of the page, in HelloID's own styles: it
+    // scrolls when the text is long, and the text can be selected and
+    // copied (the browser's own alert/confirm cut long texts off).
+    // With confirm: Cancel and Continue; resolves to true for Continue.
+    const DIALOG_CLASS = 'tm-dialog';
+
+    function showDialog(title, text, { confirm = false } = {}) {
+        return new Promise(resolve => {
+            const dialog = document.createElement('dialog');
+            dialog.className = DIALOG_CLASS;
+
+            const heading = document.createElement('h5');
+            heading.textContent = title;
+
+            const body = document.createElement('pre');
+            body.textContent = text;
+            body.tabIndex = 0; // can take the focus, so the keyboard scrolls it
+
+            const footer = document.createElement('div');
+            footer.className = 'tm-dialog-footer';
+            const button = (label, className, onClick) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = `btn btn-sm ${className}`;
+                btn.textContent = label;
+                btn.addEventListener('click', onClick);
+                footer.appendChild(btn);
+                return btn;
+            };
+            const copy = button('Copy text', 'btn-primary tm-dialog-copy', async () => {
+                copy.textContent = await copyToClipboard(text) ? 'Copied' : 'Copy failed';
+                setTimeout(() => { copy.textContent = 'Copy text'; }, SETTINGS.copyFeedbackMs);
+            });
+            copy.style.marginRight = 'auto'; // on the left, the others on the right
+            if (confirm) button('Cancel', 'btn-default', () => dialog.close('cancel'));
+            const ok = button(confirm ? 'Continue' : 'Close', 'btn-primary', () => dialog.close('ok'));
+
+            // Also closed with Escape: that counts as Cancel
+            dialog.addEventListener('close', () => {
+                dialog.remove();
+                resolve(dialog.returnValue === 'ok');
+            });
+            // Keep typing away from the page's own key handlers
+            dialog.addEventListener('keydown', (e) => e.stopPropagation());
+
+            dialog.append(heading, body, footer);
+            addStyles();
+            document.body.appendChild(dialog);
+            dialog.showModal();
+            // Not the primary button for a confirmation: Enter shouldn't
+            // start an import by accident
+            (confirm ? body : ok).focus();
+        });
+    }
+
+    // --- Import of a system's configuration ---
+    // The Import button (next to HelloID's "Add new system" button) reads
+    // a file made by the Export button and compares it with the system it
+    // was exported from, found by the system ID in the file. It shows
+    // what differs and, after a confirmation, writes that to HelloID.
+    // Without such a system, a new one is made (also after a confirmation).
+
+    // What to write per type of target system (templateIdentifier), each
+    // step being one request:
+    //   name:   what it writes, for the summary
+    //   path:   where to
+    //   method: how
+    //   body:   (configuration from the file, current one, all systems)
+    //           -> what to send
+    //   before: requests to send first, each with name, path, method, body
+    //           and optionally when: (current) -> is it needed?
+    //   resetsFieldIds: the mapping fields have new IDs afterwards
+    //   usesFieldIds: sent again after such a step, with the new IDs
+    //   note:   what else the user should know, for the summary
+    //   changes: (configuration, current) -> the names of the parts it
+    //           would change, when that's not simply what differs in body
+    const GENERAL_FIELDS = ['displayName', 'description', 'icon', 'isDisabled', 'executeOnPremises',
+        'limitConcurrentActionsConfiguration'];
+    const POWERSHELL_IMPORT_STEPS = [
+        {
+            name: 'General settings',
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/general`,
+            method: 'POST',
+            body: (configuration) => Object.fromEntries(GENERAL_FIELDS.map(f => [f, configuration[f]])),
+        },
+        // The systems this one waits for. The request wants more about each
+        // of them than the configuration has; that comes from the list of
+        // systems (which also shows if such a system still exists).
+        {
+            name: 'Depends on systems',
+            path: (id) => `/service/provisioning-api/api/target-systems/${id}/depend-on-systems`,
+            method: 'POST',
+            body: (configuration, current, systems) => ({
+                dependOnSystems: (configuration.dependOnSystems ?? []).map(dependency => {
+                    const system = systems.find(s => s.systemId === dependency.systemId);
+                    if (!system) {
+                        throw new Error(`The system depends on a system (ID ${dependency.systemId}) ` +
+                                        'that was not found in this HelloID environment.');
+                    }
+                    return {
+                        systemId: system.systemId,
+                        displayName: system.displayName,
+                        internalSystemReferenceName: system.internalSystemReferenceName,
+                        templateIdentifier: system.templateIdentifier,
+                    };
+                }),
+            }),
+            changes: (configuration, current) => {
+                const ids = (c) => (c.dependOnSystems ?? []).map(d => d.systemId).sort().join();
+                return ids(configuration) === ids(current) ? [] : ['dependOnSystems'];
+            },
+        },
+        {
+            name: 'Configuration values',
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/script-configuration`,
+            method: 'POST',
+            body: (configuration) => ({ scriptConfiguration: configuration.scriptConfiguration }),
+        },
+        {
+            name: 'Account scripts and configuration form',
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/account`,
+            method: 'POST',
+            body: (configuration) => ({
+                scripts: Object.fromEntries(Object.entries(configuration.scripts ?? {})
+                    .filter(([key]) => key.startsWith('account'))),
+                scriptConfigurationForm: configuration.scriptConfigurationForm,
+                scriptConfiguration: configuration.scriptConfiguration,
+            }),
+        },
+        // All thresholds in one request
+        {
+            name: 'Thresholds',
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/thresholds`,
+            method: 'POST',
+            body: (configuration) => configuration.thresholds ?? [],
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c === 'thresholds'),
+        },
+        // All resources (with their scripts) in one request. They belong
+        // to the system they are sent to; one that the system already has
+        // (same name) keeps the ID it has there.
+        {
+            name: 'Resources',
+            path: POWERSHELL_RESOURCES_PATH,
+            method: 'POST',
+            body: (configuration, current) => (configuration.resources ?? []).map(resource => ({
+                ...resource,
+                systemId: current.systemId,
+                // In a new system: an ID of its own, as the file's may be
+                // in use by the system it was exported from
+                resourceDefinitionId: matchingResource(resource, current.resources ?? [])?.resourceDefinitionId ??
+                    (current.isNew ? crypto.randomUUID() : resource.resourceDefinitionId),
+            })),
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c.startsWith(RESOURCE)),
+        },
+        // All permission sets (with their scripts) in one request
+        {
+            name: 'Permissions',
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/permissions`,
+            method: 'POST',
+            body: (configuration) => ({ permissions: configuration.permissions ?? [] }),
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c.startsWith(PERMISSION_SET)),
+        },
+        // The whole mapping, in the format of HelloID's own mapping export
+        // ("v1"): names instead of the numbers the configuration has.
+        // That request only adds fields, so first all fields are deleted,
+        // which in turn needs correlation to be off. The new fields get new
+        // IDs: correlation (next step) always has to be set again after this.
+        {
+            name: 'Mapping (all fields)',
+            resetsFieldIds: true,
+            note: 'replaces the whole mapping: turns correlation off, deletes all fields, then adds those of the file',
+            before: [
+                {
+                    name: 'Turn correlation off',
+                    when: (current) => current.correlationConfiguration?.enabled === true,
+                    path: (id) => `/connector/powershell-target/api/configuration/${id}/correlation-configuration`,
+                    method: 'POST',
+                    body: (configuration, current) => ({ ...current.correlationConfiguration, enabled: false }),
+                },
+                {
+                    name: 'Delete all mapping fields',
+                    path: (id) => `/connector/powershell-target/api/mapping/${id}/fields`,
+                    method: 'DELETE',
+                },
+            ],
+            path: (id) => `/connector/powershell-target/api/mapping/${id}/import`,
+            method: 'POST',
+            body: (configuration) => ({
+                Version: 'v1',
+                MappingFields: (configuration.mappingConfiguration?.fields ?? []).map(field => ({
+                    Name: field.name,
+                    Description: field.description,
+                    Type: mappingName(MAPPING_TYPES, field.type, 'type', field),
+                    MappingActions: (field.mappingActions ?? []).map(action => ({
+                        MapForActions: (action.entitlementActions ?? [])
+                            .map(n => mappingName(MAPPING_ACTIONS, n, 'action', field)),
+                        MappingMode: mappingName(MAPPING_MODES, action.mode, 'mode', field),
+                        Value: JSON.stringify(action.value ?? null),
+                        UsedInNotifications: action.usedInNotifications === true,
+                        StoreInAccountData: action.storeInAccountData === true,
+                    })),
+                })),
+                UniqueFieldNames: (configuration.mappingConfiguration?.uniquenessConfiguration
+                    ?.selectedUniqueFields ?? []).map(id => mappingFieldName(configuration, id)),
+            }),
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c.startsWith(MAPPING_FIELD)),
+        },
+        // The fields to check are given by their IDs in the system as it is
+        // then, like the correlation field below
+        {
+            name: 'Uniqueness check',
+            usesFieldIds: true,
+            path: (id) => `/connector/powershell-target/api/mapping/${id}/uniqueness`,
+            method: 'POST',
+            body: (configuration, current) => {
+                const { script, mappingEntitlementActions, selectedUniqueFields } =
+                    configuration.mappingConfiguration?.uniquenessConfiguration ?? {};
+                const currentFields = current.mappingConfiguration?.fields ?? [];
+                return {
+                    script,
+                    mappingEntitlementActions,
+                    selectedUniqueFields: (selectedUniqueFields ?? []).map(id => {
+                        const name = mappingFieldName(configuration, id);
+                        const field = currentFields.find(f => f.name === name);
+                        if (!field) throw new Error(`The unique field "${name}" is not in the mapping.`);
+                        return field.identifier;
+                    }),
+                };
+            },
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c === UNIQUENESS),
+        },
+        // The correlation field is given by its ID in the system as it is
+        // then (after the mapping step: its new ID), found by its name.
+        // On or off as in the file.
+        {
+            name: 'Correlation',
+            usesFieldIds: true,
+            path: (id) => `/connector/powershell-target/api/configuration/${id}/correlation-configuration`,
+            method: 'POST',
+            body: (configuration, current) => {
+                const { enabled, accountFieldId, personPropertyPath } = configuration.correlationConfiguration ?? {};
+                const name = mappingFieldName(configuration, accountFieldId);
+                const field = (current.mappingConfiguration?.fields ?? []).find(f => f.name === name);
+                if (enabled && !field) {
+                    const inFile = (configuration.mappingConfiguration?.fields ?? [])
+                        .some(f => f.identifier === accountFieldId);
+                    throw new Error(inFile
+                        ? `Correlation is on in the file, but its field ("${name}") is not in the mapping of the system.`
+                        : 'Correlation is on in the file, but correlationConfiguration.accountFieldId ' +
+                          `(${accountFieldId}) is not the identifier of a mapping field in the file. ` +
+                          'Set it to the identifier of the field to correlate on.');
+                }
+                return { enabled: enabled === true, accountFieldId: field?.identifier ?? null, personPropertyPath };
+            },
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c === CORRELATION),
+        },
+    ];
+
+    const CORRELATION = 'correlationConfiguration';
+    const UNIQUENESS = 'mappingConfiguration.uniquenessConfiguration';
+
+    // Name of the mapping field with this ID (IDs differ per system and
+    // change when the mapping is imported; names don't)
+    const mappingFieldName = (configuration, identifier) =>
+        (configuration.mappingConfiguration?.fields ?? []).find(f => f.identifier === identifier)?.name ?? identifier;
+
+    // The names HelloID's mapping export uses for the numbers in the
+    // configuration. Another number stops the import instead of being
+    // guessed.
+    const MAPPING_TYPES = { 1: 'Text', 2: 'Array' };
+    const MAPPING_MODES = { 0: 'None', 1: 'Fixed', 2: 'Field', 3: 'Complex' };
+    const MAPPING_ACTIONS = { 1: 'Create', 2: 'Enable', 3: 'Update', 4: 'Disable', 5: 'Delete' };
+
+    function mappingName(names, number, what, field) {
+        if (!(number in names)) {
+            throw new Error(`Mapping field "${field.name}" has ${what} ${number}, which this script doesn't know.`);
+        }
+        return names[number];
+    }
+
+    // Is there a target system with this name already?
+    const NAME_EXISTS_PATH = (name) =>
+        `/service/provisioning-api/api/target-systems/exists?name=${encodeURIComponent(name)}`;
+
+    // Makes a new, empty system of a type; answers its ID
+    const CREATE_PATHS = {
+        'powershell-target': '/connector/powershell-target/api/configuration/create/powershell-target',
+        'powershell-onpremise': '/connector/powershell-target/api/configuration/create/powershell-onpremise',
+    };
+
+    const IMPORT_STEPS = {
+        'powershell-onpremise': POWERSHELL_IMPORT_STEPS,
+        'powershell-target': POWERSHELL_IMPORT_STEPS,
+    };
+
+    // Secrets that were left out of the file ("***") keep the value the
+    // system has now
+    function restoreSecrets(configuration, current) {
+        if (!isPlainObject(configuration.scriptConfiguration)) return configuration;
+        const values = { ...configuration.scriptConfiguration };
+        Object.keys(values).forEach(key => {
+            if (values[key] === EXPORT_MASK) values[key] = current.scriptConfiguration?.[key] ?? null;
+        });
+        return { ...configuration, scriptConfiguration: values };
+    }
+
+    // Lets the user pick the file to import; null when cancelled
+    async function pickImportFile() {
+        if (typeof pageWindow.showOpenFilePicker === 'function') {
+            try {
+                const [handle] = await pageWindow.showOpenFilePicker({
+                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+                });
+                return (await handle.getFile()).text();
+            } catch (e) {
+                if (e?.name === 'AbortError') return null; // cancelled
+                throw e;
+            }
+        }
+        return new Promise((resolve, reject) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json,application/json';
+            input.addEventListener('change', () => {
+                const file = input.files[0];
+                if (file) file.text().then(resolve, reject);
+                else resolve(null);
+            });
+            input.addEventListener('cancel', () => resolve(null));
+            input.click();
+        });
+    }
+
+    const MAPPING_FIELD = 'mapping field ';
+    const PERMISSION_SET = 'permission set ';
+    const RESOURCE = 'resource ';
+
+    const matchingResource = (resource, resources) =>
+        resources.find(o => o.resourceDefinitionId === resource.resourceDefinitionId) ??
+        resources.find(o => o.displayName === resource.displayName);
+
+    // Names of the parts of a configuration (or of a step's body) that
+    // differ from the system's current one, e.g. "scripts.accountCreate",
+    // 'mapping field "mail"', 'mapping field "mail" (not in the system)'
+    // or 'permission set "Groups"'
+    function changedParts(body, currentBody) {
+        const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+        const keysOf = (...objects) => [...new Set(objects.flatMap(o => Object.keys(o ?? {})))];
+        return keysOf(body, currentBody).flatMap(key => {
+            if (key === 'mappingConfiguration') {
+                // By name and without the IDs, which an import changes
+                const withoutIds = ({ identifier, mappingActions, ...field }) => ({
+                    ...field,
+                    mappingActions: (mappingActions ?? []).map(({ mappingActionId, ...action }) => action),
+                });
+                const fieldsOf = (c) => new Map((c.mappingConfiguration?.fields ?? []).map(f => [f.name, withoutIds(f)]));
+                const mine = fieldsOf(body);
+                const theirs = fieldsOf(currentBody);
+                // The rest, with the unique fields by name as well
+                const restOf = (c) => {
+                    const { fields, ...rest } = c.mappingConfiguration ?? {};
+                    const unique = rest.uniquenessConfiguration;
+                    return !unique ? rest : {
+                        ...rest,
+                        uniquenessConfiguration: {
+                            ...unique,
+                            selectedUniqueFields: (unique.selectedUniqueFields ?? [])
+                                .map(id => mappingFieldName(c, id)).sort(),
+                        },
+                    };
+                };
+                const rest = restOf(body);
+                const currentRest = restOf(currentBody);
+                return [
+                    ...[...mine.values()].filter(f => !same(f, theirs.get(f.name))).map(f =>
+                        `${MAPPING_FIELD}"${f.name}"${theirs.has(f.name) ? '' : ' (not in the system)'}`),
+                    ...[...theirs.values()].filter(f => !mine.has(f.name)).map(f =>
+                        `${MAPPING_FIELD}"${f.name}" (not in the file)`),
+                    ...changedParts(rest, currentRest).map(c => `mappingConfiguration.${c}`),
+                ];
+            }
+            if (key === 'resources') {
+                // Only when both sides have them (older files don't)
+                if (!Array.isArray(body.resources) || !Array.isArray(currentBody.resources)) return [];
+                const mine = body.resources;
+                const theirs = currentBody.resources;
+                const withoutIds = ({ systemId, resourceDefinitionId, ...resource }) => resource;
+                return [
+                    ...mine.filter(r => !matchingResource(r, theirs)).map(r =>
+                        `${RESOURCE}"${r.displayName}" (not in the system)`),
+                    ...mine.filter(r => matchingResource(r, theirs) &&
+                                        !same(withoutIds(r), withoutIds(matchingResource(r, theirs))))
+                        .map(r => `${RESOURCE}"${r.displayName}"`),
+                    ...theirs.filter(r => !matchingResource(r, mine)).map(r =>
+                        `${RESOURCE}"${r.displayName}" (not in the file)`),
+                ];
+            }
+            if (key === 'permissions') {
+                // By ID, or else by name: HelloID gives a new set an ID of
+                // its own, so the same set can have another ID in the file
+                const mine = body.permissions ?? [];
+                const theirs = currentBody.permissions ?? [];
+                const match = (set, sets) => sets.find(o => o.identification === set.identification) ??
+                    sets.find(o => o.displayName === set.displayName);
+                const withoutId = ({ identification, ...set }) => set;
+                return [
+                    ...mine.filter(set => !match(set, theirs)).map(set =>
+                        `${PERMISSION_SET}"${set.displayName}" (not in the system)`),
+                    ...mine.filter(set => match(set, theirs) && !same(withoutId(set), withoutId(match(set, theirs))))
+                        .map(set => `${PERMISSION_SET}"${set.displayName}"`),
+                    ...theirs.filter(set => !match(set, mine)).map(set =>
+                        `${PERMISSION_SET}"${set.displayName}" (not in the file)`),
+                ];
+            }
+            if (key === CORRELATION) {
+                // The field by its name instead of its ID
+                const named = (c) => c[CORRELATION] && {
+                    ...c[CORRELATION],
+                    accountFieldId: mappingFieldName(c, c[CORRELATION].accountFieldId),
+                };
+                return same(named(body), named(currentBody)) ? [] : [key];
+            }
+            if (key === 'scripts') {
+                return keysOf(body.scripts, currentBody.scripts)
+                    .filter(s => !same(body.scripts?.[s], currentBody.scripts?.[s]))
+                    .map(s => `scripts.${s}`);
+            }
+            return same(body[key], currentBody[key]) ? [] : [key];
+        });
+    }
+
+    // false: cancelled
+    async function importSystem() {
+        const text = await pickImportFile();
+        if (text === null) return false;
+
+        let data;
+        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        if (!isPlainObject(data?.configuration) || typeof data.templateIdentifier !== 'string') {
+            throw new Error('The file is not an export of a target system.');
+        }
+        const steps = IMPORT_STEPS[data.templateIdentifier];
+        if (!steps) throw new Error(`Import is not supported for systems of type "${data.templateIdentifier}".`);
+        // Older exports only have these inside the configuration
+        const systemId = data.systemId ?? data.configuration.systemId;
+        const fileName = data.displayName ?? data.configuration.displayName ?? '?';
+        if (!systemId) throw new Error('The file has no system ID. Export the system again.');
+
+        // The file has to be right in itself: correlation that is on needs
+        // its field in the file's own mapping
+        const fileFields = data.configuration.mappingConfiguration?.fields ?? [];
+        const fileCorrelation = data.configuration.correlationConfiguration;
+        if (fileCorrelation?.enabled === true &&
+            !fileFields.some(f => f.identifier === fileCorrelation.accountFieldId)) {
+            throw new Error('Correlation is on in the file, but its field (correlationConfiguration.accountFieldId: ' +
+                            `${fileCorrelation.accountFieldId}) is not in the mapping of the file. ` +
+                            'Nothing was imported.');
+        }
+
+        const systems = await fetchSystems();
+        let system = systems.find(s => s?.systemId === systemId);
+        const created = !system;
+        if (created) system = await createSystemFor(data, fileName, systemId, steps, systems);
+        if (!system) return false; // cancelled
+        if (system.templateIdentifier !== data.templateIdentifier) {
+            throw new Error(`The file is of a system of type "${data.templateIdentifier}", ` +
+                            `but "${system.displayName}" is of type "${system.templateIdentifier}".`);
+        }
+
+        const id = encodeURIComponent(system.systemId);
+        const currentPath = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id).configuration;
+        // The resources are a part of their own, in the file and in HelloID;
+        // here they go along with the configuration
+        let resourcesRead = true;
+        const loadCurrent = async () => ({
+            ...(currentPath ? await fetchFromGateway(currentPath) : system),
+            systemId: system.systemId,
+            isNew: created,
+            resources: await fetchFromGateway(POWERSHELL_RESOURCES_PATH(id)).catch(e => {
+                console.warn('[HelloID UX] Import: could not read the resources', e);
+                resourcesRead = false;
+            }),
+        });
+        const current = await loadCurrent();
+        const configuration = { ...restoreSecrets(data.configuration, current), resources: data.resources };
+        const notCompared = !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
+            : !resourcesRead ? 'HelloID did not return the resources of the system'
+            : null;
+
+        // Everything that differs, and which of it a known request can write
+        // (a part that several requests send is listed with the first one)
+        const importable = new Set();
+        const work = steps.map(step => {
+            const changes = (step.changes?.(configuration, current) ??
+                             changedParts(step.body(configuration, current, systems), step.body(current, current, systems)))
+                .filter(c => !importable.has(c));
+            changes.forEach(c => importable.add(c));
+            return { step, changes };
+        }).filter(w => w.changes.length);
+        const others = changedParts(configuration, current).filter(c => !importable.has(c));
+
+        // A new name must not be in use by another system: stop right here
+        if (!created && importable.has('displayName') && typeof configuration.displayName === 'string' &&
+            await fetchFromGateway(NAME_EXISTS_PATH(configuration.displayName)) === true) {
+            throw new Error(`Another target system is already named "${configuration.displayName}". ` +
+                            'Nothing was imported.');
+        }
+
+        const from = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ` +
+                     `${data.exportedAt ?? '?'}`;
+        const skipped = notCompared ? `\n\nResources were not compared: ${notCompared}.` : '';
+        const describe = (title, changes) => `${title}:\n` + changes.map(c => `  - ${c}`).join('\n');
+        const unsupported = others.length ? `\n\n${describe('Not importable, left as is', others)}` : '';
+        if (!work.length) {
+            await showDialog('Import', `${from}\n\n` + (created ? `Created "${system.displayName}". ` : '') +
+                (others.length
+                    ? `Nothing to import into "${system.displayName}".${unsupported}`
+                    : `"${system.displayName}" already has the configuration of the file.`) + skipped);
+            return true;
+        }
+
+        // What to send: the steps with changes, plus, when the mapping is
+        // replaced, the steps that point at mapping fields (new IDs)
+        const replacesMapping = work.some(w => w.step.resetsFieldIds);
+        const plan = steps.filter(step => work.some(w => w.step === step) ||
+                                          (replacesMapping && step.usesFieldIds));
+        const parts = plan.map(step => {
+            const changes = work.find(w => w.step === step)?.changes;
+            const title = step.name + (step.note ? ` (${step.note})` : '');
+            return changes ? describe(title, changes) : `${title}:\n  - set again after the mapping is replaced`;
+        });
+
+        // Build every request once before sending any, so a problem in the
+        // file stops the import before anything is changed. (After the
+        // mapping step the system has the fields of the file.)
+        const afterMapping = replacesMapping
+            ? { ...current, mappingConfiguration: configuration.mappingConfiguration } : current;
+        plan.forEach(step => step.body(configuration, step.usesFieldIds ? afterMapping : current, systems));
+
+        // A system that was just made was confirmed already, and has
+        // nothing to back up
+        if (!created) {
+            if (!await showDialog('Import', `${from}\n\nThis will overwrite in "${system.displayName}":\n\n` +
+                                  `${parts.join('\n\n')}${unsupported}${skipped}\n\n` +
+                                  'A backup of the current configuration is downloaded first.', { confirm: true })) {
+                return false;
+            }
+            await downloadBackup(system.displayName.trim());
+        }
+
+        // Send, in order; the first error stops the import
+        const done = created ? ['Create new system'] : [];
+        let latest = current;
+        const send = async (request) => {
+            await sendToGateway(request.path(id), request.method, request.body?.(configuration, latest, systems));
+            done.push(request.name);
+        };
+        try {
+            for (const step of plan) {
+                for (const request of step.before ?? []) {
+                    if (!request.when || request.when(latest)) await send(request);
+                }
+                await send(step);
+                if (step.resetsFieldIds) latest = await loadImportedFields(loadCurrent, fileFields);
+            }
+        } catch (e) {
+            throw new Error(`${e?.message ?? e}\n\n` +
+                (done.length ? `Done before the error:\n${done.map(d => `  - ${d}`).join('\n')}\n\n`
+                    : 'Nothing was changed yet.\n\n') +
+                'The import stopped there. ' + (created ? 'The new system is in the list of target systems.'
+                    : 'The backup file has the configuration from before the import.'));
+        }
+
+        // A file without secrets: those kept the values the system had
+        const masked = Object.entries(data.configuration.scriptConfiguration ?? {})
+            .filter(([, value]) => value === EXPORT_MASK).map(([key]) => key);
+        const secrets = data.secretsIncluded !== false ? ''
+            : '\n\nThe file was exported without secrets. ' +
+              (created ? 'They are empty in the new system' : 'They kept the values the system already had') +
+              (masked.length ? ` (${masked.join(', ')})` : '') +
+              (created ? ': set them by hand.' : ': check them, and set them by hand where needed.');
+        await showDialog('Import finished', `${created ? 'Created' : 'Imported into'} "${system.displayName}":\n\n${done.map(d => `  - ${d}`).join('\n')}${secrets}\n\n` +
+              'The page reloads when you close this message.');
+        location.reload(); // show the changes
+        return true;
+    }
+
+    // The file's system isn't in this environment: make a new, empty one
+    // for it, after a confirmation. Returns the new system as in the list
+    // of systems, or null when cancelled. Everything that can be checked
+    // is checked first, so no empty system is left behind for a file that
+    // can't be imported.
+    async function createSystemFor(data, fileName, systemId, steps, systems) {
+        const createPath = CREATE_PATHS[data.templateIdentifier];
+        if (!createPath) {
+            throw new Error(`The system of the file ("${fileName}", ID ${systemId}) was not found in this ` +
+                            `HelloID environment, and systems of type "${data.templateIdentifier}" can't be created.`);
+        }
+        const name = data.configuration.displayName;
+        if (typeof name === 'string' && await fetchFromGateway(NAME_EXISTS_PATH(name)) === true) {
+            throw new Error(`The system of the file (ID ${systemId}) was not found in this HelloID environment, ` +
+                            `and a new one can't be made: another target system is already named "${name}". ` +
+                            'Nothing was imported.');
+        }
+        // Build every request once, as if for a system that already has
+        // the mapping of the file
+        const configuration = { ...data.configuration, resources: data.resources };
+        const empty = { systemId: '', isNew: true, resources: [], mappingConfiguration: configuration.mappingConfiguration };
+        steps.forEach(step => step.body(configuration, empty, systems));
+
+        if (!await showDialog('Import: new system',
+            `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}\n\n` +
+            `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n` +
+            `A NEW target system "${name}" (type ${data.templateIdentifier}) will be created, and the ` +
+            'configuration of the file is then imported into it.' +
+            (data.secretsIncluded === false
+                ? '\n\nThe file has no secrets: those will be empty in the new system.' : ''),
+            { confirm: true })) {
+            return null;
+        }
+        const newId = await sendToGateway(createPath, 'POST', {});
+        if (typeof newId !== 'string' || !newId) {
+            throw new Error('HelloID did not return the ID of the new system. Check the list of target systems.');
+        }
+        return { systemId: newId, displayName: name, templateIdentifier: data.templateIdentifier };
+    }
+
+    // After the mapping is replaced: the system with its new fields (and
+    // their new IDs). HelloID may need a moment before it shows them.
+    async function loadImportedFields(loadCurrent, fileFields) {
+        for (let attempt = 0; ; attempt++) {
+            const current = await loadCurrent();
+            const names = new Set((current.mappingConfiguration?.fields ?? []).map(f => f.name));
+            if (fileFields.every(f => names.has(f.name))) return current;
+            if (attempt >= 9) {
+                throw new Error('The mapping fields were sent, but HelloID does not show them (yet).');
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
+
+    // The system as it is now, saved as a normal download (no save dialog:
+    // that needs a click of its own)
+    async function downloadBackup(name) {
+        const json = JSON.stringify(await collectSystemExport(name), null, 2);
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+        link.download = exportFileName(`${name} - backup before import`);
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    }
+
+    async function sendToGateway(path, method, body) {
+        const response = await origFetch.call(pageWindow, gateway.origin + path, {
+            method,
+            headers: body === undefined ? gateway.headers : { ...gateway.headers, 'Content-Type': 'application/json' },
+            credentials: gateway.withCredentials ? 'include' : 'same-origin',
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        if (!response.ok) {
+            const detail = (await response.text().catch(() => '')).slice(0, 300);
+            throw new Error(`HelloID answered ${response.status} for ${method} ${path}` + (detail ? `\n${detail}` : ''));
+        }
+        // The answer, if any (most requests have none)
+        const answer = await response.text().catch(() => '');
+        try { return JSON.parse(answer); } catch { return answer; }
+    }
+
+    const IMPORT_BTN_CLASS = 'tm-import-system';
+
+    // Next to HelloID's "Add new system" button on the target systems page
+    function addImportButton() {
+        const addBtn = document.querySelector('button[data-cy="add-target-system"]');
+        if (!addBtn || addBtn.parentElement.querySelector(`.${IMPORT_BTN_CLASS}`)) return;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `btn btn-xs btn-default ${IMPORT_BTN_CLASS}`;
+        btn.title = 'Import the configuration from an exported JSON file';
+        // The header spreads its items out: keep this one with the Add button
+        btn.style.marginLeft = 'auto';
+        const icon = document.createElement('i');
+        icon.className = 'fa-solid fa-upload';
+        btn.appendChild(icon);
+
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            icon.className = 'fa-solid fa-spinner fa-spin';
+            let result = 'fa-solid fa-upload';
+            try {
+                if (await importSystem()) result = 'fa-solid fa-check';
+            } catch (err) {
+                console.warn('[HelloID UX] Import failed', err);
+                result = 'fa-solid fa-xmark';
+                await showDialog('Import failed', String(err?.message ?? err));
+            }
+            icon.className = result;
+            btn.disabled = false;
+            setTimeout(() => { icon.className = 'fa-solid fa-upload'; }, SETTINGS.copyFeedbackMs);
+        });
+        addBtn.before(btn);
     }
 
     function findTileByName(name) {
@@ -2678,6 +3421,38 @@
         .tm-progress { display: flex; align-items: center; gap: 6px; }
         .tm-progress .progress { flex: 1; height: 10px; margin: 0; }
 
+        /* Our own dialog (see showDialog) */
+        .${DIALOG_CLASS} {
+            width: min(800px, 92vw);
+            max-height: 85vh;
+            padding: 20px;
+            border: none;
+            border-radius: 6px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, .3);
+            color: inherit;
+        }
+        .${DIALOG_CLASS}[open] { display: flex; flex-direction: column; gap: 15px; }
+        .${DIALOG_CLASS}::backdrop { background: rgba(0, 0, 0, .4); }
+        .${DIALOG_CLASS} h5 { margin: 0; }
+        /* The message: scrolls, wraps, and can be selected */
+        .${DIALOG_CLASS} pre {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            margin: 0;
+            padding: 0;
+            border: none;
+            background: none;
+            font: inherit;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            user-select: text;
+        }
+        .tm-dialog-footer { display: flex; gap: 8px; }
+        /* Copy: the color of the main button, lighter */
+        .tm-dialog-copy { opacity: .55; }
+        .tm-dialog-copy:hover, .tm-dialog-copy:focus { opacity: .8; }
+
         /* Filter panels show all items now (see the slice patch), so the
            "Maximum of 50 entries shown" warning no longer applies. */
         helloid-filter-panels i.fa-warning[title^="Maximum of ${FILTER_PANEL_LIMIT} entries"] {
@@ -2779,6 +3554,7 @@
                 addStyles();
                 addCopyButtons();
                 setupSystemList();
+                addImportButton();
                 addGridFlagButtons();
                 hideLimitWarnings();
                 addRuleStatusFilter();
