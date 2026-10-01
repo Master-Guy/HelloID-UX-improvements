@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.5
+// @version      2026-10-01.6
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -41,23 +41,20 @@
         // before reloading, so several buttons can be set in one go.
         filterReloadDelayMs: 1500,
 
-        // All filter and sort buttons: color per status
-        filterColors: {
-            unknown:  '#cdcdcd',  // off: not filtering
-            enabled:  'black',    // on: only the rows that have it
-            disabled: 'red',      // inverted: only the rows that don't have it
-        },
-
         // Copy buttons: how long the check/cross is shown after copying
         copyFeedbackMs: 1000,
+
+        // Target system export: also write the values of password fields
+        // to the file. Off: those values are replaced by "***".
+        exportSecrets: false,
     });
 
     const SETTINGS_KEY = 'settings';
 
     const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-    // Defaults + stored overrides. Nested objects (like filterColors) are
-    // merged too, so overriding one color keeps the other defaults.
+    // Defaults + stored overrides. Nested objects are
+    // merged too, so overriding one value in them keeps the others.
     function mergeSettings(defaults, overrides) {
         const result = { ...defaults };
         for (const [key, value] of Object.entries(overrides || {})) {
@@ -99,7 +96,7 @@
         const n = Number(v);
         return Number.isInteger(n) && n > 0 ? n : undefined;
     };
-    const parseColor = (v) => (CSS.supports('color', v) ? v : undefined);
+    const parseYesNo = (v) => (/^(yes|true|1)$/i.test(v) ? true : /^(no|false|0)$/i.test(v) ? false : undefined);
 
     const SETTING_DEFS = [
         {
@@ -127,27 +124,13 @@
             hint: 'a whole number of minutes',
         },
         {
-            path: 'filterColors.unknown',
-            label: 'Filter buttons: color when off',
-            description: 'Color of a filter or sort button that is off (not filtering or sorting).',
-            parse: parseColor,
-            hint: 'a CSS color, e.g. #cdcdcd or grey',
-        },
-        {
-            path: 'filterColors.enabled',
-            label: 'Filter buttons: color when on',
-            description: 'Color of a filter or sort button that is on: only the rows that have what the button ' +
-                         'stands for are shown (e.g. only rules WITH this entitlement, only rules the person is in).',
-            parse: parseColor,
-            hint: 'a CSS color, e.g. black or #000',
-        },
-        {
-            path: 'filterColors.disabled',
-            label: 'Filter buttons: color when inverted',
-            description: 'Color of a filter button that shows the opposite: only the rows that do NOT have what ' +
-                         'the button stands for (e.g. only rules WITHOUT this entitlement, only rules the person is not in).',
-            parse: parseColor,
-            hint: 'a CSS color, e.g. red or #c00',
+            path: 'exportSecrets',
+            label: 'Target system export: include secrets',
+            description: 'Whether the export of a target system also contains the values of its password fields ' +
+                         '(e.g. an app secret). With "no", those values are replaced by "***". ' +
+                         'Secrets typed into the scripts themselves are always exported.',
+            parse: parseYesNo,
+            hint: 'yes or no',
         },
         {
             path: 'filterReloadDelayMs',
@@ -211,10 +194,11 @@
 
     const statusOrder = Object.values(ButtonStatus);
 
+    // Color of a filter or sort button, per status
     const statusColor = {
-        [ButtonStatus.UNKNOWN]:  SETTINGS.filterColors.unknown,
-        [ButtonStatus.ENABLED]:  SETTINGS.filterColors.enabled,
-        [ButtonStatus.DISABLED]: SETTINGS.filterColors.disabled,
+        [ButtonStatus.UNKNOWN]:  '#cdcdcd', // off: not filtering
+        [ButtonStatus.ENABLED]:  'black',   // on: only the rows that have it
+        [ButtonStatus.DISABLED]: 'red',     // inverted: only the rows that don't have it
     };
 
     const FILTERS = [
@@ -323,6 +307,13 @@
     const onPage = (route) => !route || location.hash.includes(route);
     const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url) && onPage(i.route));
 
+    // HelloID's API server, as seen in its own requests: where it is and
+    // the headers (login) to send along. For requests of our own.
+    let gateway = null; // { origin, headers, withCredentials }
+    const isGatewayUrl = (url) => {
+        try { return /gateway/i.test(new URL(url, location.href).hostname); } catch { return false; }
+    };
+
     // Responses that are only read, not changed. onData: the parsed response
     const WATCHES = [
         // Persons > Rules tab: the IDs of the rules the selected person is in
@@ -334,6 +325,7 @@
     const watchFor = (url) => WATCHES.find(w => w.pattern.test(url));
 
     function watched(watch, raw) {
+        if (raw == null || raw === '') return; // no content
         try {
             watch.onData(typeof raw === 'string' ? JSON.parse(raw) : raw);
         } catch (e) {
@@ -525,12 +517,20 @@
     const proto = pageWindow.XMLHttpRequest.prototype;
     const origOpen = proto.open;
     const origSend = proto.send;
+    const origSetRequestHeader = proto.setRequestHeader;
     const origResponse = Object.getOwnPropertyDescriptor(proto, 'response').get;
     const origResponseText = Object.getOwnPropertyDescriptor(proto, 'responseText').get;
+
+    proto.setRequestHeader = function (name, value) {
+        if (this._tmHeaders) this._tmHeaders[name] = String(value);
+        return origSetRequestHeader.call(this, name, value);
+    };
 
     proto.open = function (method, url, ...rest) {
         const s = String(url);
         delete this._tmResult;
+        this._tmHeaders = {};
+        this._tmUrl = s;
         if (interceptFor(s)) {
             this._tmPage = rewriteUrl(s);
             if (this._tmPage.loads) {
@@ -557,6 +557,16 @@
     // A request that is answered from the cache waits until the full data
     // is there
     proto.send = function (...args) {
+        // Remember how HelloID talks to its API server
+        const headers = this._tmHeaders ?? {};
+        if (isGatewayUrl(this._tmUrl) && Object.keys(headers).some(h => /^authorization$/i.test(h))) {
+            gateway = {
+                origin: new URL(this._tmUrl, location.href).origin,
+                headers: Object.fromEntries(Object.entries(headers).filter(([h]) => !/^content-type$/i.test(h))),
+                withCredentials: this.withCredentials,
+            };
+        }
+
         const page = this._tmPage;
         if (page && !page.loads && !page.entry.data) {
             page.entry.ready.then(() => origSend.apply(this, args));
@@ -1013,7 +1023,7 @@
         return btn;
     }
 
-    // --- Target systems overview: tiles ---
+    // --- Target systems overview: tiles (copy and export buttons) ---
     function addSystemTileCopyButtons() {
         document.querySelectorAll('helloid-provisioning-system-tile').forEach(tile => {
             if (tile.querySelector(`.${COPY_BTN_CLASS}`)) return;
@@ -1021,11 +1031,12 @@
             const configureBtn = tile.querySelector('button[title="configure" i]');
             if (!configureBtn) return;
 
-            const btn = createCopyButton(
-                () => tile.querySelector('h5')?.innerText,
-                configureBtn.className
+            // The name at click time: HelloID may reuse a tile for another system
+            const name = () => tile.querySelector('h5')?.innerText.trim() ?? '';
+            configureBtn.before(
+                createCopyButton(name, configureBtn.className),
+                createExportButton(name, configureBtn.className),
             );
-            configureBtn.before(btn);
         });
     }
 
@@ -1632,6 +1643,168 @@
         return btn;
     }
 
+    // --- Export of a system's configuration ---
+    // The Export button (list and tiles) saves what HelloID knows about one
+    // target system in a single JSON file: its configuration, what its
+    // type adds to that (e.g. the scripts of a PowerShell system), and the
+    // business rules that have an entitlement for it. The data comes
+    // straight from HelloID's API, with the login headers of HelloID's own
+    // requests (see "gateway").
+
+    // All target systems, with their general configuration (mapping,
+    // correlation, thresholds, ...)
+    const SYSTEMS_PATH = '/service/provisioning-api/api/target-systems?showReferenceSystems=true';
+
+    // What else to fetch per type of target system (templateIdentifier):
+    // name in the export -> path. "configuration" replaces the system's
+    // entry from SYSTEMS_PATH (it has the same, and more). Other types
+    // are exported with what all types have.
+    const CONNECTOR_EXPORTS = {
+        'powershell-onpremise': (id) => ({
+            configuration: `/connector/powershell-target/api/configuration/${id}`,
+            defaultScripts: `/connector/powershell-target/api/configuration/${id}/default`,
+        }),
+    };
+
+    // Message shown after saving the export, per type of target system
+    const DECOMMISSIONED_NOTICE =
+        'Due to this system type being decommissioned and lack of support, we cannot save ' +
+        'all configuration items for this Target System. Please be careful when modifying ' +
+        'this Target System.\n\n' +
+        'Recommendation: Migrate to a PowerShell v2 connector.';
+    const EXPORT_NOTICES = {
+        'azuread': DECOMMISSIONED_NOTICE,
+        'activedirectory': DECOMMISSIONED_NOTICE,
+    };
+
+    const EXPORT_MASK = '***'; // instead of a secret, when not exported
+
+    const RULE_ENTITLEMENT_FIELDS = FILTERS.map(f => f.field);
+
+    // Password fields of the configuration form: their values are secrets
+    function maskSecrets(configuration) {
+        const secretKeys = (configuration.scriptConfigurationForm?.fields ?? [])
+            .filter(f => f.templateOptions?.type === 'password')
+            .map(f => f.key);
+        if (!secretKeys.length || !isPlainObject(configuration.scriptConfiguration)) return configuration;
+        const values = { ...configuration.scriptConfiguration };
+        secretKeys.forEach(key => { if (values[key] != null && values[key] !== '') values[key] = EXPORT_MASK; });
+        return { ...configuration, scriptConfiguration: values };
+    }
+
+    async function fetchFromGateway(path) {
+        const response = await origFetch.call(pageWindow, gateway.origin + path, {
+            headers: gateway.headers,
+            credentials: gateway.withCredentials ? 'include' : 'same-origin',
+        });
+        if (!response.ok) throw new Error(`HelloID answered ${response.status} for ${path}`);
+        return response.json();
+    }
+
+    async function collectSystemExport(name) {
+        if (!gateway) throw new Error('No request of HelloID seen yet. Reload the page and try again.');
+
+        const systems = await fetchFromGateway(SYSTEMS_PATH);
+        const system = (Array.isArray(systems) ? systems : [])
+            .find(s => typeof s?.displayName === 'string' && s.displayName.trim() === name);
+        if (!system) throw new Error(`"${name}" was not found in HelloID's list of target systems.`);
+
+        const id = encodeURIComponent(system.systemId);
+        const paths = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id) ?? {};
+        const names = Object.keys(paths);
+        const [rules, ...answers] = await Promise.all([
+            fetchFromGateway(`/api/connectors/shared/rules/published/${id}/entitlements-overview` +
+                             `?skip=0&take=${SETTINGS.fetchAllTake}`),
+            ...names.map(n => fetchFromGateway(paths[n])),
+        ]);
+        const { configuration = system, ...others } = Object.fromEntries(names.map((n, i) => [n, answers[i]]));
+
+        return {
+            exportedAt: new Date().toISOString(),
+            exportedFrom: location.origin,
+            exportedBy: `HelloID UX improvements ${typeof GM_info !== 'undefined' ? GM_info.script.version : ''}`.trim(),
+            secretsIncluded: SETTINGS.exportSecrets,
+            templateIdentifier: system.templateIdentifier,
+            configuration: SETTINGS.exportSecrets ? configuration : maskSecrets(configuration),
+            ...others,
+            // Only the rules that have an entitlement for this system
+            rules: (rules.pageData ?? []).filter(r => RULE_ENTITLEMENT_FIELDS.some(f => r[f] === true)),
+        };
+    }
+
+    const exportFileName = (name) =>
+        `${name.replace(/[\\/:*?"<>|]+/g, '_').trim()} - ${new Date().toISOString().slice(0, 10)}.json`;
+
+    // The save dialog has to open right at the click, so first ask where
+    // to save, then collect, then write. Browsers without that dialog get
+    // a normal download.
+    async function exportSystem(name) {
+        let handle = null;
+        if (typeof pageWindow.showSaveFilePicker === 'function') {
+            try {
+                handle = await pageWindow.showSaveFilePicker({
+                    suggestedName: exportFileName(name),
+                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+                });
+            } catch (e) {
+                if (e?.name === 'AbortError') return false; // cancelled
+                throw e;
+            }
+        }
+
+        const data = await collectSystemExport(name);
+        const json = JSON.stringify(data, null, 2);
+
+        if (handle) {
+            const writable = await handle.createWritable();
+            await writable.write(json);
+            await writable.close();
+        } else {
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+            link.download = exportFileName(name);
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+        }
+
+        // After the button shows its check mark
+        const notice = EXPORT_NOTICES[data.templateIdentifier];
+        if (notice) setTimeout(() => alert(notice), 100);
+        return true;
+    }
+
+    // getName is called at click time
+    function createExportButton(getName, className = 'btn btn-default btn-xs') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = className;
+        btn.title = 'Export the configuration to a JSON file';
+        const icon = document.createElement('i');
+        icon.className = 'fa-solid fa-download';
+        btn.appendChild(icon);
+
+        btn.addEventListener('mousedown', (e) => e.stopPropagation());
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            icon.className = 'fa-solid fa-spinner fa-spin';
+            let result = 'fa-solid fa-download';
+            try {
+                if (await exportSystem(getName())) result = 'fa-solid fa-check';
+            } catch (err) {
+                console.warn('[HelloID UX] Export failed', err);
+                result = 'fa-solid fa-xmark';
+                alert(`Export failed.\n\n${err?.message ?? err}`);
+            }
+            icon.className = result;
+            btn.disabled = false;
+            setTimeout(() => { icon.className = 'fa-solid fa-download'; }, SETTINGS.copyFeedbackMs);
+        });
+        return btn;
+    }
+
     function findTileByName(name) {
         return [...document.querySelectorAll(SYSTEM_TILE)]
             .find(t => t.querySelector('h5.system-header')?.textContent.trim() === name);
@@ -1652,7 +1825,7 @@
             return cell;
         };
 
-        // Name: icon, name, extra labels; copy and configure buttons pinned
+        // Name: icon, name, extra labels; copy, export and configure buttons pinned
         // right. Plain inline content, so the cell's own "..." cuts it off.
         const nameCell = td();
         nameCell.title = row.name;
@@ -1679,7 +1852,8 @@
             findTileByName(row.name)?.querySelector('button[title="Configure" i]')?.click();
         });
 
-        pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'), configure);
+        pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'),
+            createExportButton(() => row.name), configure);
 
         // Summary since, Last updated, Actions, ...
         model.infoLabels.forEach(label => {
