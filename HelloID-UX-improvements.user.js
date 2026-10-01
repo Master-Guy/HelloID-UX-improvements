@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.2
+// @version      2026-10-01.3
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -982,6 +982,8 @@
     // are used on many pages). Without host: any grid on that page.
     const ENTITLEMENTS_ROUTE = '/business/entitlements';
     const EVALUATIONS_ROUTE = '/business/evaluations';
+    const AUDIT_LOGS_ROUTE = '/persons/overview?tab=Audit';
+    const NOTIFICATIONS_ROUTE = '/notifications/configurations';
     const NAME_COLUMNS = [
         { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
         // Its persons: a single column without a header, so any column
@@ -995,6 +997,10 @@
         // Entitlements: Granted and History tabs
         ...['System', 'Person', 'Entitlement name'].map(header => (
             { header, route: ENTITLEMENTS_ROUTE })),
+        // Persons > Audit logs
+        ...['System', 'Message'].map(header => ({ header, route: AUDIT_LOGS_ROUTE })),
+        // Notifications > Configurations
+        ...['Name', 'System'].map(header => ({ header, route: NOTIFICATIONS_ROUTE })),
     ];
 
     // Body cells of the name columns, in all grids on the page
@@ -2129,6 +2135,65 @@
         applyResizable(api);
     }
 
+    // Column widths (px) for grids whose own widths don't fit their
+    // content, by page and header text. The columns start at these widths
+    // and keep them when the grid fits its columns to its width; the
+    // "fill" column takes the space that's left (at least fillMin).
+    const PAGE_COLUMN_WIDTHS = [
+        {
+            route: NOTIFICATIONS_ROUTE,
+            fill: 'Name',
+            fillMin: 250,
+            widths: {
+                'System': 370,
+                'Event': 270,
+                'Notification System': 180,
+                'Enabled': 95,
+                'Last changed on': 160,
+            },
+        },
+    ];
+
+    const pageWidthGrids = new WeakSet(); // grids that have their widths
+
+    function applyPageColumnWidths() {
+        PAGE_COLUMN_WIDTHS.filter(c => location.hash.includes(c.route)).forEach(({ widths, fill, fillMin }) => {
+            const byHeader = Object.fromEntries(
+                Object.entries(widths).map(([header, px]) => [header.toLowerCase(), px]));
+            document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
+                if (pageWidthGrids.has(gridEl)) return;
+                const headers = [...gridEl.querySelectorAll('.ag-header-cell')];
+                const api = headers.length && findGridApi(gridEl);
+                if (!api) return; // grid not ready yet; the observer will retry
+                pageWidthGrids.add(gridEl);
+
+                // Per column ID: what to change in its definition
+                const props = {};
+                let fillId;
+                headers.forEach(h => {
+                    const text = h.textContent.trim().toLowerCase();
+                    const id = h.getAttribute('col-id');
+                    if (text === fill.toLowerCase()) {
+                        fillId = id;
+                        props[id] = { flex: 1 };
+                    } else if (byHeader[text]) {
+                        props[id] = { width: byHeader[text], flex: undefined, suppressSizeToFit: true };
+                    }
+                });
+                setColumnProps(api, props);
+                if (fillId != null) setMinColumnWidth(api, fillId, fillMin);
+            });
+        });
+    }
+
+    function setColumnProps(api, props) {
+        const merge = (defs) => defs.map(d => d.children
+            ? { ...d, children: merge(d.children) }
+            : { ...d, ...props[columnKey(d)] });
+        const defs = api.getColumnDefs();
+        if (defs) setColumnDefs(api, merge(defs));
+    }
+
     // Set while we update the columns, so the resulting newColumnsLoaded
     // event doesn't trigger another update (endless loop if the grid puts
     // a default minWidth back).
@@ -2139,7 +2204,10 @@
         const defs = api.getColumnDefs();
         const mins = minColumnWidths.get(api);
         if (!defs || !needsResizable(defs, mins)) return;
-        const newDefs = withResizable(defs, mins);
+        setColumnDefs(api, withResizable(defs, mins));
+    }
+
+    function setColumnDefs(api, newDefs) {
         applyingResizable = true;
         try {
             if (typeof api.setGridOption === 'function') {
@@ -2343,6 +2411,7 @@
                 hideLimitWarnings();
                 addFilterPanelSearch();
                 makeGridsResizable();
+                applyPageColumnWidths();
             });
         });
         observer.observe(document.documentElement, { childList: true, subtree: true });
