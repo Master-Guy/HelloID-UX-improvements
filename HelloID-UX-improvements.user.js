@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.3
+// @version      2026-10-01.4
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -41,11 +41,11 @@
         // before reloading, so several buttons can be set in one go.
         filterReloadDelayMs: 1500,
 
-        // Entitlements tab: icon colors per filter status
+        // All filter and sort buttons: color per status
         filterColors: {
-            unknown:  '#cdcdcd',  // no filter
-            enabled:  'black',    // only rules WITH this entitlement
-            disabled: 'red',      // only rules WITHOUT this entitlement
+            unknown:  '#cdcdcd',  // off: not filtering
+            enabled:  'black',    // on: only the rows that have it
+            disabled: 'red',      // inverted: only the rows that don't have it
         },
 
         // Copy buttons: how long the check/cross is shown after copying
@@ -128,29 +128,31 @@
         },
         {
             path: 'filterColors.unknown',
-            label: 'Entitlements filter: color for "no filter"',
-            description: 'Icon color of a filter button that is not filtering.',
+            label: 'Filter buttons: color when off',
+            description: 'Color of a filter or sort button that is off (not filtering or sorting).',
             parse: parseColor,
             hint: 'a CSS color, e.g. #cdcdcd or grey',
         },
         {
             path: 'filterColors.enabled',
-            label: 'Entitlements filter: color for "with entitlement"',
-            description: 'Icon color of a filter button that only shows rules WITH this entitlement.',
+            label: 'Filter buttons: color when on',
+            description: 'Color of a filter or sort button that is on: only the rows that have what the button ' +
+                         'stands for are shown (e.g. only rules WITH this entitlement, only rules the person is in).',
             parse: parseColor,
             hint: 'a CSS color, e.g. black or #000',
         },
         {
             path: 'filterColors.disabled',
-            label: 'Entitlements filter: color for "without entitlement"',
-            description: 'Icon color of a filter button that only shows rules WITHOUT this entitlement.',
+            label: 'Filter buttons: color when inverted',
+            description: 'Color of a filter button that shows the opposite: only the rows that do NOT have what ' +
+                         'the button stands for (e.g. only rules WITHOUT this entitlement, only rules the person is not in).',
             parse: parseColor,
             hint: 'a CSS color, e.g. red or #c00',
         },
         {
             path: 'filterReloadDelayMs',
-            label: 'Entitlements filter: reload delay (ms)',
-            description: 'How long to wait after the last click on a filter button before the page reloads, ' +
+            label: 'Target system entitlements: filter reload delay (ms)',
+            description: 'Target system > Entitlements tab: how long to wait after the last click on a filter button before the page reloads, ' +
                          'so you can set several filters in one go.',
             parse: parsePositiveInt,
             hint: 'a whole number of milliseconds',
@@ -274,12 +276,21 @@
     // patching the script's own window would not affect HelloID.
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
+    // Pages (part of their address, after the #)
+    const ENTITLEMENTS_ROUTE = '/business/entitlements';
+    const EVALUATIONS_ROUTE = '/business/evaluations';
+    const AUDIT_LOGS_ROUTE = '/persons/overview?tab=Audit';
+    const NOTIFICATIONS_ROUTE = '/notifications/configurations';
+    const PERSON_RULES_ROUTE = '/persons/overview?tab=Rules';
+    const PERSON_RULES_GRID = 'Condition Summary'; // a header only this grid has
+
     // Paged requests that are fetched in full instead, so they can be
     // filtered here; the app then gets only the page it asked for.
     // filter: all rows -> the rows to show
     // grid: the grid showing these rows, if known (for its loading overlay)
     // limitWarning: text of the page's "only the first N rows" warning,
     //   which no longer applies once all rows are fetched
+    // route: only on pages with this in their address
     const INTERCEPTS = [
         // Target system > Entitlements tab
         { pattern: /\/entitlements-overview(\?|$)/, filter: (all) => all.filter(matchesFilters) },
@@ -301,8 +312,34 @@
             filter: (all) => all,
             limitWarning: 'will only show the first',
         },
+        // Persons > Rules tab (the Business rules page uses the same
+        // request, and is left alone)
+        {
+            pattern: new RegExp('/rules/api/rules/published([?]|$)'),
+            filter: (all) => filterPersonRules(all),
+            route: PERSON_RULES_ROUTE,
+        },
     ];
-    const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url));
+    const onPage = (route) => !route || location.hash.includes(route);
+    const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url) && onPage(i.route));
+
+    // Responses that are only read, not changed. onData: the parsed response
+    const WATCHES = [
+        // Persons > Rules tab: the IDs of the rules the selected person is in
+        {
+            pattern: new RegExp('/evaluation/results/person/[^/?]+/rules([?]|$)'),
+            onData: (ids) => onPersonRules(ids),
+        },
+    ];
+    const watchFor = (url) => WATCHES.find(w => w.pattern.test(url));
+
+    function watched(watch, raw) {
+        try {
+            watch.onData(typeof raw === 'string' ? JSON.parse(raw) : raw);
+        } catch (e) {
+            console.warn('[HelloID UX] Could not read response', e);
+        }
+    }
 
     // Field the grid uses to decide how many rows exist
     const COUNT_KEYS = ['totalRowCount'];
@@ -316,6 +353,7 @@
         const u = new URL(url, location.href);
         u.searchParams.delete('skip');
         u.searchParams.delete('take');
+        u.searchParams.delete('cachebust'); // changes with every request
         u.searchParams.sort();
         return u.toString();
     }
@@ -452,6 +490,12 @@
     const origFetch = pageWindow.fetch;
     pageWindow.fetch = async function (input, init) {
         const url = input instanceof pageWindow.Request ? input.url : String(input);
+        const watch = watchFor(url);
+        if (watch) {
+            const response = await origFetch.call(this, input, init);
+            if (response.ok) response.clone().text().then(text => watched(watch, text), () => {});
+            return response;
+        }
         if (!interceptFor(url)) return origFetch.call(this, input, init);
 
         const page = rewriteUrl(url);
@@ -497,6 +541,16 @@
             return origOpen.call(this, method, this._tmPage.url, ...rest);
         }
         this._tmPage = null;
+        // Listen once per request object; it may be opened again
+        this._tmWatch = watchFor(s);
+        if (this._tmWatch && !this._tmWatching) {
+            this._tmWatching = true;
+            this.addEventListener('load', () => {
+                if (this._tmWatch && this.status >= 200 && this.status < 300) {
+                    watched(this._tmWatch, origResponse.call(this));
+                }
+            });
+        }
         return origOpen.call(this, method, url, ...rest);
     };
 
@@ -980,10 +1034,7 @@
     // button: by column ID, or by header text when the ID isn't known.
     // route: only on pages with this in their address (for hosts that
     // are used on many pages). Without host: any grid on that page.
-    const ENTITLEMENTS_ROUTE = '/business/entitlements';
-    const EVALUATIONS_ROUTE = '/business/evaluations';
-    const AUDIT_LOGS_ROUTE = '/persons/overview?tab=Audit';
-    const NOTIFICATIONS_ROUTE = '/notifications/configurations';
+    // requires: only grids that also have a column with this header.
     const NAME_COLUMNS = [
         { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
         // Its persons: a single column without a header, so any column
@@ -1001,13 +1052,20 @@
         ...['System', 'Message'].map(header => ({ header, route: AUDIT_LOGS_ROUTE })),
         // Notifications > Configurations
         ...['Name', 'System'].map(header => ({ header, route: NOTIFICATIONS_ROUTE })),
+        // Persons > Rules
+        { header: 'Name', route: PERSON_RULES_ROUTE, requires: PERSON_RULES_GRID },
     ];
+
+    const headerTexts = (grid) => [...grid.querySelectorAll('.ag-header-cell')]
+        .map(h => h.textContent.trim().toLowerCase());
+    const hasHeader = (grid, header) => !header || headerTexts(grid).includes(header.toLowerCase());
 
     // Body cells of the name columns, in all grids on the page
     function nameCells() {
         const here = NAME_COLUMNS.filter(c => !c.route || location.hash.includes(c.route));
-        return here.flatMap(({ host, colId, header }) =>
+        return here.flatMap(({ host, colId, header, requires }) =>
             [...document.querySelectorAll(`${host ?? ''} ag-grid-angular`)].flatMap(grid => {
+                if (!hasHeader(grid, requires)) return [];
                 const rows = 'div.ag-body-viewport div[role="row"]';
                 // Any column: the grid may have no header at all
                 if (!colId && header == null) return [...grid.querySelectorAll(`${rows} div[col-id]`)];
@@ -2047,6 +2105,106 @@
     }
 
     // =====================================================================
+    // Persons > Rules: filter on the status ("in rule")
+    // =====================================================================
+    // The Status header gets a filter button: grey = all rules, black =
+    // only rules the person is in, red = only rules the person is not in
+    // (same colors as the other filters).
+    // The grid loads the rules page by page, and HelloID gets the rules
+    // the person is in from a second request. So all rules are fetched
+    // once and filtered on the request (see Response interception), with
+    // the IDs from that second request (see WATCHES); a click makes the
+    // grid load its rows again.
+
+    const RULE_STATUS_COLUMN = 'inRule'; // column ID
+    const RULE_STATUS_CLASS = 'tm-rule-status-filter';
+    const RULE_STATUS_KEY = 'tm-helloid-person-rule-status'; // in sessionStorage
+
+    const ruleStatus = () => {
+        const status = sessionGet(RULE_STATUS_KEY, null);
+        return statusOrder.includes(status) ? status : ButtonStatus.UNKNOWN;
+    };
+
+    let personRuleIds = null; // Set: the rules the selected person is in
+
+    // Called with all rules (see INTERCEPTS)
+    function filterPersonRules(all) {
+        const status = ruleStatus();
+        if (status === ButtonStatus.UNKNOWN || !personRuleIds) return all;
+        const inRule = status === ButtonStatus.ENABLED;
+        return all.filter(rule => personRuleIds.has(rule.ruleId) === inRule);
+    }
+
+    // Called with the rule IDs of the selected person (see WATCHES). With
+    // a filter on, another person means other rows; only when the IDs
+    // really changed, as loading the rows may ask for the IDs again.
+    function onPersonRules(ids) {
+        if (!Array.isArray(ids)) return;
+        const changed = !personRuleIds || personRuleIds.size !== ids.length ||
+                        ids.some(id => !personRuleIds.has(id));
+        personRuleIds = new Set(ids);
+        if (!changed) return;
+        setTimeout(() => { // not while the app reads the response
+            updateRuleStatusButtons();
+            if (ruleStatus() !== ButtonStatus.UNKNOWN) reloadPersonRules();
+        });
+    }
+
+    function reloadPersonRules() {
+        document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
+            if (!hasHeader(gridEl, PERSON_RULES_GRID)) return;
+            const api = findGridApi(gridEl);
+            if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
+            else api?.refreshInfiniteCache?.();
+        });
+    }
+
+    function updateRuleStatusButtons() {
+        const status = ruleStatus();
+        const count = personRuleIds ? ` (${personRuleIds.size})` : '';
+        const title = {
+            [ButtonStatus.UNKNOWN]:  `Showing all rules. Click to show only the rules the person is in${count}.`,
+            [ButtonStatus.ENABLED]:  `Showing only the rules the person is in${count}. Click for the rules the person is not in.`,
+            [ButtonStatus.DISABLED]: 'Showing only the rules the person is not in. Click to show all rules.',
+        }[status];
+        document.querySelectorAll(`.${RULE_STATUS_CLASS}`).forEach(btn => {
+            if (btn.style.color !== statusColor[status]) btn.style.color = statusColor[status];
+            if (btn.title !== title) btn.title = title;
+        });
+    }
+
+    function addRuleStatusFilter() {
+        if (!location.hash.includes(PERSON_RULES_ROUTE)) return;
+        document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
+            if (!hasHeader(gridEl, PERSON_RULES_GRID)) return;
+            const header = gridEl.querySelector(`.ag-header-cell[col-id="${RULE_STATUS_COLUMN}"]`) ??
+                [...gridEl.querySelectorAll('.ag-header-cell')]
+                    .find(h => h.textContent.trim().toLowerCase() === 'status');
+            if (!header || header.querySelector(`.${RULE_STATUS_CLASS}`)) return;
+
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `btn btn-default btn-xs ${RULE_STATUS_CLASS}`;
+            // On the right side of the header: after the label, wherever
+            // the grid puts that in the wrapper
+            Object.assign(btn.style, { flexShrink: '0', marginLeft: 'auto', order: '1' });
+            const icon = document.createElement('i');
+            icon.className = 'fa-solid fa-filter';
+            btn.appendChild(icon);
+            btn.addEventListener('mousedown', (e) => e.stopPropagation());
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                sessionSet(RULE_STATUS_KEY, nextStatus(ruleStatus()));
+                updateRuleStatusButtons();
+                reloadPersonRules(); // through the filter
+            });
+            (header.querySelector('.ag-header-cell-comp-wrapper') ?? header).appendChild(btn);
+            updateRuleStatusButtons();
+        });
+    }
+
+    // =====================================================================
     // All grids: resizable columns
     // =====================================================================
 
@@ -2138,7 +2296,8 @@
     // Column widths (px) for grids whose own widths don't fit their
     // content, by page and header text. The columns start at these widths
     // and keep them when the grid fits its columns to its width; the
-    // "fill" column takes the space that's left (at least fillMin).
+    // "fill" column, if any, takes the space that's left (at least
+    // fillMin). requires: only grids that have a column with this header.
     const PAGE_COLUMN_WIDTHS = [
         {
             route: NOTIFICATIONS_ROUTE,
@@ -2152,16 +2311,24 @@
                 'Last changed on': 160,
             },
         },
+        {
+            route: PERSON_RULES_ROUTE,
+            requires: PERSON_RULES_GRID,
+            widths: {
+                'Name': 250,
+                'Entitlements': 210,
+            },
+        },
     ];
 
     const pageWidthGrids = new WeakSet(); // grids that have their widths
 
     function applyPageColumnWidths() {
-        PAGE_COLUMN_WIDTHS.filter(c => location.hash.includes(c.route)).forEach(({ widths, fill, fillMin }) => {
+        PAGE_COLUMN_WIDTHS.filter(c => location.hash.includes(c.route)).forEach(({ widths, fill, fillMin, requires }) => {
             const byHeader = Object.fromEntries(
                 Object.entries(widths).map(([header, px]) => [header.toLowerCase(), px]));
             document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
-                if (pageWidthGrids.has(gridEl)) return;
+                if (pageWidthGrids.has(gridEl) || !hasHeader(gridEl, requires)) return;
                 const headers = [...gridEl.querySelectorAll('.ag-header-cell')];
                 const api = headers.length && findGridApi(gridEl);
                 if (!api) return; // grid not ready yet; the observer will retry
@@ -2173,7 +2340,7 @@
                 headers.forEach(h => {
                     const text = h.textContent.trim().toLowerCase();
                     const id = h.getAttribute('col-id');
-                    if (text === fill.toLowerCase()) {
+                    if (fill && text === fill.toLowerCase()) {
                         fillId = id;
                         props[id] = { flex: 1 };
                     } else if (byHeader[text]) {
@@ -2385,6 +2552,12 @@
             applySystemsView();
         }
 
+        // Persons > Rules: status filter
+        if (ruleStatus() !== ButtonStatus.UNKNOWN) {
+            sessionSet(RULE_STATUS_KEY, null);
+            updateRuleStatusButtons();
+        }
+
         // Grids: icon filters
         Object.values(FLAG_GRIDS).forEach(config => {
             if (!activeGridFlags(config).length) return;
@@ -2409,6 +2582,7 @@
                 setupSystemList();
                 addGridFlagButtons();
                 hideLimitWarnings();
+                addRuleStatusFilter();
                 addFilterPanelSearch();
                 makeGridsResizable();
                 applyPageColumnWidths();
