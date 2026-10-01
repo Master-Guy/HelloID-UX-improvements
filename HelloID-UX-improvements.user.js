@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-09-30.4
+// @version      2026-10-01.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -28,9 +28,13 @@
     // toolbar menu, are stored by Tampermonkey and survive script updates.
 
     const DEFAULTS = Object.freeze({
-        // Entitlements tab: number of rules requested from the server in one go.
-        // Must be higher than the number of rules on any target system.
-        fetchAllTake: 99999,
+        // Entitlements tabs: number of rows requested from the server in one go.
+        // Must be higher than the number of rows in any of these grids.
+        fetchAllTake: 999999,
+
+        // Entitlements tabs: how long fetched rows are reused (minutes)
+        // before they are fetched again
+        cacheMaxAgeMinutes: 5,
 
         // Entitlements tab: wait this long after the last filter click
         // before reloading, so several buttons can be set in one go.
@@ -107,10 +111,19 @@
         {
             path: 'fetchAllTake',
             label: 'Entitlements: max rules to fetch',
-            description: 'Number of rules requested from the server in one go on the Entitlements tab. ' +
-                         'Must be higher than the number of rules on any target system.',
+            description: 'Number of rows requested from the server in one go on the Entitlements tabs ' +
+                         '(target systems and business rules). Must be higher than the number of rows in any of them.',
             parse: parsePositiveInt,
             hint: 'a whole number',
+        },
+        {
+            path: 'cacheMaxAgeMinutes',
+            label: 'Entitlements: cache duration (minutes)',
+            description: 'How long the fetched rows on the Entitlements tabs are reused while scrolling and ' +
+                         'filtering, before they are fetched from the server again. ' +
+                         'Navigating to another page always fetches fresh rows.',
+            parse: parsePositiveInt,
+            hint: 'a whole number of minutes',
         },
         {
             path: 'filterColors.unknown',
@@ -260,34 +273,138 @@
     // patching the script's own window would not affect HelloID.
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-    const TARGET = /\/entitlements-overview(\?|$)/;
+    // Paged requests that are fetched in full instead, so they can be
+    // filtered here; the app then gets only the page it asked for.
+    // filter: all rows -> the rows to show
+    // grid: the grid showing these rows, if known (for its loading overlay)
+    const INTERCEPTS = [
+        // Target system > Entitlements tab
+        { pattern: /\/entitlements-overview(\?|$)/, filter: (all) => all.filter(matchesFilters) },
+        // Business rules > Entitlements tab
+        {
+            pattern: /\/rules\/api\/entitlements(\?|$)/,
+            filter: (all) => filterEntitlements(all),
+            grid: 'helloid-entitlement-grid ag-grid-angular',
+        },
+    ];
+    const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url));
 
     // Field the grid uses to decide how many rows exist
     const COUNT_KEYS = ['totalRowCount'];
 
-    // Always ask the server for everything, but remember which page the app wanted.
+    // Full responses per query (the URL without skip/take): scrolling
+    // through a grid fetches everything only once. Cleared on navigation.
+    const CACHE_MAX_AGE_MS = SETTINGS.cacheMaxAgeMinutes * 60 * 1000;
+    const fullResponses = new Map(); // key -> { data, time, ready, resolve }
+
+    function queryKey(url) {
+        const u = new URL(url, location.href);
+        u.searchParams.delete('skip');
+        u.searchParams.delete('take');
+        u.searchParams.sort();
+        return u.toString();
+    }
+
+    // Which page the app wants, and where the full data comes from. The
+    // first request for a query fetches everything ("loads"). Later ones
+    // wait for that, if needed, and are sent as a 1-row request: they keep
+    // the app's own request (with its login headers), but the answer comes
+    // from the cache.
     function rewriteUrl(url) {
-        // Before filtering: drop filters left over from another page
+        // Before filtering: drop filters (and cached data) from another page
         syncFiltersWithPage();
 
         const u = new URL(url, location.href);
-        const skipParam = u.searchParams.get('skip');
+        const skip = parseInt(u.searchParams.get('skip'), 10) || 0;
         const takeParam = u.searchParams.get('take');
-        const page = {
-            skip: parseInt(skipParam, 10) || 0,
-            take: takeParam === null ? Infinity : (parseInt(takeParam, 10) || Infinity),
-        };
+        const key = queryKey(url);
+
+        let entry = fullResponses.get(key);
+        if (entry?.data && Date.now() - entry.time > CACHE_MAX_AGE_MS) {
+            fullResponses.delete(key);
+            entry = null;
+        }
+        const loads = !entry;
+        if (loads) {
+            entry = { data: null, time: 0 };
+            entry.ready = new Promise(resolve => { entry.resolve = resolve; });
+            fullResponses.set(key, entry);
+            showLoadingWhile(entry.ready, interceptFor(url).grid);
+        }
+
         u.searchParams.set('skip', '0');
-        u.searchParams.set('take', String(SETTINGS.fetchAllTake));
-        page.url = u.toString();
-        return page;
+        u.searchParams.set('take', loads ? String(SETTINGS.fetchAllTake) : '1');
+        return {
+            skip,
+            take: takeParam === null ? Infinity : (parseInt(takeParam, 10) || Infinity),
+            intercept: interceptFor(url),
+            key,
+            entry,
+            loads,
+            url: u.toString(),
+        };
+    }
+
+    // The answer for the app: the full data, filtered, and only the page it
+    // asked for. raw is the response body (text or parsed JSON); errors are
+    // passed on unchanged.
+    function respond(raw, page, ok) {
+        const { entry } = page;
+        if (page.loads && !page.done) {
+            page.done = true;
+            if (ok) {
+                try {
+                    entry.data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    entry.time = Date.now();
+                } catch (e) {
+                    console.warn('Could not read response', e);
+                }
+            }
+            if (!entry.data) fullResponses.delete(page.key);
+            entry.resolve(); // let the waiting requests go
+        }
+        if (!ok || !entry.data) return raw;
+        const result = modifyData({ ...entry.data }, page);
+        return typeof raw === 'string' ? JSON.stringify(result) : result;
+    }
+
+    // A full fetch can take a while. Meanwhile the grid only shows empty
+    // rows, so show its "Loading" overlay on top: the same one the grid
+    // shows on its first load. The grid is the intercept's own, if known;
+    // otherwise the one showing loading rows (AG Grid marks rows that
+    // wait for data with ag-row-loading).
+    function showLoadingWhile(ready, gridSelector) {
+        let done = false;
+        ready.then(() => { done = true; });
+        setTimeout(() => { // the grid draws its loading rows around the request
+            if (done) return;
+            const grids = gridSelector
+                ? [...document.querySelectorAll(gridSelector)]
+                : [...document.querySelectorAll(AG_GRIDS)].filter(g => g.querySelector('.ag-row-loading'));
+            const apis = grids.map(findGridApi).filter(Boolean);
+            apis.forEach(api => setGridLoading(api, true));
+            // After the grid got its rows
+            ready.then(() => setTimeout(() => apis.forEach(api => setGridLoading(api, false))));
+        }, 100);
+    }
+
+    // HelloID uses AG Grid v32+, with the "loading" option: it keeps the
+    // overlay up until turned off, even while the grid updates its rows.
+    // Afterwards it goes back to undefined (not false, which would block
+    // the grid's own loading overlay from then on).
+    function setGridLoading(api, on) {
+        try {
+            api.setGridOption('loading', on ? true : undefined);
+        } catch (e) {
+            console.warn('[HelloID UX] Could not toggle the loading overlay', e);
+        }
     }
 
     // Filter the full set, then hand the app only the page it asked for.
     function modifyData(data, page) {
         if (!Array.isArray(data?.pageData)) return data;
 
-        const filtered = data.pageData.filter(matchesFilters);
+        const filtered = page.intercept.filter(data.pageData);
         data.pageData = filtered.slice(page.skip, page.skip + page.take);
 
         for (const key of COUNT_KEYS) {
@@ -296,57 +413,73 @@
         return data;
     }
 
-    function modifyJsonText(text, page) {
-        try {
-            return JSON.stringify(modifyData(JSON.parse(text), page));
-        } catch (e) {
-            console.warn('Could not modify response', e);
-            return text;
-        }
-    }
-
     // --- fetch ---
     const origFetch = pageWindow.fetch;
     pageWindow.fetch = async function (input, init) {
         const url = input instanceof pageWindow.Request ? input.url : String(input);
-        if (!TARGET.test(url)) return origFetch.call(this, input, init);
+        if (!interceptFor(url)) return origFetch.call(this, input, init);
 
         const page = rewriteUrl(url);
-        const newInput = input instanceof pageWindow.Request ? new pageWindow.Request(page.url, input) : page.url;
-        const response = await origFetch.call(this, newInput, init);
+        if (!page.loads) await page.entry.ready;
 
-        const text = await response.clone().text();
-        const modified = new pageWindow.Response(modifyJsonText(text, page), {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-        });
-        Object.defineProperty(modified, 'url', { value: url });
-        return modified;
+        try {
+            const newInput = input instanceof pageWindow.Request ? new pageWindow.Request(page.url, input) : page.url;
+            const response = await origFetch.call(this, newInput, init);
+
+            const text = await response.clone().text();
+            const body = respond(text, page, response.ok);
+            if (body === text) return response;
+            const modified = new pageWindow.Response(body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+            });
+            Object.defineProperty(modified, 'url', { value: url });
+            return modified;
+        } catch (e) {
+            respond(null, page, false); // don't leave waiting requests hanging
+            throw e;
+        }
     };
 
     // --- XMLHttpRequest ---
     const proto = pageWindow.XMLHttpRequest.prototype;
     const origOpen = proto.open;
+    const origSend = proto.send;
     const origResponse = Object.getOwnPropertyDescriptor(proto, 'response').get;
     const origResponseText = Object.getOwnPropertyDescriptor(proto, 'responseText').get;
 
     proto.open = function (method, url, ...rest) {
         const s = String(url);
-        if (TARGET.test(s)) {
+        delete this._tmResult;
+        if (interceptFor(s)) {
             this._tmPage = rewriteUrl(s);
+            if (this._tmPage.loads) {
+                // Also when the app never reads the answer (error, abort):
+                // let the waiting requests go
+                this.addEventListener('loadend', () => getModified(this), { once: true });
+            }
             return origOpen.call(this, method, this._tmPage.url, ...rest);
         }
         this._tmPage = null;
         return origOpen.call(this, method, url, ...rest);
     };
 
+    // A request that is answered from the cache waits until the full data
+    // is there
+    proto.send = function (...args) {
+        const page = this._tmPage;
+        if (page && !page.loads && !page.entry.data) {
+            page.entry.ready.then(() => origSend.apply(this, args));
+            return;
+        }
+        return origSend.apply(this, args);
+    };
+
     function getModified(xhr) {
         if (!('_tmResult' in xhr)) {
-            const raw = origResponse.call(xhr);
-            xhr._tmResult = typeof raw === 'string'
-                ? modifyJsonText(raw, xhr._tmPage)
-                : (raw && typeof raw === 'object' ? modifyData(raw, xhr._tmPage) : raw);
+            const ok = xhr.status >= 200 && xhr.status < 300;
+            xhr._tmResult = respond(origResponse.call(xhr), xhr._tmPage, ok);
         }
         return xhr._tmResult;
     }
@@ -807,9 +940,28 @@
         });
     }
 
-    // --- Business rules overview: grid ---
-    const RULE_NAME_CELLS =
-        'helloid-rules-grid ag-grid-angular div.ag-body-viewport div[role="row"] div[col-id="name"]';
+    // --- Business rules: name columns in grids ---
+    // Grids (by their host element) and the column that gets a copy
+    // button: by column ID, or by header text when the ID isn't known.
+    const NAME_COLUMNS = [
+        { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
+        // Entitlements tab, details of the selected entitlement
+        { host: 'helloid-entitlement-details', colId: 'name' }, // its Rules tab
+        { host: 'helloid-entitlement-details', header: 'Person' }, // its Persons tab
+    ];
+
+    // Body cells of the name columns, in all grids on the page
+    function nameCells() {
+        return NAME_COLUMNS.flatMap(({ host, colId, header }) =>
+            [...document.querySelectorAll(`${host} ag-grid-angular`)].flatMap(grid => {
+                const ids = colId ? [colId]
+                    : [...grid.querySelectorAll('.ag-header-cell')]
+                        .filter(h => h.textContent.trim().toLowerCase() === header.toLowerCase())
+                        .map(h => h.getAttribute('col-id'));
+                return ids.flatMap(id => [...grid.querySelectorAll(
+                    `div.ag-body-viewport div[role="row"] div[col-id="${CSS.escape(id)}"]`)]);
+            }));
+    }
 
     // Text of the cell without our own button
     function cellTextWithout(cell, btn) {
@@ -820,7 +972,7 @@
     }
 
     function addRuleGridCopyButtons() {
-        document.querySelectorAll(RULE_NAME_CELLS).forEach(cell => {
+        nameCells().forEach(cell => {
             if (cell.querySelector(`.${COPY_BTN_CLASS}`)) return;
 
             const btn = createCopyButton(
@@ -1653,6 +1805,138 @@
     }
 
     // =====================================================================
+    // Business rules > Entitlements: filter on the warning / info icon
+    // =====================================================================
+    // The grid's last (nameless) column shows an icon for entitlements the
+    // target system no longer returns: a warning when business rules still
+    // use them, an info icon when not. Its header gets a filter button for
+    // each, with the number of entitlements that have that icon; grey =
+    // off, black = only those. A row never has both icons, so with both
+    // on, a row needs either.
+    // The grid loads its rows page by page from the server, so the
+    // filtering happens on the request (see Response interception), and a
+    // click makes the grid load its rows again.
+
+    const ENTITLEMENT_GRID = 'helloid-entitlement-grid ag-grid-angular';
+    const ENTITLEMENT_FLAG_CLASS = 'tm-entitlement-flags';
+    const ENTITLEMENT_FLAGS_KEY = 'tm-helloid-entitlement-flags'; // in sessionStorage
+
+    const notInTargetSystem = (e) => e.inTargetSystem === false;
+    const ENTITLEMENT_FLAGS = [
+        {
+            key: 'warning',
+            icon: 'fa-solid fa-warning',
+            label: 'entitlements no longer in the target system, but still used in business rules',
+            test: (e) => notInTargetSystem(e) && e.ruleCount > 0,
+        },
+        {
+            key: 'info',
+            icon: 'fa-solid fa-info-circle',
+            label: 'entitlements no longer in the target system, not used in business rules',
+            test: (e) => notInTargetSystem(e) && !(e.ruleCount > 0),
+        },
+    ];
+
+    const activeEntitlementFlags = () => {
+        const flags = sessionGet(ENTITLEMENT_FLAGS_KEY, []);
+        return Array.isArray(flags) ? flags : [];
+    };
+
+    // Counts per flag, from the last full set of entitlements; counted once
+    // per set (the same cached set comes by for every page of the grid)
+    let entitlementFlagCounts = {};
+    let countedEntitlements = null;
+
+    // Called with all entitlements (see INTERCEPTS): count, then filter
+    function filterEntitlements(all) {
+        if (all !== countedEntitlements) {
+            countedEntitlements = all;
+            entitlementFlagCounts = Object.fromEntries(
+                ENTITLEMENT_FLAGS.map(f => [f.key, all.filter(f.test).length]));
+            setTimeout(updateEntitlementFlagButtons); // not while the app reads the response
+        }
+
+        const active = ENTITLEMENT_FLAGS.filter(f => activeEntitlementFlags().includes(f.key));
+        return active.length ? all.filter(e => active.some(f => f.test(e))) : all;
+    }
+
+    function createEntitlementFlagButton(flag, gridEl) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-default btn-xs';
+        btn.dataset.entitlementFlag = flag.key;
+        const icon = document.createElement('i');
+        icon.className = flag.icon;
+        btn.append(icon, ' ', document.createElement('span'));
+        btn.addEventListener('mousedown', (e) => e.stopPropagation());
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const active = activeEntitlementFlags();
+            sessionSet(ENTITLEMENT_FLAGS_KEY, active.includes(flag.key)
+                ? active.filter(k => k !== flag.key)
+                : [...active, flag.key]);
+            updateEntitlementFlagButtons();
+            // Load the rows again, through the filter
+            const api = findGridApi(gridEl);
+            if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
+            else api?.refreshInfiniteCache?.();
+        });
+        return btn;
+    }
+
+    // Look and count of the buttons
+    function updateEntitlementFlagButtons() {
+        const active = activeEntitlementFlags();
+        document.querySelectorAll('button[data-entitlement-flag]').forEach(btn => {
+            const flag = ENTITLEMENT_FLAGS.find(f => f.key === btn.dataset.entitlementFlag);
+            const on = active.includes(flag.key);
+            const n = entitlementFlagCounts[flag.key];
+            const color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
+            if (btn.style.color !== color) btn.style.color = color;
+            setText(btn.querySelector('span'), n == null ? '' : String(n));
+            const count = n == null ? '' : ` (${n})`;
+            const title = on
+                ? `Showing only ${flag.label}${count}. Click to show all.`
+                : `Show only ${flag.label}${count}`;
+            if (btn.title !== title) btn.title = title;
+        });
+        fitEntitlementFlagColumn();
+    }
+
+    function addEntitlementFlagButtons() {
+        const gridEl = document.querySelector(ENTITLEMENT_GRID);
+        if (!gridEl) return;
+
+        // The nameless column: the last header without text
+        const header = [...gridEl.querySelectorAll('.ag-header-cell')]
+            .filter(h => !h.textContent.trim() || h.querySelector(`.${ENTITLEMENT_FLAG_CLASS}`))
+            .pop();
+        if (!header || header.querySelector(`.${ENTITLEMENT_FLAG_CLASS}`)) return;
+
+        const group = document.createElement('span');
+        group.className = ENTITLEMENT_FLAG_CLASS;
+        Object.assign(group.style, { display: 'flex', gap: '2px', flexShrink: '0' });
+        ENTITLEMENT_FLAGS.forEach(f => group.appendChild(createEntitlementFlagButton(f, gridEl)));
+        (header.querySelector('.ag-header-cell-comp-wrapper') ?? header).appendChild(group);
+        updateEntitlementFlagButtons();
+    }
+
+    // Make the column at least as wide as its buttons need. Done again when
+    // the counts change (more digits, wider buttons); a minimum width only
+    // grows, so this settles.
+    function fitEntitlementFlagColumn() {
+        const group = document.querySelector(`${ENTITLEMENT_GRID} .${ENTITLEMENT_FLAG_CLASS}`);
+        const header = group?.closest('.ag-header-cell');
+        const api = header && findGridApi(header.closest('ag-grid-angular'));
+        if (!api || !group.offsetWidth) return;
+        const style = getComputedStyle(header);
+        const needed = Math.ceil(group.offsetWidth +
+            (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)) + 8;
+        setMinColumnWidth(api, header.getAttribute('col-id'), needed);
+    }
+
+    // =====================================================================
     // All grids: resizable columns
     // =====================================================================
 
@@ -1700,19 +1984,45 @@
         return null;
     }
 
-    function needsResizable(defs) {
+    // Minimum widths we need for some columns (room for our buttons), per
+    // grid API: { colId: px }. Set through the column definitions, so the
+    // grid keeps them, also when it fits the columns to its width again.
+    const minColumnWidths = new WeakMap();
+
+    const columnKey = (d) => d.colId ?? d.field;
+
+    function needsResizable(defs, mins = {}) {
         return defs.some(d => d.children
-            ? needsResizable(d.children)
-            : d.resizable !== true || d.minWidth != null || d.maxWidth != null);
+            ? needsResizable(d.children, mins)
+            : d.resizable !== true || d.maxWidth != null ||
+              d.minWidth !== mins[columnKey(d)] ||
+              (mins[columnKey(d)] != null && (d.width ?? 0) < mins[columnKey(d)]));
     }
 
     // Some columns are fixed-width (minWidth === maxWidth), which blocks
     // resizing even with resizable: true. Drop both limits; each column
-    // keeps its current width as starting point.
-    function withResizable(defs) {
-        return defs.map(d => d.children
-            ? { ...d, children: withResizable(d.children) }
-            : { ...d, resizable: true, minWidth: undefined, maxWidth: undefined });
+    // keeps its current width as starting point. Only our own minimum
+    // widths stay.
+    function withResizable(defs, mins = {}) {
+        return defs.map(d => {
+            if (d.children) return { ...d, children: withResizable(d.children, mins) };
+            const min = mins[columnKey(d)];
+            return {
+                ...d,
+                resizable: true,
+                minWidth: min,
+                maxWidth: undefined,
+                ...(min != null && (d.width ?? 0) < min ? { width: min } : {}),
+            };
+        });
+    }
+
+    function setMinColumnWidth(api, colId, px) {
+        const mins = minColumnWidths.get(api) ?? {};
+        if (mins[colId] >= px) return;
+        mins[colId] = px;
+        minColumnWidths.set(api, mins);
+        applyResizable(api);
     }
 
     // Set while we update the columns, so the resulting newColumnsLoaded
@@ -1723,8 +2033,9 @@
     function applyResizable(api) {
         if (applyingResizable) return;
         const defs = api.getColumnDefs();
-        if (!defs || !needsResizable(defs)) return;
-        const newDefs = withResizable(defs);
+        const mins = minColumnWidths.get(api);
+        if (!defs || !needsResizable(defs, mins)) return;
+        const newDefs = withResizable(defs, mins);
         applyingResizable = true;
         try {
             if (typeof api.setGridOption === 'function') {
@@ -1884,6 +2195,9 @@
         if (sessionGet(FILTER_PAGE_KEY, null) === key) return;
         sessionSet(FILTER_PAGE_KEY, key);
 
+        // Cached full responses: fetch fresh data on the new page
+        fullResponses.clear();
+
         // Entitlements filters (the object is shared, so clear it in place)
         if (Object.keys(filterState).length) {
             Object.keys(filterState).forEach(k => delete filterState[k]);
@@ -1897,6 +2211,12 @@
             sessionSet(FLAG_FILTERS_KEY, []);
             sessionSet(SORT_KEY, null);
             applySystemsView();
+        }
+
+        // Business rules > Entitlements: icon filters
+        if (activeEntitlementFlags().length) {
+            sessionSet(ENTITLEMENT_FLAGS_KEY, []);
+            updateEntitlementFlagButtons();
         }
     }
 
@@ -1914,6 +2234,7 @@
                 addStyles();
                 addCopyButtons();
                 setupSystemList();
+                addEntitlementFlagButtons();
                 addFilterPanelSearch();
                 makeGridsResizable();
             });
