@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-01.8
+// @version      2026-10-02.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -320,6 +320,11 @@
         {
             pattern: new RegExp('/evaluation/results/person/[^/?]+/rules([?]|$)'),
             onData: (ids) => onPersonRules(ids),
+        },
+        // Target systems: the IDs of the systems (for the export's file name)
+        {
+            pattern: new RegExp('/provisioning-api/api/target-systems([?]|$)'),
+            onData: (systems) => rememberSystemIds(systems),
         },
     ];
     const watchFor = (url) => WATCHES.find(w => w.pattern.test(url));
@@ -1036,6 +1041,7 @@
             configureBtn.before(
                 createCopyButton(name, configureBtn.className),
                 createExportButton(name, configureBtn.className),
+                createExportButton(name, configureBtn.className, EXPORT_KINDS.granted),
             );
         });
     }
@@ -1672,17 +1678,33 @@
     const CONNECTOR_EXPORTS = {
         'powershell-onpremise': powershellExport,
         'powershell-target': powershellExport,
+        // Built-in Azure AD: its mapping, correlation and settings
+        'azuread': (id) => ({
+            configuration: `/connector/azure-active-directory/api/configuration/${id}`,
+        }),
+        // Built-in Active Directory: its containers, directories, Exchange
+        // and other settings
+        'activedirectory': (id) => ({
+            configuration: `/connector/active-directory/api/configuration/${id}`,
+        }),
     };
 
     // Message shown after saving the export, per type of target system
-    const DECOMMISSIONED_NOTICE =
-        'Due to this system type being decommissioned and lack of support, we cannot save ' +
-        'all configuration items for this Target System. Please be careful when modifying ' +
-        'this Target System.\n\n' +
+    const DEPRECATED_NOTICE = 'This system type is deprecated.\n\n' +
         'Recommendation: Migrate to a PowerShell v2 connector.';
     const EXPORT_NOTICES = {
-        'azuread': DECOMMISSIONED_NOTICE,
-        'activedirectory': DECOMMISSIONED_NOTICE,
+        'azuread': 'This system type is deprecated. Its configuration was exported in full, but the file ' +
+                   'cannot be imported.\n\nRecommendation: Migrate to a PowerShell v2 connector.',
+        'activedirectory': DEPRECATED_NOTICE,
+    };
+
+    // The tags and agent pools whose agents run a system's on-premises
+    // actions: read with GET, stored with POST
+    const AGENT_SELECTION_PATH = (id) => `/service/agent-repository/api/agents/selected-agents/${id}`;
+    // Two selections with the same tags and pools?
+    const sameAgentSelection = (a, b) => {
+        const keys = (selection) => (selection ?? []).map(s => `${s?.type}:${s?.value}`).sort().join();
+        return keys(a) === keys(b);
     };
 
     const EXPORT_MASK = '***'; // instead of a secret, when not exported
@@ -1694,17 +1716,239 @@
     // values of fields that are no longer in the form, which HelloID keeps.
     const SECRET_NAME = /secret|passw|pwd|token|api[-_]?key|private[-_]?key|certificate|credential/i;
 
-    function maskSecrets(configuration) {
-        if (!isPlainObject(configuration.scriptConfiguration)) return configuration;
+    // The names of the values that are secrets
+    function secretKeys(configuration) {
+        if (!isPlainObject(configuration.scriptConfiguration)) return [];
         const passwordKeys = new Set((configuration.scriptConfigurationForm?.fields ?? [])
             .filter(f => f.templateOptions?.type === 'password')
             .map(f => f.key));
-        const values = { ...configuration.scriptConfiguration };
-        Object.keys(values).forEach(key => {
-            const filled = typeof values[key] === 'string' && values[key] !== '';
-            if (filled && (passwordKeys.has(key) || SECRET_NAME.test(key))) values[key] = EXPORT_MASK;
+        return Object.keys(configuration.scriptConfiguration)
+            .filter(key => passwordKeys.has(key) || SECRET_NAME.test(key));
+    }
+
+    const isFilled = (value) => typeof value === 'string' && value !== '';
+
+    // Built-in types (e.g. Azure AD) have their settings in the
+    // configuration itself, or in a group in it (exchangeConfiguration):
+    // there, the texts (or empty values) whose name says they are secrets.
+    // As [group, key]; group is null for the configuration itself.
+    function settingSecretKeys(configuration) {
+        const secretsOf = (values) => Object.keys(values)
+            .filter(key => SECRET_NAME.test(key) && (values[key] === null || typeof values[key] === 'string'));
+        return [
+            ...secretsOf(configuration).map(key => [null, key]),
+            ...Object.keys(configuration)
+                // scriptConfiguration: see secretKeys
+                .filter(group => group !== 'scriptConfiguration' && isPlainObject(configuration[group]))
+                .flatMap(group => secretsOf(configuration[group]).map(key => [group, key])),
+        ];
+    }
+
+    function maskSecrets(configuration) {
+        const masked = { ...configuration };
+        settingSecretKeys(configuration).forEach(([group, key]) => {
+            if (group) {
+                if (!isFilled(masked[group][key])) return;
+                masked[group] = { ...masked[group], [key]: EXPORT_MASK };
+            } else if (isFilled(masked[key])) {
+                masked[key] = EXPORT_MASK;
+            }
         });
-        return { ...configuration, scriptConfiguration: values };
+        const keys = secretKeys(configuration);
+        if (keys.length) {
+            masked.scriptConfiguration = { ...configuration.scriptConfiguration };
+            keys.forEach(key => {
+                if (isFilled(masked.scriptConfiguration[key])) masked.scriptConfiguration[key] = EXPORT_MASK;
+            });
+        }
+        return masked;
+    }
+
+    // Which values are secrets, and whether HelloID returned one: also in
+    // a file without the secrets themselves
+    const listSecrets = (configuration) => [
+        ...settingSecretKeys(configuration).map(([group, key]) => (group
+            ? { key: `${group}.${key}`, hasValue: isFilled(configuration[group][key]) }
+            : { key, hasValue: isFilled(configuration[key]) })),
+        ...secretKeys(configuration)
+            .map(key => ({ key, hasValue: isFilled(configuration.scriptConfiguration[key]) })),
+    ];
+
+    // --- Other systems that use the exported one ---
+    // A system is used by another one that depends on it ("Depends on
+    // systems"), or that names its accounts in a mapping or a script:
+    // Person.Accounts._<system ID without dashes>. A replacement of the
+    // system has another ID, so those have to be changed along.
+
+    const accountsReference = (systemId) => `_${String(systemId).replace(/-/g, '')}`;
+
+    // Where a text is found in a configuration, as paths; list items by
+    // their name, when they have one ("mappingConfiguration.fields[mail]")
+    function findText(value, text, path = '') {
+        if (typeof value === 'string') return value.toLowerCase().includes(text) ? [path] : [];
+        if (Array.isArray(value)) {
+            return value.flatMap((v, i) => findText(v, text, `${path}[${v?.name ?? v?.displayName ?? i}]`));
+        }
+        if (isPlainObject(value)) {
+            return Object.entries(value).flatMap(([k, v]) => findText(v, text, path ? `${path}.${k}` : k));
+        }
+        return [];
+    }
+
+    const USED_BY_BATCH = 6; // configurations fetched at the same time
+
+    // The other systems that use this one. Systems of a type with a
+    // configuration of its own (CONNECTOR_EXPORTS) are read in full: their
+    // scripts or mappings aren't in the list of systems. Other types with
+    // what the list has.
+    // onCount(done, total): called as the systems are read; the same
+    // for the other collectors
+    async function collectUsedBy(system, systems, onCount = () => {}) {
+        const text = accountsReference(system.systemId).toLowerCase();
+        const others = systems.filter(o => o?.systemId && o.systemId !== system.systemId);
+        const usedBy = [];
+        let count = 0;
+        onCount(count, others.length);
+        for (let i = 0; i < others.length; i += USED_BY_BATCH) {
+            await Promise.all(others.slice(i, i + USED_BY_BATCH).map(async (other) => {
+                const path = CONNECTOR_EXPORTS[other.templateIdentifier]
+                    ?.(encodeURIComponent(other.systemId)).configuration;
+                let configuration = other;
+                let couldNotRead = false;
+                if (path) {
+                    try {
+                        configuration = await fetchFromGateway(path);
+                    } catch (e) {
+                        console.warn(`[HelloID UX] Export: could not read "${other.displayName}"`, e);
+                        couldNotRead = true;
+                    }
+                }
+                const dependsOnThisSystem = (configuration.dependOnSystems ?? other.dependOnSystems ?? [])
+                    .some(d => d?.systemId === system.systemId);
+                const references = findText(configuration, text);
+                onCount(++count, others.length);
+                if (!dependsOnThisSystem && !references.length && !couldNotRead) return;
+                usedBy.push({
+                    systemId: other.systemId,
+                    displayName: other.displayName,
+                    templateIdentifier: other.templateIdentifier,
+                    dependsOnThisSystem,
+                    references,
+                    // Its scripts were not searched
+                    ...(couldNotRead ? { couldNotRead } : {}),
+                });
+            }));
+        }
+        return usedBy.sort((a, b) => String(a.displayName).localeCompare(String(b.displayName)));
+    }
+
+    // --- The business rules of the exported system, in full ---
+    // The overview only says that a rule has entitlements for the system.
+    // The rule itself has the rest: its conditions, and which entitlements
+    // (of them, the ones for this system are exported).
+    const RULE_PATH = (ruleId) => `/service/rules/api/rules/${encodeURIComponent(ruleId)}`;
+
+    async function collectRules(rows, system, onCount = () => {}) {
+        const rules = [];
+        let count = 0;
+        onCount(count, rows.length);
+        const counted = (rule) => {
+            onCount(++count, rows.length);
+            return rule;
+        };
+        for (let i = 0; i < rows.length; i += USED_BY_BATCH) {
+            rules.push(...await Promise.all(rows.slice(i, i + USED_BY_BATCH).map(async (row) => {
+                try {
+                    const { description, categories, published, hasDraft, condition, entitlements } =
+                        await fetchFromGateway(RULE_PATH(row.ruleId));
+                    return counted({
+                        ...row,
+                        description,
+                        categories,
+                        published,
+                        hasDraft,
+                        condition,
+                        entitlements: (entitlements ?? []).filter(e => e?.systemIdentifier === system.systemId),
+                    });
+                } catch (e) {
+                    console.warn(`[HelloID UX] Export: could not read rule "${row.ruleName}"`, e);
+                    return counted({ ...row, couldNotRead: true });
+                }
+            })));
+        }
+        return rules;
+    }
+
+    // --- Notifications ---
+    // The notifications of the exported system, in full, and those of
+    // other systems that use its data (their dataReferences name it): a
+    // replacement of the system has another ID. Which ones use it is only
+    // in the notification itself, so all of them are read.
+    const NOTIFICATIONS_PATH = '/service/notifications/api/notifications';
+
+    // What sends the notifications (e.g. the built-in "Email"): the ones
+    // these notifications use, in full. A notification only has the ID,
+    // which may be another one in another environment.
+    const NOTIFICATION_SYSTEMS_PATH = '/service/notifications/api/notification/systems';
+
+    async function collectNotificationSystems(notifications) {
+        const ids = [...new Set(notifications.map(n => n.notificationSystemId).filter(Boolean))];
+        return Promise.all(ids.map(async (systemId) => {
+            try {
+                const read = await fetchFromGateway(`${NOTIFICATION_SYSTEMS_PATH}/${encodeURIComponent(systemId)}`);
+                // Its settings may hold secrets, like those of a target system
+                const settings = read.systemConfiguration;
+                if (SETTINGS.exportSecrets || !isPlainObject(settings)) return read;
+                return {
+                    ...read,
+                    systemConfiguration: Object.fromEntries(Object.entries(settings).map(([key, value]) =>
+                        [key, SECRET_NAME.test(key) && isFilled(value) ? EXPORT_MASK : value])),
+                };
+            } catch (e) {
+                console.warn(`[HelloID UX] Export: could not read notification system ${systemId}`, e);
+                return { systemId, couldNotRead: true };
+            }
+        }));
+    }
+
+    async function collectNotifications(system, onCount = () => {}) {
+        const list = await fetchFromGateway(`${NOTIFICATIONS_PATH}?skip=0&take=${SETTINGS.fetchAllTake}` +
+                                            '&enabled=false&disabled=false'); // no filter: both
+        const rows = list.pageData ?? [];
+        const notifications = [];
+        const notificationsUsingThisSystem = [];
+        let count = 0;
+        onCount(count, rows.length);
+        for (let i = 0; i < rows.length; i += USED_BY_BATCH) {
+            await Promise.all(rows.slice(i, i + USED_BY_BATCH).map(async (row) => {
+                const own = row.systemId === system.systemId;
+                let notification;
+                try {
+                    notification = await fetchFromGateway(`${NOTIFICATIONS_PATH}/${encodeURIComponent(row.identifier)}`);
+                } catch (e) {
+                    onCount(++count, rows.length);
+                    console.warn(`[HelloID UX] Export: could not read notification "${row.name}"`, e);
+                    (own ? notifications : notificationsUsingThisSystem).push({ ...row, couldNotRead: true });
+                    return;
+                }
+                onCount(++count, rows.length);
+                if (own) {
+                    notifications.push(notification);
+                    return;
+                }
+                const dataReferences = (notification.dataReferences ?? [])
+                    .filter(r => r?.systemId === system.systemId);
+                if (!dataReferences.length) return;
+                const { identifier, systemId, event, name, enabled } = notification;
+                notificationsUsingThisSystem.push({ identifier, systemId, event, name, enabled, dataReferences });
+            }));
+        }
+        const byName = (a, b) => String(a.name).localeCompare(String(b.name));
+        return {
+            notifications: notifications.sort(byName),
+            notificationSystems: await collectNotificationSystems(notifications),
+            notificationsUsingThisSystem: notificationsUsingThisSystem.sort(byName),
+        };
     }
 
     async function fetchFromGateway(path) {
@@ -1721,11 +1965,46 @@
     async function fetchSystems() {
         if (!gateway) throw new Error('No request of HelloID seen yet. Reload the page and try again.');
         const systems = await fetchFromGateway(SYSTEMS_PATH);
+        rememberSystemIds(systems);
         return Array.isArray(systems) ? systems : [];
     }
 
-    async function collectSystemExport(name) {
-        const system = (await fetchSystems())
+    // The IDs of the systems by name, from the last list of systems that
+    // came by (HelloID's own or ours): for the name of the export file,
+    // which is needed before anything can be fetched
+    const systemIds = new Map();
+
+    function rememberSystemIds(systems) {
+        if (!Array.isArray(systems)) return;
+        systems.forEach(s => {
+            if (typeof s?.displayName === 'string' && s.systemId) systemIds.set(s.displayName.trim(), s.systemId);
+        });
+    }
+
+    // The steps of the export, for its progress: report(key, state, detail)
+    // is called as they go (see showProgress for the states)
+    const CONFIGURATION_STEPS = [
+        { key: 'systems', label: 'List of target systems' },
+        { key: 'configuration', label: 'Configuration' },
+        { key: 'agents', label: 'Agents' },
+        { key: 'rules', label: 'Business rules' },
+        { key: 'notifications', label: 'Notifications' },
+        { key: 'usedBy', label: 'Other systems that use this one' },
+    ];
+
+    // Reports a step as busy, and as done or failed when its work is over
+    const tracked = (report, key, work) => {
+        report(key, 'busy');
+        return work().then(
+            result => { report(key, 'done'); return result; },
+            e => { report(key, 'failed'); throw e; },
+        );
+    };
+    const counter = (report, key) => (done, total) => report(key, 'busy', `${done}/${total}`);
+
+    async function collectSystemExport(name, report = () => {}) {
+        const systems = await tracked(report, 'systems', fetchSystems);
+        const system = systems
             .find(s => typeof s?.displayName === 'string' && s.displayName.trim() === name);
         if (!system) throw new Error(`"${name}" was not found in HelloID's list of target systems.`);
 
@@ -1733,16 +2012,63 @@
         const paths = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id) ?? {};
         const names = Object.keys(paths);
         const couldNotRead = [];
-        const [rules, ...answers] = await Promise.all([
-            fetchFromGateway(`/api/connectors/shared/rules/published/${id}/entitlements-overview` +
-                             `?skip=0&take=${SETTINGS.fetchAllTake}`),
-            ...names.map(n => fetchFromGateway(paths[n]).catch(e => {
+        // The agents that run the system's on-premises actions: which
+        // ones are selected (by tag or agent pool, never a single agent),
+        // and how many that are.
+        // Not all systems may have this, so no message when it fails.
+        const agentPaths = {
+            selected: AGENT_SELECTION_PATH(id),
+            summary: `/service/agent-repository/api/agents/selections/summary/${id}`,
+        };
+        const collectAgents = async () => {
+            const parts = await Promise.all(Object.values(agentPaths).map(path => fetchFromGateway(path)));
+            const agents = Object.fromEntries(Object.keys(agentPaths).map((key, i) => [key, parts[i]]));
+            // The agents that selection stands for right now. HelloID
+            // answers with all agents, marking the selected ones (a POST,
+            // but it only looks them up).
+            if (Array.isArray(agents.selected) && agents.selected.length) {
+                const all = await sendToGateway('/service/agent-repository/api/agents', 'POST', agents.selected);
+                if (Array.isArray(all)) agents.selectedAgents = all.filter(a => a?.selected === true);
+            }
+            return agents;
+        };
+        const [agents, notifications, rules, usedBy, answers] = await Promise.all([
+            tracked(report, 'agents', collectAgents).catch(e => {
+                console.warn('[HelloID UX] Export: could not read "agents"', e);
+                return { couldNotRead: true };
+            }),
+            tracked(report, 'notifications',
+                () => collectNotifications(system, counter(report, 'notifications'))).catch(e => {
+                console.warn('[HelloID UX] Export: could not read "notifications"', e);
+                couldNotRead.push('notifications');
+                return {};
+            }),
+            // Only the rules that have an entitlement for this system
+            tracked(report, 'rules', () => fetchFromGateway(
+                `/api/connectors/shared/rules/published/${id}/entitlements-overview` +
+                `?skip=0&take=${SETTINGS.fetchAllTake}`)
+                .then(overview => collectRules((overview.pageData ?? [])
+                    .filter(r => RULE_ENTITLEMENT_FIELDS.some(f => r[f] === true)), system, counter(report, 'rules')))),
+            tracked(report, 'usedBy', () => collectUsedBy(system, systems, counter(report, 'usedBy'))),
+            tracked(report, 'configuration', () => Promise.all(names.map(n => fetchFromGateway(paths[n]).catch(e => {
                 if (!OPTIONAL_EXPORTS.has(n)) throw e;
                 console.warn(`[HelloID UX] Export: could not read "${n}"`, e);
                 couldNotRead.push(n);
-            })),
+            })))),
         ]);
-        const { configuration = system, ...others } = Object.fromEntries(names.map((n, i) => [n, answers[i]]));
+        const { configuration: read = system, ...others } = Object.fromEntries(names.map((n, i) => [n, answers[i]]));
+        // The systems it depends on, with their names: HelloID only gives
+        // their IDs, which mean nothing in another environment
+        const configuration = !Array.isArray(read.dependOnSystems) ? read : {
+            ...read,
+            dependOnSystems: read.dependOnSystems.map(d => {
+                const displayName = systems.find(o => o?.systemId === d.systemId)?.displayName;
+                return displayName === undefined ? d : { ...d, displayName };
+            }),
+        };
+        // What the list of systems has about it that the configuration
+        // of its type doesn't
+        const listEntry = Object.fromEntries(Object.entries(system).filter(([key]) => !(key in read)));
 
         return {
             exportedAt: new Date().toISOString(),
@@ -1753,25 +2079,40 @@
             displayName: system.displayName,
             templateIdentifier: system.templateIdentifier,
             configuration: SETTINGS.exportSecrets ? configuration : maskSecrets(configuration),
+            secrets: listSecrets(configuration),
+            ...(Object.keys(listEntry).length ? { listEntry } : {}),
+            agents,
             ...others,
+            // How its accounts are named in mappings and scripts, and the
+            // other systems that do so or depend on it
+            accountsReference: `Person.Accounts.${accountsReference(system.systemId)}`,
+            usedBy,
+            ...notifications,
             ...(couldNotRead.length ? { couldNotRead } : {}),
-            // Only the rules that have an entitlement for this system
-            rules: (rules.pageData ?? []).filter(r => RULE_ENTITLEMENT_FIELDS.some(f => r[f] === true)),
+            rules,
         };
     }
 
-    const exportFileName = (name) =>
-        `${name.replace(/[\\/:*?"<>|]+/g, '_').trim()} - ${new Date().toISOString().slice(0, 10)}.json`;
+    // With the system's ID, when known: a copied or migrated system has
+    // the name of the original. forName: the system, when name says more
+    // than that.
+    const exportFileName = (name, forName = name) => {
+        const id = systemIds.get(forName);
+        return `${name.replace(/[\\/:*?"<>|]+/g, '_').trim()}${id ? ` - ${id}` : ''} - ` +
+               `${new Date().toISOString().slice(0, 10)}.json`;
+    };
 
     // The save dialog has to open right at the click, so first ask where
     // to save, then collect, then write. Browsers without that dialog get
     // a normal download.
-    async function exportSystem(name) {
+    // kind: which export (see EXPORT_KINDS)
+    async function exportSystem(name, kind) {
+        const fileName = () => exportFileName(`${name}${kind.suffix}`, name);
         let handle = null;
         if (typeof pageWindow.showSaveFilePicker === 'function') {
             try {
                 handle = await pageWindow.showSaveFilePicker({
-                    suggestedName: exportFileName(name),
+                    suggestedName: fileName(),
                     types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
                 });
             } catch (e) {
@@ -1780,37 +2121,149 @@
             }
         }
 
-        const data = await collectSystemExport(name);
-        const json = JSON.stringify(data, null, 2);
+        // The progress, in a card: the steps of this export, then the file
+        const steps = [...kind.steps, { key: 'save', label: 'Save the file' }];
+        const progress = showProgress(`Export: ${name}`, steps.map(step => step.label));
+        const report = (key, state, detail) => progress.set(steps.findIndex(step => step.key === key), state, detail);
+        let data;
+        try {
+            data = await kind.collect(name, report);
+            const json = JSON.stringify(data, null, 2);
 
-        if (handle) {
-            const writable = await handle.createWritable();
-            await writable.write(json);
-            await writable.close();
-        } else {
-            const link = document.createElement('a');
-            link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-            link.download = exportFileName(name);
-            link.click();
-            setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+            report('save', 'busy');
+            if (handle) {
+                const writable = await handle.createWritable();
+                await writable.write(json);
+                await writable.close();
+            } else {
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+                link.download = fileName();
+                link.click();
+                setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+            }
+            report('save', 'done');
+        } catch (e) {
+            console.warn('[HelloID UX] Export failed', e);
+            progress.failBusy();
+            await progress.finish(`Export failed: ${e?.message ?? e}`);
+            // Already shown to the user
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
         }
 
-        // After the button shows its check mark
-        const notice = data.couldNotRead
-            ? `The file was saved without: ${data.couldNotRead.join(', ')}. HelloID did not return that part.`
-            : EXPORT_NOTICES[data.templateIdentifier];
-        if (notice) setTimeout(() => alert(notice), 100);
+        // The card stays only when there is something to tell
+        const notice = kind.notice(data);
+        if (notice) await progress.finish(`Export finished.\n\n${notice}`);
+        else progress.close();
         return true;
     }
 
+    function configurationNotice(data) {
+        const notSearched = data.usedBy.filter(u => u.couldNotRead).map(u => u.displayName);
+        return data.couldNotRead
+            ? `The file was saved without: ${data.couldNotRead.join(', ')}. HelloID did not return that part.`
+            : notSearched.length
+                ? 'The file was saved, but these systems could not be read, so it is not known whether they ' +
+                  `use this system (usedBy in the file): ${notSearched.join(', ')}.`
+                : EXPORT_NOTICES[data.templateIdentifier];
+    }
+
+    // --- Export of a system's granted entitlements ---
+    // What the persons have in the system right now, per person: data, not
+    // configuration, so a file of its own. For comparing before and after
+    // a change (e.g. against the system that replaces this one).
+    // HelloID has no request for one system: all granted entitlements are
+    // fetched, and those of the system are kept.
+    const GRANTED_PATH = '/service/rule-enforcement/api/enforcedstate/granted';
+
+    const GRANTED_STEPS = [
+        { key: 'systems', label: 'List of target systems' },
+        { key: 'granted', label: 'Granted entitlements (of all systems)' },
+    ];
+
+    async function collectGrantedExport(name, report = () => {}) {
+        const system = (await tracked(report, 'systems', fetchSystems))
+            .find(s => typeof s?.displayName === 'string' && s.displayName.trim() === name);
+        if (!system) throw new Error(`"${name}" was not found in HelloID's list of target systems.`);
+
+        const granted = await tracked(report, 'granted',
+            () => fetchFromGateway(`${GRANTED_PATH}?take=${SETTINGS.fetchAllTake}&skip=0`));
+        const all = granted.pageData ?? [];
+        const persons = new Map(); // personId -> person
+        all.filter(row => row?.systemId === system.systemId).forEach(row => {
+            const personId = row.personEntitlementId?.personId;
+            if (!persons.has(personId)) {
+                persons.set(personId, { personId, personName: row.personName, entitlements: [] });
+            }
+            const { entitlementId, type, displayName, permissionDefinitionDisplayName } = row.entitlement ?? {};
+            persons.get(personId).entitlements.push({
+                entitlementId,
+                type,
+                displayName: displayName ?? row.entitlementName,
+                permissionDefinitionDisplayName,
+                subPermissionCount: row.subPermissionCount,
+                lastChangedOnUtc: row.lastChangedOnUtc,
+                hasOpenActions: row.hasOpenActions,
+            });
+        });
+        // In a fixed order, so two files can be compared
+        const text = (v) => String(v ?? '');
+        const result = [...persons.values()].sort((a, b) =>
+            text(a.personName).localeCompare(text(b.personName)) || text(a.personId).localeCompare(text(b.personId)));
+        result.forEach(p => p.entitlements.sort((a, b) =>
+            text(a.type).localeCompare(text(b.type)) || text(a.displayName).localeCompare(text(b.displayName)) ||
+            text(a.entitlementId).localeCompare(text(b.entitlementId))));
+
+        return {
+            exportedAt: new Date().toISOString(),
+            exportedFrom: location.origin,
+            exportedBy: `HelloID UX improvements ${typeof GM_info !== 'undefined' ? GM_info.script.version : ''}`.trim(),
+            contents: 'grantedEntitlements',
+            systemId: system.systemId,
+            displayName: system.displayName,
+            templateIdentifier: system.templateIdentifier,
+            // False: HelloID returned as many rows as were asked for, so
+            // there may be more (setting "Grids: max rows to fetch")
+            complete: all.length < SETTINGS.fetchAllTake,
+            // For checking that: the rows HelloID returned, of all systems
+            // together, and what it said about its own limit
+            rowsOfAllSystems: all.length,
+            exceededTotalRowCountLimit: granted.exceededTotalRowCountLimit,
+            personCount: result.length,
+            entitlementCount: result.reduce((n, p) => n + p.entitlements.length, 0),
+            persons: result,
+        };
+    }
+
+    const EXPORT_KINDS = {
+        configuration: {
+            title: 'Export the configuration to a JSON file',
+            icon: 'fa-solid fa-download',
+            suffix: '',
+            steps: CONFIGURATION_STEPS,
+            collect: collectSystemExport,
+            notice: configurationNotice,
+        },
+        granted: {
+            title: 'Export the granted entitlements (per person) to a JSON file',
+            icon: 'fa-solid fa-list-check',
+            suffix: ' - granted entitlements',
+            steps: GRANTED_STEPS,
+            collect: collectGrantedExport,
+            notice: (data) => (data.complete ? ''
+                : 'The file may not have all granted entitlements: HelloID returned as many rows as were asked ' +
+                  'for. Raise the setting "Grids: max rows to fetch" and export again.'),
+        },
+    };
+
     // getName is called at click time
-    function createExportButton(getName, className = 'btn btn-default btn-xs') {
+    function createExportButton(getName, className = 'btn btn-default btn-xs', kind = EXPORT_KINDS.configuration) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = className;
-        btn.title = 'Export the configuration to a JSON file';
+        btn.title = kind.title;
         const icon = document.createElement('i');
-        icon.className = 'fa-solid fa-download';
+        icon.className = kind.icon;
         btn.appendChild(icon);
 
         btn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -1820,17 +2273,19 @@
             if (btn.disabled) return;
             btn.disabled = true;
             icon.className = 'fa-solid fa-spinner fa-spin';
-            let result = 'fa-solid fa-download';
+            let result = kind.icon;
             try {
-                if (await exportSystem(getName())) result = 'fa-solid fa-check';
+                if (await exportSystem(getName(), kind)) result = 'fa-solid fa-check';
             } catch (err) {
-                console.warn('[HelloID UX] Export failed', err);
                 result = 'fa-solid fa-xmark';
-                alert(`Export failed.\n\n${err?.message ?? err}`);
+                if (!err?.shown) {
+                    console.warn('[HelloID UX] Export failed', err);
+                    alert(`Export failed.\n\n${err?.message ?? err}`);
+                }
             }
             icon.className = result;
             btn.disabled = false;
-            setTimeout(() => { icon.className = 'fa-solid fa-download'; }, SETTINGS.copyFeedbackMs);
+            setTimeout(() => { icon.className = kind.icon; }, SETTINGS.copyFeedbackMs);
         });
         return btn;
     }
@@ -1840,9 +2295,11 @@
     // scrolls when the text is long, and the text can be selected and
     // copied (the browser's own alert/confirm cut long texts off).
     // With confirm: Cancel and Continue; resolves to true for Continue.
+    // With alternative (a label): a button in between, for another way to
+    // continue; resolves to 'alternative' for that one.
     const DIALOG_CLASS = 'tm-dialog';
 
-    function showDialog(title, text, { confirm = false } = {}) {
+    function showDialog(title, text, { confirm = false, alternative = null } = {}) {
         return new Promise(resolve => {
             const dialog = document.createElement('dialog');
             dialog.className = DIALOG_CLASS;
@@ -1871,12 +2328,14 @@
             });
             copy.style.marginRight = 'auto'; // on the left, the others on the right
             if (confirm) button('Cancel', 'btn-default', () => dialog.close('cancel'));
+            // (as valid a choice as Continue: the same color)
+            if (alternative) button(alternative, 'btn-primary', () => dialog.close('alternative'));
             const ok = button(confirm ? 'Continue' : 'Close', 'btn-primary', () => dialog.close('ok'));
 
             // Also closed with Escape: that counts as Cancel
             dialog.addEventListener('close', () => {
                 dialog.remove();
-                resolve(dialog.returnValue === 'ok');
+                resolve(dialog.returnValue === 'alternative' ? 'alternative' : dialog.returnValue === 'ok');
             });
             // Keep typing away from the page's own key handlers
             dialog.addEventListener('keydown', (e) => e.stopPropagation());
@@ -1893,15 +2352,21 @@
 
     // The same card for a job in steps: lists the steps with their state,
     // updated while they run. It can't be closed until the job is over.
-    //   set(index, state): waiting, busy, done, failed or skipped
+    //   set(index, state, detail): waiting, busy, done, failed or skipped;
+    //                    detail: shown behind the step ("12/40"), kept
+    //                    until another one is given
+    //   failBusy():      the job stopped: its busy steps failed
+    //   close():         closes the card, without the user
     //   finish(message): adds the closing text, lets the user close the
     //                    card; resolves when that happens
     const PROGRESS_ICONS = { waiting: '•', busy: '⏳', done: '✅', failed: '❌', skipped: '–' };
 
     function showProgress(title, names) {
         const states = names.map(() => 'waiting');
+        const details = names.map(() => '');
         let closing = '';
-        const text = () => names.map((name, i) => `${PROGRESS_ICONS[states[i]]} ${name}`).join('\n') + closing;
+        const text = () => names.map((name, i) =>
+            `${PROGRESS_ICONS[states[i]]} ${name}${details[i] ? ` (${details[i]})` : ''}`).join('\n') + closing;
 
         const dialog = document.createElement('dialog');
         dialog.className = DIALOG_CLASS;
@@ -1946,9 +2411,17 @@
         body.focus();
 
         return {
-            set(index, state) {
+            set(index, state, detail) {
                 states[index] = state;
+                if (detail !== undefined) details[index] = detail;
                 render();
+            },
+            failBusy() {
+                states.forEach((state, i) => { if (state === 'busy') states[i] = 'failed'; });
+                render();
+            },
+            close() {
+                dialog.close();
             },
             finish(message) {
                 closing = `\n\n${message}`;
@@ -1974,6 +2447,10 @@
     //   method: how
     //   body:   (configuration from the file, current one, all systems)
     //           -> what to send
+    //   requests: (configuration, current) -> the requests to send instead
+    //           of the step itself (each with name, path, method, body, or
+    //           with name and run: (id) -> sends it), for a part that
+    //           takes a request per item
     //   before: requests to send first, each with name, path, method, body
     //           and optionally when: (current) -> is it needed?
     //   resetsFieldIds: the mapping fields have new IDs afterwards
@@ -1983,6 +2460,42 @@
     //           would change, when that's not simply what differs in body
     const GENERAL_FIELDS = ['displayName', 'description', 'icon', 'isDisabled', 'executeOnPremises',
         'limitConcurrentActionsConfiguration'];
+    // For every type: these are stored apart from the type's configuration
+    const SHARED_IMPORT_STEPS = [
+        // The systems this one waits for. The request wants more about each
+        // of them than the configuration has; that comes from the list of
+        // systems. Systems that aren't in this environment are left out
+        // (see findDependency).
+        {
+            name: 'Depends on systems',
+            path: (id) => `/service/provisioning-api/api/target-systems/${id}/depend-on-systems`,
+            method: 'POST',
+            body: (configuration, current, systems) => ({
+                dependOnSystems: (configuration.dependOnSystems ?? [])
+                    .map(dependency => findDependency(dependency, systems)).filter(Boolean)
+                    .map(system => ({
+                        systemId: system.systemId,
+                        displayName: system.displayName,
+                        internalSystemReferenceName: system.internalSystemReferenceName,
+                        templateIdentifier: system.templateIdentifier,
+                    })),
+            }),
+            changes: (configuration, current) => {
+                const ids = (c) => (c.dependOnSystems ?? []).map(d => d.systemId).sort().join();
+                return ids(configuration) === ids(current) ? [] : ['dependOnSystems'];
+            },
+        },
+        // Stored apart from the configuration; here it goes along with it
+        // (see agentSelection in the import)
+        {
+            name: 'Agents for on-premises execution',
+            path: AGENT_SELECTION_PATH,
+            method: 'POST',
+            body: (configuration) => configuration.agentSelection ?? [],
+            changes: (configuration, current) =>
+                (sameAgentSelection(configuration.agentSelection, current.agentSelection) ? [] : ['agentSelection']),
+        },
+    ];
     const POWERSHELL_IMPORT_STEPS = [
         {
             name: 'General settings',
@@ -1990,33 +2503,7 @@
             method: 'POST',
             body: (configuration) => Object.fromEntries(GENERAL_FIELDS.map(f => [f, configuration[f]])),
         },
-        // The systems this one waits for. The request wants more about each
-        // of them than the configuration has; that comes from the list of
-        // systems (which also shows if such a system still exists).
-        {
-            name: 'Depends on systems',
-            path: (id) => `/service/provisioning-api/api/target-systems/${id}/depend-on-systems`,
-            method: 'POST',
-            body: (configuration, current, systems) => ({
-                dependOnSystems: (configuration.dependOnSystems ?? []).map(dependency => {
-                    const system = systems.find(s => s.systemId === dependency.systemId);
-                    if (!system) {
-                        throw new Error(`The system depends on a system (ID ${dependency.systemId}) ` +
-                                        'that was not found in this HelloID environment.');
-                    }
-                    return {
-                        systemId: system.systemId,
-                        displayName: system.displayName,
-                        internalSystemReferenceName: system.internalSystemReferenceName,
-                        templateIdentifier: system.templateIdentifier,
-                    };
-                }),
-            }),
-            changes: (configuration, current) => {
-                const ids = (c) => (c.dependOnSystems ?? []).map(d => d.systemId).sort().join();
-                return ids(configuration) === ids(current) ? [] : ['dependOnSystems'];
-            },
-        },
+        ...SHARED_IMPORT_STEPS,
         {
             name: 'Configuration values',
             path: (id) => `/connector/powershell-target/api/configuration/${id}/script-configuration`,
@@ -2191,6 +2678,30 @@
         return names[number];
     }
 
+    // A system the file's system depends on, as it is in this environment:
+    // found by its ID or, for a file from another environment, by its name
+    // (unless the user chose not to: matchByName false)
+    const findDependency = (dependency, systems) =>
+        systems.find(s => s.systemId === dependency.systemId) ??
+        systems.find(s => dependency.matchByName !== false &&
+                          typeof dependency.displayName === 'string' && typeof s.displayName === 'string' &&
+                          s.displayName.trim() === dependency.displayName.trim());
+
+    // The file's dependencies with the IDs they have here, without the
+    // ones that aren't here
+    const resolveDependencies = (configuration, systems) => (configuration.dependOnSystems ?? [])
+        .filter(d => findDependency(d, systems))
+        .map(({ displayName, matchByName, ...d }) => ({ ...d, systemId: findDependency({ displayName, ...d }, systems).systemId }));
+
+    // For the user: the dependencies that are left out, if any
+    function missingDependencies(configuration, systems) {
+        const missing = (configuration.dependOnSystems ?? []).filter(d => !findDependency(d, systems));
+        if (!missing.length) return '';
+        return '\n\nThe system depends on systems whose ID is not in this HelloID environment. They are left ' +
+               'out of "Depends on systems"; add them by hand when needed:\n' +
+               missing.map(d => `  - ${d.displayName ?? '?'} (ID ${d.systemId})`).join('\n');
+    }
+
     // Is there a target system with this name already?
     const NAME_EXISTS_PATH = (name) =>
         `/service/provisioning-api/api/target-systems/exists?name=${encodeURIComponent(name)}`;
@@ -2199,22 +2710,578 @@
     const CREATE_PATHS = {
         'powershell-target': '/connector/powershell-target/api/configuration/create/powershell-target',
         'powershell-onpremise': '/connector/powershell-target/api/configuration/create/powershell-onpremise',
+        'activedirectory': '/connector/active-directory/api/configuration/create/activedirectory',
     };
+
+    // Built-in Active Directory. A part without a step here is shown as
+    // not importable when it differs.
+    const AD_GENERAL_FIELDS = ['domain', 'selectedDomainControllers', 'manualDomainControllerSelection',
+        'description', 'displayName', 'isDisabled'];
+    // The requests that make the system's mapping fields those of the
+    // file, field by field (found by name), so the fields keep their IDs:
+    // a field that differs is sent; a field the system doesn't have is
+    // made (HelloID makes an empty one) and then sent; a field that isn't
+    // in the file is deleted, after the others. The mapping actions of a
+    // field keep their IDs too, in order; an action more than the system
+    // has gets a new ID.
+    function adFieldRequests(configuration, current) {
+        const fieldPath = (id, identifier) => `/connector/active-directory/api/mapping/${id}/field` +
+            (identifier ? `/${encodeURIComponent(identifier)}` : '');
+        const withoutIds = ({ identifier, mappingActions, ...field }) => JSON.stringify({
+            ...field,
+            mappingActions: (mappingActions ?? []).map(({ mappingActionId, ...action }) => action),
+        });
+        // mine: the system's field it is written to
+        const bodyFor = (field, mine) => ({
+            type: field.type,
+            mappingActions: (field.mappingActions ?? []).map((action, i) => ({
+                ...action,
+                mappingActionId: mine.mappingActions?.[i]?.mappingActionId ?? crypto.randomUUID(),
+            })),
+            configuredForActions: [...new Set((field.mappingActions ?? []).flatMap(a => a.entitlementActions ?? []))],
+            identifier: mine.identifier,
+            name: field.name,
+            description: field.description,
+            // Always empty in HelloID's own requests
+            useInNotificationsForActions: '',
+            storeInAccountDataForActions: '',
+        });
+        const currentFields = current.mappingConfiguration?.fields ?? [];
+        const fileFields = configuration.mappingConfiguration?.fields ?? [];
+        const known = new Set(currentFields.map(f => f.identifier)); // to tell a new field from the others
+
+        // HelloID answers nothing usable for a new field: it is the one
+        // the system didn't have before (it may take a moment to show)
+        const makeField = async (id) => {
+            await sendToGateway(fieldPath(id), 'POST', {});
+            for (let attempt = 0; ; attempt++) {
+                const now = await fetchFromGateway(CONNECTOR_EXPORTS.activedirectory(id).configuration);
+                const made = (now.mappingConfiguration?.fields ?? []).filter(f => !known.has(f.identifier));
+                if (made.length === 1) {
+                    known.add(made[0].identifier);
+                    return made[0];
+                }
+                if (made.length > 1 || attempt >= 9) {
+                    throw new Error(`A new mapping field was made, but HelloID shows ${made.length} new fields.`);
+                }
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        };
+
+        const requests = fileFields.flatMap(field => {
+            const mine = currentFields.find(f => f.name === field.name);
+            if (!mine) {
+                return [{
+                    name: `Mapping field "${field.name}" (new)`,
+                    run: async (id) => {
+                        const made = await makeField(id);
+                        await sendToGateway(fieldPath(id, made.identifier), 'POST', bodyFor(field, made));
+                    },
+                }];
+            }
+            if (withoutIds(mine) === withoutIds(field)) return [];
+            const body = bodyFor(field, mine);
+            return [{
+                name: `Mapping field "${field.name}"`,
+                path: (id) => fieldPath(id, mine.identifier),
+                method: 'POST',
+                body: () => body,
+            }];
+        });
+        currentFields.filter(f => !fileFields.some(o => o.name === f.name)).forEach(f => requests.push({
+            name: `Mapping field "${f.name}" (delete)`,
+            path: (id) => fieldPath(id, f.identifier),
+            method: 'DELETE',
+        }));
+        // After the last one, the system has the fields of the file
+        if (requests.length) requests[requests.length - 1].resetsFieldIds = true;
+        return requests;
+    }
+
+    const AD_ADMINISTRATION_FIELDS = ['deleteAccounts', 'managerSettings',
+        'container', 'containerSelectionType', 'containerSelectorPowershellScript',
+        ...['enable', 'disable', 'update'].flatMap(action => [`${action}Container`,
+            `${action}ContainerSelectionType`, `${action}ContainerSelectorPowershellScript`,
+            `moveOn${action[0].toUpperCase()}${action.slice(1)}`])];
+    const ACTIVE_DIRECTORY_IMPORT_STEPS = [
+        {
+            name: 'General settings',
+            path: (id) => `/connector/active-directory/api/configuration/${id}/general`,
+            method: 'POST',
+            body: (configuration) => Object.fromEntries(AD_GENERAL_FIELDS.map(f => [f, configuration[f]])),
+        },
+        ...SHARED_IMPORT_STEPS,
+        {
+            name: 'Exchange',
+            path: (id) => `/connector/active-directory/api/configuration/${id}/exchange`,
+            method: 'POST',
+            body: (configuration) => configuration.exchangeConfiguration,
+            changes: (configuration, current) =>
+                (JSON.stringify(configuration.exchangeConfiguration ?? null) ===
+                 JSON.stringify(current.exchangeConfiguration ?? null) ? [] : ['exchangeConfiguration']),
+        },
+        // Home, profile and terminal services directories, in one request
+        {
+            name: 'Directories',
+            path: (id) => `/connector/active-directory/api/configuration/${id}/directories`,
+            method: 'POST',
+            body: (configuration) => configuration.directories,
+            changes: (configuration, current) =>
+                (JSON.stringify(configuration.directories ?? null) ===
+                 JSON.stringify(current.directories ?? null) ? [] : ['directories']),
+        },
+        // Field by field (see adFieldRequests). The steps that point at
+        // fields are sent again afterwards: a new field has its ID only then.
+        {
+            name: 'Field mapping',
+            note: 'field by field: changes them, adds the new ones, deletes the ones that are not in the file',
+            resetsFieldIds: true,
+            requests: adFieldRequests,
+            body: (configuration, current) => adFieldRequests(configuration, current).map(r => r.body?.()),
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c.startsWith(MAPPING_FIELD)),
+        },
+        // Delete accounts, the manager, and the containers (default, and
+        // after enable, disable and update). The request groups per
+        // container what the configuration has side by side.
+        {
+            name: 'Administration (delete accounts, manager, containers)',
+            path: (id) => `/connector/active-directory/api/configuration/${id}/administration`,
+            method: 'POST',
+            body: (configuration) => {
+                const container = (action, move) => ({
+                    container: configuration[action ? `${action}Container` : 'container'],
+                    containerSelectionType: configuration[action ? `${action}ContainerSelectionType`
+                        : 'containerSelectionType'],
+                    containerSelectorPowershellScript: configuration[action
+                        ? `${action}ContainerSelectorPowershellScript` : 'containerSelectorPowershellScript'],
+                    ...(action ? { move: configuration[move] } : {}),
+                });
+                return {
+                    deleteAccounts: configuration.deleteAccounts,
+                    managerSettings: configuration.managerSettings,
+                    defaultContainer: container(),
+                    enableContainer: container('enable', 'moveOnEnable'),
+                    disableContainer: container('disable', 'moveOnDisable'),
+                    updateContainer: container('update', 'moveOnUpdate'),
+                };
+            },
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => AD_ADMINISTRATION_FIELDS.includes(c)),
+        },
+        // All thresholds in one request
+        {
+            name: 'Thresholds',
+            path: (id) => `/connector/active-directory/api/configuration/${id}/thresholds`,
+            method: 'POST',
+            body: (configuration) => configuration.thresholds,
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c === 'thresholds'),
+        },
+        // As for a PowerShell system: the script, its actions and the
+        // fields to check
+        {
+            name: 'Uniqueness check',
+            usesFieldIds: true,
+            path: (id) => `/connector/active-directory/api/mapping/${id}/uniqueness`,
+            method: 'POST',
+            body: (configuration, current) => {
+                const { script, mappingEntitlementActions, selectedUniqueFields } =
+                    configuration.mappingConfiguration?.uniquenessConfiguration ?? {};
+                return {
+                    script,
+                    mappingEntitlementActions,
+                    selectedUniqueFields: (selectedUniqueFields ?? []).map(id => {
+                        const name = mappingFieldName(configuration, id);
+                        const field = (current.mappingConfiguration?.fields ?? []).find(f => f.name === name);
+                        if (!field) throw new Error(`The unique field "${name}" is not in the mapping of the system.`);
+                        return field.identifier;
+                    }),
+                };
+            },
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => c === UNIQUENESS),
+        },
+        // The unique fields are given by their IDs in the system, found by
+        // name. The request also wants the dependencies again.
+        {
+            name: 'Account settings (sync unique fields, configuration form, post-action scripts)',
+            usesFieldIds: true,
+            path: (id) => `/connector/active-directory/api/configuration/${id}/account`,
+            method: 'POST',
+            body: (configuration, current, systems) => ({
+                selectedUniqueFields: (configuration.mappingConfiguration?.uniquenessConfiguration
+                    ?.selectedUniqueFields ?? []).map(id => {
+                    const name = mappingFieldName(configuration, id);
+                    const field = (current.mappingConfiguration?.fields ?? []).find(f => f.name === name);
+                    if (!field) throw new Error(`The unique field "${name}" is not in the mapping of the system.`);
+                    return field.identifier;
+                }),
+                syncUniqueFields: configuration.syncUniqueFields,
+                ...SHARED_IMPORT_STEPS[0].body(configuration, current, systems), // dependOnSystems
+                scriptConfigurationForm: configuration.scriptConfigurationForm,
+                postActionPowerShellConfiguration: configuration.postActionPowerShellConfiguration,
+            }),
+            changes: (configuration, current) => changedParts(configuration, current)
+                .filter(c => ['syncUniqueFields', 'scriptConfigurationForm',
+                    'postActionPowerShellConfiguration'].includes(c)),
+        },
+        // As for a PowerShell system, to another address
+        {
+            ...POWERSHELL_IMPORT_STEPS.find(step => step.name === 'Correlation'),
+            path: (id) => `/connector/active-directory/api/configuration/${id}/correlate`,
+        },
+    ];
 
     const IMPORT_STEPS = {
         'powershell-onpremise': POWERSHELL_IMPORT_STEPS,
         'powershell-target': POWERSHELL_IMPORT_STEPS,
+        'activedirectory': ACTIVE_DIRECTORY_IMPORT_STEPS,
     };
+
+    // --- Import of the notifications ---
+    // The notifications of the file are made for the system, or, when it
+    // has them already (the same ID, or else the same event and name),
+    // changed into those of the file where they differ. One request each;
+    // HelloID uses the same one for a new and for an existing
+    // notification, told apart by the ID. Notifications the system has
+    // that the file doesn't are left alone.
+
+    // What HelloID wants: the notification as it was read, with the ID to
+    // write to, for this system and this environment. Data of the file's
+    // system is data of this system here.
+    function notificationFor(notification, identifier, fileSystemId, system) {
+        const { couldNotRead, ...rest } = notification;
+        return {
+            ...rest,
+            identifier,
+            systemId: system.systemId,
+            tenantUrl: location.origin,
+            dataReferences: (notification.dataReferences ?? [])
+                .map(r => (r?.systemId === fileSystemId ? { ...r, systemId: system.systemId } : r)),
+        };
+    }
+
+    // Two notifications with the same content? Not counting when they
+    // were changed and what HelloID fills in itself.
+    function sameNotification(a, b) {
+        const content = ({ lastChange, tenantUrl, configuration, ...rest }) => {
+            const { verifiedDomains, ...mail } = configuration ?? {};
+            return { ...rest, configuration: mail };
+        };
+        const ordered = (value) => (Array.isArray(value) ? value.map(ordered)
+            : isPlainObject(value) ? Object.fromEntries(Object.keys(value).sort().map(k => [k, ordered(value[k])]))
+            : value ?? null);
+        return JSON.stringify(ordered(content(a))) === JSON.stringify(ordered(content(b)));
+    }
+
+    // The requests, as import steps; none when the file has no
+    // notifications (an older export)
+    // skipped: for the user, the notifications that can't be sent here
+    async function notificationRequests(data, fileSystemId, system) {
+        const all = (Array.isArray(data.notifications) ? data.notifications : [])
+            .filter(n => isPlainObject(n) && !n.couldNotRead && isPlainObject(n.configuration));
+        if (!all.length) return { requests: [], skipped: '' };
+
+        // What sends them, as it is here: found by its ID or, for a file
+        // from another environment, by its name
+        const senders = await fetchFromGateway(NOTIFICATION_SYSTEMS_PATH);
+        const senderHere = (id) => {
+            if (!id || senders.some(s => s?.systemId === id)) return id;
+            const name = (data.notificationSystems ?? []).find(s => s?.systemId === id)?.displayName;
+            return senders.find(s => typeof name === 'string' && s?.displayName === name)?.systemId;
+        };
+        const unsendable = all.filter(n => n.notificationSystemId && !senderHere(n.notificationSystemId));
+        const skipped = !unsendable.length ? ''
+            : '\n\nThese notifications of the file are not imported: what sends them (their notification ' +
+              'system) is not in this HelloID environment:\n' + unsendable.map(n => `  - ${n.name}`).join('\n');
+        const inFile = all.filter(n => !unsendable.includes(n))
+            .map(n => ({ ...n, notificationSystemId: senderHere(n.notificationSystemId) }));
+        const list = await fetchFromGateway(`${NOTIFICATIONS_PATH}?skip=0&take=${SETTINGS.fetchAllTake}` +
+                                            '&enabled=false&disabled=false');
+        const here = (list.pageData ?? []).filter(n => n?.systemId === system.systemId);
+        const taken = new Set(); // each one of the system matches one of the file at most
+        const requests = [];
+        for (const notification of inFile) {
+            const match = here.find(n => !taken.has(n) && n.identifier === notification.identifier) ??
+                          here.find(n => !taken.has(n) && n.event === notification.event && n.name === notification.name);
+            if (match) taken.add(match);
+            const body = notificationFor(notification, match?.identifier ?? crypto.randomUUID(), fileSystemId, system);
+            if (match && sameNotification(body,
+                await fetchFromGateway(`${NOTIFICATIONS_PATH}/${encodeURIComponent(match.identifier)}`))) {
+                continue;
+            }
+            requests.push({
+                name: `Notification "${notification.name}" (${match ? 'change' : 'new'})`,
+                path: () => NOTIFICATIONS_PATH,
+                method: 'POST',
+                body: () => body,
+            });
+        }
+        return { requests, skipped };
+    }
+
+    // --- Import of the business rule links ---
+    // The rules of the file get the entitlements they had for the file's
+    // system, for this system: found by ID, or else (another system) by
+    // type and name. What a rule has for other systems stays. A rule is
+    // saved as a DRAFT and never published: that is up to the user, in
+    // HelloID, which shows what publishing would do. HelloID returns a
+    // rule's draft when it has one, so a draft that is there is added to.
+    // Entitlements this system has in rules that the file doesn't have
+    // are only taken out when the user chooses so.
+    // Permissions can only be linked once HelloID has retrieved them from
+    // the system (its permission scripts). When some of the file aren't
+    // there, two last steps let HelloID retrieve them (and wait for them),
+    // and link what came: after the configuration is imported, as a new
+    // system has its scripts only then.
+    const RULES_PATH = '/service/rules/api/rules';
+    // All entitlements that rules can have, of all systems
+    const RULE_ENTITLEMENTS_PATH = `/service/rules/api/entitlements?skip=0&take=${SETTINGS.fetchAllTake}`;
+    const ENTITLEMENT_TYPES = { 1: 'Account', 2: 'AccountAccess', 3: 'Permission' };
+    // Lets HelloID retrieve the permissions of a system; it does so in
+    // its own time
+    const RETRIEVE_PERMISSIONS_PATH = (id) =>
+        `/service/provisioning-api/api/target-systems/snapshots/create/${id}?permissionsOnly=true`;
+    const RETRIEVE_WAIT_MS = 120000; // how long to wait for them
+    const RETRIEVE_POLL_MS = 5000;
+
+    // An entitlement as rules have it, from a row of that list (which
+    // has the type as a number)
+    function ruleEntitlement(row, system) {
+        const entitlement = isPlainObject(row?.entitlement) ? { ...row, ...row.entitlement } : row ?? {};
+        const type = entitlement.type ?? entitlement.entitlementType;
+        return {
+            entitlementId: entitlement.entitlementId ?? entitlement.id,
+            systemIdentifier: entitlement.systemIdentifier ?? entitlement.systemId,
+            type: ENTITLEMENT_TYPES[type] ?? type,
+            displayName: entitlement.displayName ?? entitlement.entitlementName ?? entitlement.name,
+            permissionDefinitionDisplayName: entitlement.permissionDefinitionDisplayName ?? null,
+            systemName: system.displayName,
+        };
+    }
+
+    const entitlementLabel = (e) => (e.type === 'Permission'
+        ? `permission "${e.displayName}"${e.permissionDefinitionDisplayName ? ` (${e.permissionDefinitionDisplayName})` : ''}`
+        : e.type === 'AccountAccess' ? 'account access' : e.type === 'Account' ? 'account' : `${e.type} "${e.displayName}"`);
+
+    // Answers, or null when the user cancelled:
+    //   requests:  the import steps
+    //   skipped:   for the user, what could not be linked (read it after
+    //              the import: the last step changes it)
+    //   drafts():  the number of rules saved as a draft
+    // Nothing when the file has no rules with their entitlements (an
+    // older export).
+    async function ruleRequests(data, system, created, header) {
+        const requests = [];
+        const drafts = new Set(); // rule IDs
+        let missing = [];  // { ruleId, name, entitlement }: not an entitlement of the system
+        const notes = [];  // other lines for the user
+        let retrieving = false; // the last step is planned, and hasn't run
+        const result = {
+            requests,
+            drafts: () => drafts.size,
+            get skipped() {
+                // (not the permissions the last step is still to retrieve)
+                const lines = [...notes,
+                    ...missing.filter(m => !(retrieving && m.entitlement.type === 'Permission'))
+                        .map(m => `"${m.name}": ${entitlementLabel(m.entitlement)} is not an entitlement of the system`)];
+                return !lines.length ? ''
+                    : `\n\nNot linked in business rules:\n${lines.map(line => `  - ${line}`).join('\n')}`;
+            },
+        };
+
+        const fileRules = (Array.isArray(data.rules) ? data.rules : [])
+            .filter(r => isPlainObject(r) && r.ruleId && Array.isArray(r.entitlements));
+        // (usedBy: only exports that have the rules' entitlements have it;
+        // an older export with no rules says nothing about the rules)
+        if (!Array.isArray(data.rules) || !Array.isArray(data.usedBy) ||
+            (data.rules.length && !fileRules.length)) return result;
+
+        // What rules can have for this system (not what the system no
+        // longer returns)
+        const readAvailable = async () => {
+            const list = await fetchFromGateway(RULE_ENTITLEMENTS_PATH);
+            return (list.pageData ?? list ?? []).filter(row => row?.inTargetSystem !== false)
+                .map(row => ruleEntitlement(row, system))
+                .filter(e => e.entitlementId && e.systemIdentifier === system.systemId);
+        };
+        let available;
+        try {
+            available = await readAvailable();
+        } catch (e) {
+            console.warn('[HelloID UX] Import: could not read the entitlements for rules', e);
+            notes.push(`no rule was linked: HelloID did not return the list of entitlements (${e?.message ?? e})`);
+            return result;
+        }
+        const sameName = (a, b) => a.type === b.type && a.displayName === b.displayName;
+        const here = (entitlement, list = available) => list.find(a => a.entitlementId === entitlement.entitlementId) ??
+            list.find(a => sameName(a, entitlement) &&
+                (a.permissionDefinitionDisplayName ?? null) === (entitlement.permissionDefinitionDisplayName ?? null)) ??
+            // Without the permission set's name, when that leaves one
+            (list.filter(a => sameName(a, entitlement)).length === 1
+                ? list.find(a => sameName(a, entitlement)) : undefined);
+
+        const readRule = (ruleId) => fetchFromGateway(`${RULES_PATH}/${encodeURIComponent(ruleId)}`);
+        const ofSystem = (rule) => (rule.entitlements ?? []).filter(e => e?.systemIdentifier === system.systemId);
+        const withEntitlements = (rule, add, remove = []) => ({
+            ...rule,
+            entitlements: [...(rule.entitlements ?? []).filter(e => !remove.includes(e)), ...add],
+        });
+
+        // Per rule: what to add, and what the system has that the file doesn't
+        const plans = [];
+        for (const fileRule of fileRules) {
+            let rule;
+            try {
+                rule = await readRule(fileRule.ruleId);
+            } catch (e) {
+                console.warn(`[HelloID UX] Import: could not read rule "${fileRule.ruleName}"`, e);
+                if (fileRule.entitlements.length) notes.push(`"${fileRule.ruleName}": the rule is not in this HelloID environment`);
+                continue;
+            }
+            const wanted = [];
+            fileRule.entitlements.forEach(entitlement => {
+                const found = here(entitlement);
+                if (found) wanted.push(found);
+                else missing.push({ ruleId: rule.ruleId, name: rule.name, entitlement });
+            });
+            const has = ofSystem(rule);
+            plans.push({
+                rule,
+                add: wanted.filter(w => !has.some(h => h.entitlementId === w.entitlementId)),
+                // (not what is only missing for now)
+                remove: has.filter(h => !wanted.some(w => w.entitlementId === h.entitlementId) &&
+                                        !fileRule.entitlements.some(e => e.entitlementId === h.entitlementId || sameName(e, h))),
+            });
+        }
+        // An existing system: the rules that have it, but aren't in the file
+        if (!created) {
+            const overview = await fetchFromGateway(
+                `/api/connectors/shared/rules/published/${encodeURIComponent(system.systemId)}/entitlements-overview` +
+                `?skip=0&take=${SETTINGS.fetchAllTake}`);
+            for (const row of overview.pageData ?? []) {
+                if (fileRules.some(r => r.ruleId === row.ruleId) || !RULE_ENTITLEMENT_FIELDS.some(f => row[f] === true)) continue;
+                const rule = await readRule(row.ruleId);
+                if (ofSystem(rule).length) plans.push({ rule, add: [], remove: ofSystem(rule) });
+            }
+        }
+
+        // Taking entitlements out of rules: only when the user says so
+        const describe = (name, sign, entitlements) => entitlements.map(e => `${sign} "${name}": ${entitlementLabel(e)}`);
+        const removals = plans.flatMap(plan => describe(plan.rule.name, '-', plan.remove));
+        let removing = false;
+        if (removals.length) {
+            const answer = await showDialog('Import: business rules', `${header}\n\n` +
+                `Business rules have entitlements for "${system.displayName}" that the file doesn't have:\n` +
+                `${removals.map(line => `  ${line}`).join('\n')}\n\n` +
+                'Continue: these stay as they are.\n' +
+                'Take them out: the rules are saved without them, as drafts. Nothing changes until you publish ' +
+                'those rules in HelloID; when you do, HelloID asks what to do with what was granted.\n' +
+                'Cancel: stops the import.',
+                { confirm: true, alternative: 'Take them out' });
+            if (!answer) return null;
+            removing = answer === 'alternative';
+        }
+
+        plans.filter(plan => plan.add.length || (removing && plan.remove.length)).forEach(plan => {
+            const remove = removing ? plan.remove : [];
+            const body = withEntitlements(plan.rule, plan.add, remove);
+            drafts.add(plan.rule.ruleId);
+            requests.push({
+                name: `Business rule "${plan.rule.name}" (draft)`,
+                changes: [...describe(plan.rule.name, '+', plan.add), ...describe(plan.rule.name, '-', remove)],
+                path: () => RULES_PATH,
+                method: 'POST',
+                body: () => body,
+            });
+        });
+
+        // Permissions of the file that the system doesn't have (yet)
+        const missingPermissions = () => missing.filter(m => m.entitlement.type === 'Permission');
+        if (!missingPermissions().length) return result;
+        // A new system without its secrets can't reach the target system
+        // (a secret that was left out of the file: "***" in it, whatever
+        // the file says about its secrets)
+        const configuration = data.configuration ?? {};
+        const leftOut = Object.values(configuration.scriptConfiguration ?? {}).includes(EXPORT_MASK) ||
+            settingSecretKeys(configuration).some(([group, key]) =>
+                (group ? configuration[group][key] : configuration[key]) === EXPORT_MASK);
+        if (created && leftOut) {
+            notes.push('the permissions of the new system can\'t be retrieved before its secrets are set: ' +
+                       'set them, then import the file again to link the permissions');
+            return result;
+        }
+        retrieving = true;
+        // Two steps: HelloID retrieves the permissions (in its own time,
+        // so this waits for the ones that are wanted), then the rules
+        // get the ones that came
+        let retrieved = available;
+        requests.push({
+            name: 'Retrieve the permissions of the system',
+            changes: ['lets HelloID retrieve the permissions of the system now, and waits for them ' +
+                      `(${RETRIEVE_WAIT_MS / 60000} minutes at most)`],
+            run: async (id) => {
+                try {
+                    await sendToGateway(RETRIEVE_PERMISSIONS_PATH(id), 'POST', {});
+                } catch (e) {
+                    console.warn('[HelloID UX] Import: could not start retrieving the permissions', e);
+                    notes.push(`HelloID did not start retrieving the permissions (${e?.message ?? e})`);
+                    return;
+                }
+                // Until all of them are there, or time is up
+                const deadline = Date.now() + RETRIEVE_WAIT_MS;
+                while (missing.some(m => !here(m.entitlement, retrieved)) && Date.now() < deadline) {
+                    await new Promise(resolve => setTimeout(resolve, RETRIEVE_POLL_MS));
+                    retrieved = await readAvailable();
+                }
+            },
+        });
+        requests.push({
+            name: 'Link the retrieved permissions in business rules (drafts)',
+            changes: missingPermissions().flatMap(m => describe(m.name, '+', [m.entitlement])),
+            run: async () => {
+                retrieving = false;
+                // Each rule as it is now: an earlier step may have saved it
+                const found = missing.filter(m => here(m.entitlement, retrieved));
+                for (const ruleId of new Set(found.map(m => m.ruleId))) {
+                    const rule = await readRule(ruleId);
+                    const has = ofSystem(rule);
+                    const add = found.filter(m => m.ruleId === ruleId).map(m => here(m.entitlement, retrieved))
+                        .filter((w, i, all) => all.indexOf(w) === i && !has.some(h => h.entitlementId === w.entitlementId));
+                    if (!add.length) continue;
+                    await sendToGateway(RULES_PATH, 'POST', withEntitlements(rule, add));
+                    drafts.add(ruleId);
+                }
+                missing = missing.filter(m => !found.includes(m));
+                if (missing.some(m => m.entitlement.type === 'Permission')) {
+                    notes.push('HelloID was asked to retrieve the permissions of the system, but these did not come ' +
+                               '(in time): check the system, let it retrieve its permissions, then import the file again');
+                }
+            },
+        });
+        return result;
+    }
 
     // Secrets that were left out of the file ("***") keep the value the
     // system has now
     function restoreSecrets(configuration, current) {
-        if (!isPlainObject(configuration.scriptConfiguration)) return configuration;
+        const restored = { ...configuration };
+        // Settings of built-in types (see settingSecretKeys)
+        settingSecretKeys(configuration).forEach(([group, key]) => {
+            if (group) {
+                if (restored[group][key] !== EXPORT_MASK) return;
+                restored[group] = { ...restored[group], [key]: current[group]?.[key] ?? null };
+            } else if (restored[key] === EXPORT_MASK) {
+                restored[key] = current[key] ?? null;
+            }
+        });
+        if (!isPlainObject(configuration.scriptConfiguration)) return restored;
         const values = { ...configuration.scriptConfiguration };
         Object.keys(values).forEach(key => {
             if (values[key] === EXPORT_MASK) values[key] = current.scriptConfiguration?.[key] ?? null;
         });
-        return { ...configuration, scriptConfiguration: values };
+        return { ...restored, scriptConfiguration: values };
     }
 
     // Lets the user pick the file to import; null when cancelled
@@ -2333,6 +3400,11 @@
                 };
                 return same(named(body), named(currentBody)) ? [] : [key];
             }
+            if (key === 'dependOnSystems') {
+                // Only which systems: the file also has their names
+                const ids = (c) => (c.dependOnSystems ?? []).map(d => d.systemId).sort().join();
+                return ids(body) === ids(currentBody) ? [] : [key];
+            }
             if (key === 'scripts') {
                 return keysOf(body.scripts, currentBody.scripts)
                     .filter(s => !same(body.scripts?.[s], currentBody.scripts?.[s]))
@@ -2371,6 +3443,43 @@
         }
 
         const systems = await fetchSystems();
+        // Dependencies that aren't here: the user decides, before anything
+        // else. First those with only a system of the same name here (it
+        // is another system than the one of the file): use these, leave
+        // them out, or stop.
+        const header = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
+        const notHere = missingDependencies(data.configuration, systems);
+        const onlyByName = (d) => !systems.some(s => s.systemId === d.systemId) && findDependency(d, systems);
+        const byName = (data.configuration.dependOnSystems ?? []).filter(onlyByName).map(d => {
+            const found = findDependency(d, systems);
+            const type = found.templateIdentifier === d.templateIdentifier ? `type ${found.templateIdentifier}`
+                : `type ${found.templateIdentifier}, NOT the type in the file (${d.templateIdentifier})`;
+            return `  - "${found.displayName}": ID in the file ${d.systemId}, ID here ${found.systemId} (${type})`;
+        });
+        if (byName.length) {
+            const answer = await showDialog('Import: dependency matched by name', `${header}\n\n` +
+                'The system depends on systems whose ID is not in this HelloID environment, but a target system ' +
+                `with the same name is:\n${byName.join('\n')}\n\n` +
+                'Continue: "Depends on systems" will point at these systems.\n' +
+                'Continue without these: they are left out of "Depends on systems".\n' +
+                'Cancel: stops the import.',
+                { confirm: true, alternative: 'Continue without these' });
+            if (!answer) return false;
+            if (answer === 'alternative') {
+                data.configuration = {
+                    ...data.configuration,
+                    dependOnSystems: data.configuration.dependOnSystems
+                        .map(d => (onlyByName(d) ? { ...d, matchByName: false } : d)),
+                };
+            }
+        }
+        // Then those that aren't here at all
+        if (notHere && !await showDialog('Import: dependency not found',
+            `${header}${notHere}\n\nContinue the import without them?`, { confirm: true })) {
+            return false;
+        }
+        // All that are left out, for the messages
+        const missing = missingDependencies(data.configuration, systems);
         let system = systems.find(s => s?.systemId === systemId);
         const created = !system;
         if (created) system = await createSystemFor(data, fileName, systemId, steps, systems);
@@ -2384,25 +3493,43 @@
         const currentPath = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id).configuration;
         // The resources are a part of their own, in the file and in HelloID;
         // here they go along with the configuration
+        const hasResources = Boolean(CONNECTOR_EXPORTS[system.templateIdentifier]?.(id).resources);
         let resourcesRead = true;
         const loadCurrent = async () => ({
             ...(currentPath ? await fetchFromGateway(currentPath) : system),
             systemId: system.systemId,
             isNew: created,
-            resources: await fetchFromGateway(POWERSHELL_RESOURCES_PATH(id)).catch(e => {
+            resources: !hasResources ? undefined : await fetchFromGateway(POWERSHELL_RESOURCES_PATH(id)).catch(e => {
                 console.warn('[HelloID UX] Import: could not read the resources', e);
                 resourcesRead = false;
+            }),
+            agentSelection: await fetchFromGateway(AGENT_SELECTION_PATH(id)).catch(e => {
+                console.warn('[HelloID UX] Import: could not read the agent selection', e);
+                return [];
             }),
         });
         const current = await loadCurrent();
         const configuration = {
             ...restoreSecrets(data.configuration, current),
             resources: data.resources,
+            // The tags and agent pools of the file; a file without them
+            // (an older export), or with the same ones, changes nothing
+            agentSelection: !Array.isArray(data.agents?.selected) ||
+                            sameAgentSelection(data.agents.selected, current.agentSelection)
+                ? current.agentSelection : data.agents.selected,
+            isNew: created, // as in the current one: not a difference
+            ...(Array.isArray(data.configuration.dependOnSystems)
+                ? { dependOnSystems: resolveDependencies(data.configuration, systems) } : {}),
             // A new system starts disabled, whatever the file says, so it
             // does nothing before it has been checked
             ...(created ? { isDisabled: true } : {}),
         };
-        const notCompared = !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
+        const { requests: newNotifications, skipped: notificationsSkipped } =
+            await notificationRequests(data, systemId, system);
+        const ruleWork = await ruleRequests(data, system, created, header);
+        if (!ruleWork) return false; // cancelled
+        const ruleDrafts = ruleWork.requests;
+        const notCompared = !hasResources ? null : !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
             : !resourcesRead ? 'HelloID did not return the resources of the system'
             : null;
 
@@ -2427,10 +3554,11 @@
 
         const from = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ` +
                      `${data.exportedAt ?? '?'}`;
-        const skipped = notCompared ? `\n\nResources were not compared: ${notCompared}.` : '';
+        const skipped = (notCompared ? `\n\nResources were not compared: ${notCompared}.` : '') + missing +
+                        notificationsSkipped + ruleWork.skipped;
         const describe = (title, changes) => `${title}:\n` + changes.map(c => `  - ${c}`).join('\n');
         const unsupported = others.length ? `\n\n${describe('Not importable, left as is', others)}` : '';
-        if (!work.length) {
+        if (!work.length && !newNotifications.length && !ruleDrafts.length) {
             await showDialog('Import', `${from}\n\n` + (created ? `Created "${system.displayName}". ` : '') +
                 (others.length
                     ? `Nothing to import into "${system.displayName}".${unsupported}`
@@ -2446,8 +3574,16 @@
         const parts = plan.map(step => {
             const changes = work.find(w => w.step === step)?.changes;
             const title = step.name + (step.note ? ` (${step.note})` : '');
-            return changes ? describe(title, changes) : `${title}:\n  - set again after the mapping is replaced`;
+            return changes ? describe(title, changes) : `${title}:\n  - set again after the mapping is changed`;
         });
+        if (newNotifications.length) {
+            parts.push(describe('Notifications',
+                newNotifications.map(r => r.name)));
+        }
+        if (ruleDrafts.length) {
+            parts.push(describe('Business rules (saved as DRAFTS, not published: publish them yourself in HelloID)',
+                ruleDrafts.flatMap(r => r.changes)));
+        }
 
         // Build every request once before sending any, so a problem in the
         // file stops the import before anything is changed. (After the
@@ -2459,7 +3595,7 @@
         // A system that was just made was confirmed already, and has
         // nothing to back up
         if (!created) {
-            if (!await showDialog('Import', `${from}\n\nThis will overwrite in "${system.displayName}":\n\n` +
+            if (!await showDialog('Import', `${from}\n\nThis will overwrite in, or add to, "${system.displayName}":\n\n` +
                                   `${parts.join('\n\n')}${unsupported}${skipped}\n\n` +
                                   'A backup of the current configuration is downloaded first.', { confirm: true })) {
                 return false;
@@ -2469,7 +3605,12 @@
 
         // Send, in order, showing each request and how it went; the first
         // error stops the import
-        const requests = plan.flatMap(step => [...(step.before ?? []), step]);
+        // (a step with requests of its own is sent as those)
+        const requests = [
+            ...plan.flatMap(step => step.requests?.(configuration, current) ?? [...(step.before ?? []), step]),
+            ...newNotifications,
+            ...ruleDrafts,
+        ];
         const first = created ? 1 : 0; // a new system: it was made before this
         const progress = showProgress(
             `${created ? 'Creating' : 'Importing into'} "${system.displayName}"`,
@@ -2485,7 +3626,9 @@
                     continue;
                 }
                 progress.set(index, 'busy');
-                await sendToGateway(request.path(id), request.method, request.body?.(configuration, latest, systems));
+                // (run: a request that takes more than one call)
+                if (request.run) await request.run(id);
+                else await sendToGateway(request.path(id), request.method, request.body?.(configuration, latest, systems));
                 if (request.resetsFieldIds) latest = await loadImportedFields(loadCurrent, fileFields);
                 progress.set(index++, 'done');
             }
@@ -2509,9 +3652,12 @@
               (created ? 'They are empty in the new system' : 'They kept the values the system already had') +
               (masked.length ? ` (${masked.join(', ')})` : '') +
               (created ? ': set them by hand.' : ': check them, and set them by hand where needed.');
+        const draftsNote = !ruleWork.drafts() ? ''
+            : `\n\n${ruleWork.drafts()} business rule(s) were saved as DRAFTS. They do nothing until you publish ` +
+              'them in HelloID (Business rules; they are marked as having a draft).';
         const disabled = !created ? ''
             : '\n\nThe new system is DISABLED. Check it, and enable it yourself when it is ready.';
-        await progress.finish(`Import finished.${disabled}${secrets}\n\n` +
+        await progress.finish(`Import finished.${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}\n\n` +
                               'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
@@ -2548,7 +3694,8 @@
             'The new system will be DISABLED, also when the system of the file is enabled, so it does ' +
             'nothing before you have checked it. Enable it yourself when it is ready.' +
             (data.secretsIncluded === false
-                ? '\n\nThe file has no secrets: those will be empty in the new system.' : ''),
+                ? '\n\nThe file has no secrets: those will be empty in the new system.' : '') +
+            missingDependencies(data.configuration, systems),
             { confirm: true })) {
             return null;
         }
@@ -2579,7 +3726,7 @@
         const json = JSON.stringify(await collectSystemExport(name), null, 2);
         const link = document.createElement('a');
         link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-        link.download = exportFileName(`${name} - backup before import`);
+        link.download = exportFileName(`${name} - backup before import`, name);
         link.click();
         setTimeout(() => URL.revokeObjectURL(link.href), 10000);
     }
@@ -2686,7 +3833,8 @@
         });
 
         pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'),
-            createExportButton(() => row.name), configure);
+            createExportButton(() => row.name),
+            createExportButton(() => row.name, undefined, EXPORT_KINDS.granted), configure);
 
         // Summary since, Last updated, Actions, ...
         model.infoLabels.forEach(label => {
