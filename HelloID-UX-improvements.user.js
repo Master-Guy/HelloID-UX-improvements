@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-02.2
+// @version      2026-10-02.3
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -3039,12 +3039,15 @@
     // All entitlements that rules can have, of all systems
     const RULE_ENTITLEMENTS_PATH = `/service/rules/api/entitlements?skip=0&take=${SETTINGS.fetchAllTake}`;
     const ENTITLEMENT_TYPES = { 1: 'Account', 2: 'AccountAccess', 3: 'Permission' };
-    // Lets HelloID retrieve the permissions of a system; it does so in
-    // its own time
+    // Lets HelloID retrieve the permissions of a system. It answers when
+    // that is done, or with an error when it takes HelloID too long (30
+    // seconds).
     const RETRIEVE_PERMISSIONS_PATH = (id) =>
         `/service/provisioning-api/api/target-systems/snapshots/create/${id}?permissionsOnly=true`;
-    const RETRIEVE_WAIT_MS = 120000; // how long to wait for them
-    const RETRIEVE_POLL_MS = 5000;
+    // Afterwards: how long to wait for them to show in the list of
+    // entitlements, should that take a moment
+    const RETRIEVE_WAIT_MS = 15000;
+    const RETRIEVE_POLL_MS = 3000;
 
     // An entitlement as rules have it, from a row of that list (which
     // has the type as a number)
@@ -3213,23 +3216,25 @@
             return result;
         }
         retrieving = true;
-        // Two steps: HelloID retrieves the permissions (in its own time,
-        // so this waits for the ones that are wanted), then the rules
-        // get the ones that came
+        // Two steps: HelloID retrieves the permissions, then the rules get
+        // the ones that came
         let retrieved = available;
+        let failed = false; // HelloID could not retrieve them (said in the notes)
         requests.push({
             name: 'Retrieve the permissions of the system',
-            changes: ['lets HelloID retrieve the permissions of the system now, and waits for them ' +
-                      `(${RETRIEVE_WAIT_MS / 60000} minutes at most)`],
+            changes: ['lets HelloID retrieve the permissions of the system now (HelloID gives up after 30 seconds)'],
             run: async (id) => {
                 try {
                     await sendToGateway(RETRIEVE_PERMISSIONS_PATH(id), 'POST', {});
                 } catch (e) {
-                    console.warn('[HelloID UX] Import: could not start retrieving the permissions', e);
-                    notes.push(`HelloID did not start retrieving the permissions (${e?.message ?? e})`);
+                    console.warn('[HelloID UX] Import: could not retrieve the permissions', e);
+                    notes.push(`HelloID could not retrieve the permissions of the system (${e?.message ?? e}): ` +
+                               'check the system, then import the file again');
+                    failed = true;
                     return;
                 }
-                // Until all of them are there, or time is up
+                // They are retrieved now; until the list has them, or time is up
+                retrieved = await readAvailable();
                 const deadline = Date.now() + RETRIEVE_WAIT_MS;
                 while (missing.some(m => !here(m.entitlement, retrieved)) && Date.now() < deadline) {
                     await new Promise(resolve => setTimeout(resolve, RETRIEVE_POLL_MS));
@@ -3254,9 +3259,9 @@
                     drafts.add(ruleId);
                 }
                 missing = missing.filter(m => !found.includes(m));
-                if (missing.some(m => m.entitlement.type === 'Permission')) {
-                    notes.push('HelloID was asked to retrieve the permissions of the system, but these did not come ' +
-                               '(in time): check the system, let it retrieve its permissions, then import the file again');
+                if (!failed && missing.some(m => m.entitlement.type === 'Permission')) {
+                    notes.push('HelloID retrieved the permissions of the system, but these were not among them: ' +
+                               'check the permission scripts of the system');
                 }
             },
         });
