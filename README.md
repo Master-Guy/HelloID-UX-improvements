@@ -52,6 +52,22 @@ A card shows the progress while the file is collected.
 
 The second export button (checklist icon) saves what the persons currently have in the system: per person the account, account access and permissions. Use it to compare a system before and after a change, or against the system that replaces it.
 
+### Export for the migration to PowerShell v2
+
+PowerShell v1 systems have a third export button (magic wand icon). HelloID's own migration to PowerShell v2 leaves the scripts and the mapping to be converted by hand; this button prepares that work for a Claude agent. It saves three files:
+
+- the export of the system, the same as the normal export;
+- `HelloID PowerShell v2 migration - handoff for Claude.md`, which tells the agent how to convert the scripts and the mapping, and what to answer with. It has the agent write the scripts like the supplier's own PowerShell v2 scripts (Tools4ever's connectors on GitHub; for Microsoft Entra ID it names them), with their naming and functions, while the system keeps doing what it did and keeps its own settings. It is the same for every system, so one copy is enough for any number of exports;
+- `HelloID-Migration-Tool.ps1`, which the agent uses to take the scripts out of an export, put the converted ones into an import file, and check that file. It needs PowerShell 7.2 or later, and is also the same for every system.
+
+Give the exports, the handoff and the tool to a Claude agent. It answers with one file per system for the import button, and with what it wasn't sure of.
+
+Then import the file of the agent. When the system is still a PowerShell v1 system, the import asks whether to start HelloID's migration of it, with the same warning as HelloID's own button: it can't be undone, and the system is disabled until the migration is completed. A backup of the v1 configuration is downloaded before it starts. After the import, test the scripts before you enable the system. Make the export before the migration is started: that also keeps the time the system is disabled short.
+
+Importing the file of the agent overwrites the scripts and the mapping of the existing system, found by the system ID in the file; such a file never makes a new system. After the import, the tasks of HelloID's migration checklist are ticked off for what the file converts: the agent says so in the file, the scripts in the file have no PowerShell v1 variables left, and HelloID has them as they are in the file. What is left open is listed. When no task is left open and every request of the import succeeded, the import completes the migration, which can't be undone, and then disables the system, also when it was enabled before: nothing runs until you have tested the scripts and enabled it yourself. When a task is left open, the migration stays open for you to finish in HelloID.
+
+The button is only shown for PowerShell v1 systems (type `powershell-onpremise`). Once the migration of a system is started it is a PowerShell v2 system (`powershell-target`), so make the export before you start the migration.
+
 ### Import a target system
 
 The import button (upload icon, next to **Add new system**) reads an exported file. It works for PowerShell and Active Directory systems.

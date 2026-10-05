@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-02.3
+// @version      2026-10-05.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -52,6 +52,60 @@
     const SETTINGS_KEY = 'settings';
 
     const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+    // Errors and warnings in the messages of our dialogs: marked in the
+    // text, so the dialog can show them bold (errors red as well), and
+    // keeps its buttons disabled for a moment when there are any (see
+    // showDialog). What only has to stand out is marked too (strong):
+    // bold like a warning, without that moment.
+    const ERROR_START = '\u0005';
+    const WARNING_START = '\u0002';
+    const STRONG_START = '\u0004';
+    const MARK_STARTS = [ERROR_START, WARNING_START, STRONG_START];
+    const MARK_END = '\u0003';
+    const WARNING_HOLD_SECONDS = 5;
+    const MARKED = new RegExp(`([${MARK_STARTS.join('')}][^${MARK_END}]*${MARK_END})`);
+    const withoutMarks = (text) => [...MARK_STARTS, MARK_END]
+        .reduce((result, mark) => result.replaceAll(mark, ''), text);
+    const marked = (start) => (text) => (text ? `${start}${withoutMarks(text)}${MARK_END}` : '');
+    const error = marked(ERROR_START);
+    const warn = marked(WARNING_START);
+    const strong = marked(STRONG_START);
+    const hasWarnings = (text) => text.includes(ERROR_START) || text.includes(WARNING_START);
+
+    // Shows a message in an element, with what is marked in it
+    function renderMessage(element, text) {
+        element.replaceChildren(...text.split(MARKED).map(part => {
+            if (!MARK_STARTS.includes(part[0])) return part;
+            const bold = document.createElement('strong');
+            if (part[0] === ERROR_START) bold.className = 'tm-error';
+            bold.textContent = part.slice(1, -1);
+            return bold;
+        }));
+    }
+
+    // Keeps buttons disabled for some seconds, counting down in their
+    // labels, so a message with warnings isn't clicked away unread
+    function holdButtons(buttons) {
+        let left = WARNING_HOLD_SECONDS;
+        const counters = buttons.map(btn => {
+            btn.disabled = true;
+            const counter = document.createElement('span');
+            btn.appendChild(counter);
+            return counter;
+        });
+        const show = () => counters.forEach(counter => { counter.textContent = ` (${left})`; });
+        show();
+        const timer = setInterval(() => {
+            if (--left > 0) {
+                show();
+                return;
+            }
+            clearInterval(timer);
+            counters.forEach(counter => counter.remove());
+            buttons.forEach(btn => { btn.disabled = false; });
+        }, 1000);
+    }
 
     // Defaults + stored overrides. Nested objects are
     // merged too, so overriding one value in them keeps the others.
@@ -1042,8 +1096,11 @@
                 createCopyButton(name, configureBtn.className),
                 createExportButton(name, configureBtn.className),
                 createExportButton(name, configureBtn.className, EXPORT_KINDS.granted),
+                createExportButton(name, configureBtn.className, EXPORT_KINDS.migration),
             );
         });
+        // (HelloID may have put another system in a tile)
+        refreshExportButtons();
     }
 
     // --- Business rules: name columns in grids ---
@@ -1973,12 +2030,18 @@
     // came by (HelloID's own or ours): for the name of the export file,
     // which is needed before anything can be fetched
     const systemIds = new Map();
+    // Their entries in that list, also by name: for the buttons that are
+    // only for some systems (see appliesTo in EXPORT_KINDS)
+    const systemEntries = new Map();
 
     function rememberSystemIds(systems) {
         if (!Array.isArray(systems)) return;
         systems.forEach(s => {
-            if (typeof s?.displayName === 'string' && s.systemId) systemIds.set(s.displayName.trim(), s.systemId);
+            if (typeof s?.displayName !== 'string' || !s.systemId) return;
+            systemIds.set(s.displayName.trim(), s.systemId);
+            systemEntries.set(s.displayName.trim(), s);
         });
+        refreshExportButtons();
     }
 
     // The steps of the export, for its progress: report(key, state, detail)
@@ -2102,6 +2165,15 @@
                `${new Date().toISOString().slice(0, 10)}.json`;
     };
 
+    // Saves a text as a file, as a normal download
+    function downloadFile(text, fileName, type = 'application/json') {
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(new Blob([text], { type }));
+        link.download = fileName;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    }
+
     // The save dialog has to open right at the click, so first ask where
     // to save, then collect, then write. Browsers without that dialog get
     // a normal download.
@@ -2136,17 +2208,16 @@
                 await writable.write(json);
                 await writable.close();
             } else {
-                const link = document.createElement('a');
-                link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-                link.download = fileName();
-                link.click();
-                setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+                downloadFile(json, fileName());
             }
+            // The files that go with it (no save dialog: that needs a
+            // click of its own)
+            (kind.extraFiles ?? []).forEach(file => downloadFile(file.text, file.name, file.type));
             report('save', 'done');
         } catch (e) {
             console.warn('[HelloID UX] Export failed', e);
             progress.failBusy();
-            await progress.finish(`Export failed: ${e?.message ?? e}`);
+            await progress.finish(error(`Export failed: ${e?.message ?? e}`));
             // Already shown to the user
             throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
         }
@@ -2161,10 +2232,10 @@
     function configurationNotice(data) {
         const notSearched = data.usedBy.filter(u => u.couldNotRead).map(u => u.displayName);
         return data.couldNotRead
-            ? `The file was saved without: ${data.couldNotRead.join(', ')}. HelloID did not return that part.`
+            ? warn(`The file was saved without: ${data.couldNotRead.join(', ')}. HelloID did not return that part.`)
             : notSearched.length
-                ? 'The file was saved, but these systems could not be read, so it is not known whether they ' +
-                  `use this system (usedBy in the file): ${notSearched.join(', ')}.`
+                ? warn('The file was saved, but these systems could not be read, so it is not known whether they ' +
+                       `use this system (usedBy in the file): ${notSearched.join(', ')}.`)
                 : EXPORT_NOTICES[data.templateIdentifier];
     }
 
@@ -2235,7 +2306,1043 @@
         };
     }
 
+    // --- Export for the migration from PowerShell v1 to PowerShell v2 ---
+    // The scripts and the mapping of a PowerShell v1 system have to be
+    // converted by hand in HelloID's migration to PowerShell v2. This
+    // export is for having a Claude agent do that: it saves the
+    // configuration, like the normal export, and with it the handoff
+    // that tells the agent what to do with it, and the tool the agent
+    // does it with. The agent answers with a file for the Import button.
+    // The handoff and the tool are the same for every system, so the
+    // exports of several systems can be given to the agent with one copy
+    // of them.
+    const POWERSHELL_V1 = 'powershell-onpremise';
+    const POWERSHELL_V2 = 'powershell-target';
+    const HANDOFF_FILE_NAME = 'HelloID PowerShell v2 migration - handoff for Claude.md';
+    const HANDOFF = [
+        '# HelloID: migrate PowerShell v1 target systems to PowerShell v2',
+        '',
+        'You are given this file together with `HelloID-Migration-Tool.ps1` and one or more JSON files.',
+        'Each JSON file is the export of one HelloID Provisioning target system whose scripts are written',
+        'for PowerShell v1. For each export, produce an import file in which the scripts and the field',
+        'mapping are converted to PowerShell v2. A person then imports your file into HelloID, tests it',
+        'there and completes the migration.',
+        '',
+        'Work through every export you were given. "How to work" below gives the order that takes the',
+        'least effort.',
+        '',
+        '## Background',
+        '',
+        'HelloID has a built-in migration from PowerShell v1 to v2. Starting it cannot be undone: the',
+        'system becomes a v2 system under the same ID, it is disabled, and it cannot be enabled again until',
+        'the migration is completed. HelloID converts nothing itself. The scripts stay v1 scripts, and ten',
+        'placeholder mapping fields are added (DisplayName, NickName, FamilyName, UserName, Title,',
+        'Department, StartDate, EndDate, Manager, ExternalId) that have nothing to do with the scripts.',
+        '',
+        'HelloID then shows a checklist that a person has to work through before the migration can be',
+        'completed:',
+        '',
+        '- the field configuration (the mapping);',
+        '- the account create, enable, update, disable and delete scripts;',
+        '- every permission set;',
+        '- every resource script.',
+        '',
+        'Your import file is what gets those items done. The system is out of use for as long as that',
+        'takes, so the file has to be as right as you can make it, and you have to say plainly what you',
+        'were not sure of. You cannot run or test anything against HelloID: the person who imports the',
+        'file does that.',
+        '',
+        '## What you get',
+        '',
+        'An export is one JSON object. The parts that matter here:',
+        '',
+        '- `systemId`, `displayName`, `templateIdentifier`: which system this is. The type is',
+        '  `powershell-onpremise` for a v1 system and `powershell-target` for a v2 system.',
+        '- `configuration.scripts`: the account scripts `accountCreate`, `accountEnable`, `accountUpdate`,',
+        '  `accountDisable` and `accountDelete`, each a string or null. (`accountImport` exists in v2 only.)',
+        '- `configuration.permissions`: the permission sets. Each has a `displayName`, an `identification`',
+        '  and the scripts `retrievePermissionsScript`, `grantPermissionScript`, `updatePermissionScript`,',
+        '  `revokePermissionScript` and `permissionActionScript`. When `useSeparateScriptForEachAction` is',
+        '  true the grant, update and revoke scripts are used; otherwise `permissionActionScript` is.',
+        '- `resources`: the resources, with their scripts.',
+        '- `configuration.mappingConfiguration.fields`: the mapping (see "The mapping").',
+        '- `configuration.correlationConfiguration`: correlation on a mapping field.',
+        '- `configuration.scriptConfigurationForm` and `configuration.scriptConfiguration`: the settings',
+        '  the scripts read (`$c.someSetting`). Secrets are `"***"` or null.',
+        '- `configuration.migrationStatus`: null, or the open migration with its `checklist`.',
+        '- `defaultScripts`: HelloID\'s default scripts for the type of the system.',
+        '- `usedBy`: the other target systems that depend on this one, or that use its accounts',
+        '  (`Person.Accounts._<system ID without dashes>`) in a mapping or a script.',
+        '- `accountsReference`, `rules`, `notifications`, `agents`, `secrets`: leave these as they are.',
+        '',
+        'An export is in one of two states:',
+        '',
+        '1. **Taken before the migration was started.** The type is `powershell-onpremise`,',
+        '   `migrationStatus` is null, and the mapping is usually empty. `defaultScripts` has the v1',
+        '   defaults.',
+        '2. **Taken after the migration was started.** The type is `powershell-target`,',
+        '   `migrationStatus.checklist` lists the open tasks, and the mapping has the ten placeholder',
+        '   fields. `defaultScripts` has HelloID\'s v2 defaults: use them as a reference for how a v2',
+        '   script is written.',
+        '',
+        'Handle both the same way. In the second state, the checklist tells you which tasks are still open',
+        '(`false`); convert everything all the same, so no v1 code is left behind. If the mapping is',
+        'something other than the ten placeholders, a person has worked on it: keep those fields, add what',
+        'is missing, and say so in your report.',
+        '',
+        'A script that is identical to its counterpart in the v1 `defaultScripts` was never edited. Convert',
+        'it like any other.',
+        '',
+        '## What to produce',
+        '',
+        'For every export, one file next to it, named after the export with ` - v2 import` added before',
+        '`.json`. It is a copy of the export in which only this is changed:',
+        '',
+        '- `templateIdentifier` and `configuration.templateIdentifier` are `powershell-target`;',
+        '- the scripts in `configuration.scripts`, in every permission set and in every resource are v2',
+        '  scripts;',
+        '- `configuration.mappingConfiguration.fields` is the mapping the v2 scripts need;',
+        '- a top-level `migration` object is added, with your report (see "Report").',
+        '',
+        'Everything else stays exactly as it is: the names and IDs of permission sets and resources, the',
+        'settings, the thresholds, the rules, the notifications. Scripts that are null stay null. Leave',
+        '`"***"` where it is.',
+        '',
+        'Above all, do not change the ID or the name of the system: `systemId`, `displayName`,',
+        '`configuration.systemId` and `configuration.displayName` stay what they are in the export. The',
+        'import finds the system to write to by its ID, and your file is meant to overwrite the scripts and',
+        'the mapping of that existing system. Under another ID it would not belong to any system, and with',
+        'another name the system would be renamed. Do not put "v2" in the name either.',
+        '',
+        '## How to work',
+        '',
+        '`HelloID-Migration-Tool.ps1` does the handling of the files, so you only convert. It needs',
+        'PowerShell 7.2 or later (`pwsh`). The file came from a browser, so run it like this:',
+        '',
+        '```',
+        'pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 extract -Export "<export>.json"',
+        'pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 build   -Export "<export>.json"',
+        'pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 verify  -Export "<export>.json"',
+        '```',
+        '',
+        '- `extract` writes every script of the export to a file of its own, in a folder named after the',
+        '  export. It lists them with a hash per script and per function, says which are identical to one',
+        '  it listed before, which are HelloID\'s default script that was never edited, and which connector',
+        '  the comment at the top names.',
+        '- `build` makes the import file from the export and that folder: the scripts as they are in the',
+        '  folder now, the type of a v2 system, the mapping fields from `mapping.json` in the folder (an',
+        '  array of mapping fields, see "The mapping") and the report from `migration.json` in the folder',
+        '  (see "Report"). Everything else is written back exactly as it was in the export.',
+        '- `verify` checks the import file against the export, and lists what is wrong.',
+        '',
+        'Do not read or edit the JSON files yourself: the scripts are long strings in them, and the tool',
+        'keeps the rest of the file intact, line endings of the scripts included.',
+        '',
+        'Work in this order:',
+        '',
+        '1. Run `extract` on every export before you convert anything.',
+        '2. Group the exports by connector, from the names in the comments at the top and the hashes.',
+        '   Scripts with the same hash are the same script: convert it once, and copy the result to the',
+        '   other folders. The same goes for functions. The scripts of one system usually carry the same',
+        '   block of functions each: read it once.',
+        '3. Per group, download the supplier\'s scripts (see below) once.',
+        '4. Convert the scripts in the folders in place, and write `mapping.json` and `migration.json`',
+        '   per system.',
+        '5. Run `build`, then `verify`, per export. Fix what `verify` lists in the folder, and run both',
+        '   again until it lists no problems.',
+        '',
+        '## How the import treats your file',
+        '',
+        'Knowing this tells you what you may and may not change.',
+        '',
+        '- The system is found by `systemId`. A file with a `migration` object never makes a new system:',
+        '  when no system has that ID, the import stops.',
+        '- The file\'s type has to be the type of the system, which is `powershell-target` once the',
+        '  migration is started. That is why the type has to be changed, also in an export that was taken',
+        '  before the migration. When the system is still a v1 system, the import asks the person whether',
+        '  to start the migration, with HelloID\'s own warning, and goes on when that is confirmed.',
+        '- Each part of the file is compared with the system, and only what differs is written, after the',
+        '  person has seen the list and confirmed it. Anything you change by accident shows up there as a',
+        '  change, and gets written.',
+        '- The mapping is replaced as a whole: all fields of the system are deleted, then those of the',
+        '  file are added. So the file needs the complete mapping, and the placeholder fields go away by',
+        '  not being in it. Fields are matched by name.',
+        '- Every mapping field needs an `identifier` and every mapping action a `mappingActionId`: any new',
+        '  UUID, each one different.',
+        '- When `correlationConfiguration.enabled` is true, its `accountFieldId` has to be the',
+        '  `identifier` of a field in the file. Leave correlation as it is unless you have a reason to',
+        '  change it, and then say so.',
+        '- A system whose scripts find the account themselves has no correlation in HelloID: `enabled` is',
+        '  false and `accountFieldId` is null. That is right, and stays that way. HelloID does not accept',
+        '  correlation settings without a field, so the import sends none for such a file. Do not fill in',
+        '  a field to make it look complete, and do not see the null as something to repair.',
+        '- A secret that is `"***"` keeps the value the system has.',
+        '- After everything is written, the import ticks off tasks in HelloID\'s migration checklist. It',
+        '  ticks a task off when your `migration.checklist` says true for it, none of its scripts in your',
+        '  file still has a v1 variable in it (comments and strings included), and HelloID has that part',
+        '  as it is in your file.',
+        '- When every task of the checklist is ticked off after that, the import completes the migration',
+        '  and disables the system, so nothing runs before the person has tested it. When a task is left',
+        '  open, the migration stays open, for the person to finish in HelloID.',
+        '',
+        '## The supplier\'s scripts are the model',
+        '',
+        'Tools4ever, the supplier of HelloID, publishes PowerShell v2 connectors on GitHub under',
+        '`Tools4everBV`. Most v1 scripts started as an older version of one of them: the comment at the top',
+        'of a script usually names it (for example `HelloID-Conn-Prov-Target-Azure-...`).',
+        '',
+        'Write each v2 script the way the supplier\'s v2 script for the same target system is written. Use',
+        'as much of its naming and its functions as you can: its variable names, its function names and',
+        'their code, its layout in regions, its way of deciding what to do and then doing it, its messages',
+        'and its logging. A person who knows the supplier\'s connector should recognize yours, and the next',
+        'update of that connector should be easy to bring in.',
+        '',
+        'For Microsoft Entra ID (Azure AD) systems, the connector is',
+        '`https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online`.',
+        'Download these before you convert anything, and read them:',
+        '',
+        '| Script in the export | Supplier\'s script |',
+        '|---|---|',
+        '| `accountCreate` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/create.ps1` |',
+        '| `accountDelete` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/delete.ps1` |',
+        '| `accountDisable` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/disable.ps1` |',
+        '| `accountEnable` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/enable.ps1` |',
+        '| `accountUpdate` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/update.ps1` |',
+        '| `retrievePermissionsScript` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/permissions/groups/permissions.ps1` |',
+        '| `grantPermissionScript` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/permissions/groups/grantPermission.ps1` |',
+        '| `revokePermissionScript` | `https://github.com/Tools4everBV/HelloID-Conn-Prov-Target-Microsoft-Entra-ID-Exchange-Online/raw/fd3e2ca69ac2097c96f76061ff106f8d3c7af367/permissions/groups/revokePermission.ps1` |',
+        '',
+        'These addresses are of one fixed version of the connector (2 October 2026), so every run works',
+        'from the same scripts. The functions `Get-MSEntraCertificate` and `Get-MSEntraAccessToken` are',
+        'identical in all eight, and `Resolve-MS-Entra-ExoError` comes in two versions: read each once.',
+        '',
+        'The repository has more (other kinds of permissions, the field mapping, the configuration form):',
+        'look there, at the same version, for a script of the export that is not in this table. For a',
+        'system of another kind, find its connector under `Tools4everBV` in the same way, use that one as',
+        'the model, and name the version you used in your report.',
+        '',
+        'The supplier\'s script is the model for how the script is written. What the script does stays',
+        'that of the system you are converting. These three rules decide, in this order:',
+        '',
+        '1. **The system keeps doing what it does.** The target system ends up the same as it did with the',
+        '   v1 scripts, for every person and in every case. Whatever the v1 script does that the supplier\'s',
+        '   script does not',
+        '   (its own way of finding an account, an invitation instead of a new user, an extra call, a value',
+        '   that is worked out in its own way) is carried over into the supplier\'s structure. Whatever the',
+        '   supplier\'s script does that the v1 script does not (Exchange Online, setting the manager, a',
+        '   property the system never sent) is left out. Do not add it.',
+        '2. **The system keeps its settings.** The scripts read the settings of this system',
+        '   (`$actionContext.Configuration.<key>`), under the keys they have in the export, and',
+        '   authenticate the way they did. The supplier\'s script may use other keys, or a certificate where',
+        '   this system uses a secret: adapt the supplier\'s function to the settings of the system, or keep',
+        '   the function of the v1 script under the supplier\'s name for it. A secret cannot move to another',
+        '   key: the import can only keep it under the key it has. Moving a system from a secret to a',
+        '   certificate is done separately, and is not part of this migration.',
+        '3. **Everything else is the supplier\'s.** Names, functions, structure, error handling, logging',
+        '   (the supplier uses `Write-Information` and `Write-Warning`), the texts of audit logs where they',
+        '   say the same thing.',
+        '',
+        'Where rule 1 or 2 kept you from following the supplier, say so in your report, per script.',
+        '',
+        'If you cannot download the supplier\'s scripts, do not guess at them. Convert each script by the',
+        'tables below, keeping its own names and functions, and say in your report that it was done',
+        'without the model.',
+        '',
+        '### Decisions that are made',
+        '',
+        'These came up in earlier runs. They are decided, so do not weigh them again:',
+        '',
+        '- **A bug in a v1 script.** Follow what the script does, not what it seems to intend, and report',
+        '  each one: a migration is not the moment to change behaviour unnoticed. There is one exception.',
+        '  Where the bug makes an action fail every time, and the supplier\'s script handles that case,',
+        '  follow the supplier and report it. The known case: the account is no longer there on disable,',
+        '  delete or revoke. The v1 scripts log "possibly already deleted, skipping action" and then send',
+        '  the request anyway, without an ID, so the action fails. The supplier\'s scripts end such an',
+        '  action as done, with a message: do that.',
+        '- **What is reported after an action.** The values in `$outputContext.Data` are those of the',
+        '  account after the action, as in the supplier\'s scripts. Some v1 update scripts reported the',
+        '  values the account had before the update (in `ExportData`): report the new ones, and note it.',
+        '- **Fixed values.** Do not put a fixed value in a script or in the mapping that is not already',
+        '  in the scripts of the export or in the supplier\'s script you are following: no domain, tenant,',
+        '  address, ID or name of an organization. This document and the tool are used in many',
+        '  environments, and what is right in one is wrong in the next. A fixed value that the v1 script',
+        '  already has stays as it is, also when it looks as if it should have been a setting: note it,',
+        '  and do not turn it into something else.',
+        '- **References to another system.** A script or mapping can read the account a person has in',
+        '  another target system, as `Person.Accounts._<ID of that system, without dashes>.<property>`.',
+        '  Take such a reference from the scripts of the export, exactly as it is there. Never write one',
+        '  from memory, from an example or from another export: the ID is that of a system in this',
+        '  environment, and the export is where it is kept up to date. In the mapping, such a reference',
+        '  goes in a complex mapping (mode 3), never in mode 2: see "The mapping".',
+        '- **Comparing before an update.** Follow the supplier: read the account, and send only what',
+        '  differs. The v1 scripts always sent everything; the target system ends up the same.',
+        '- **"The same" request.** What has to stay the same is the method, the address and the values',
+        '  that are sent. Headers, the encoding of the body and what is asked back (`$select`) follow the',
+        '  supplier.',
+        '- **Names that differ only in capitals** (`DisplayName` in one place, `displayName` in another):',
+        '  one field, spelled the way the target system spells it. If `usedBy` shows another system',
+        '  reading the other spelling, report it.',
+        '- **`Account` and `ExportData` with different values for the same property.** Both end up in',
+        '  `$outputContext.Data`, which has room for one: the value of `ExportData`, as that is what other',
+        '  systems were reading. Report it.',
+        '- **A setting the v2 script no longer uses** (such as `isDebug`). The setting stays in the',
+        '  export, the script follows the supplier, and you note that the setting does nothing any more.',
+        '- **A script that is not in use** (`permissionActionScript` when',
+        '  `useSeparateScriptForEachAction` is true, and the other way around). Convert it by the tables',
+        '  only, as little as it takes to have no v1 left in it, without the supplier as a model. Do not',
+        '  make it null.',
+        '- **Retrieving the permissions fails.** Throw, as the v1 script did. The supplier\'s script only',
+        '  writes a warning, which leaves HelloID with an incomplete list.',
+        '- **`PreviousData`.** As in the supplier\'s scripts: the update, enable, disable and delete',
+        '  scripts set `$outputContext.PreviousData` to the account as it was read.',
+        '- **`Action` in an audit log.** As in the supplier\'s scripts: left out, except `CorrelateAccount`',
+        '  where the create script correlates.',
+        '- **The account reference in a dry run.** As in the supplier\'s create script: it sets',
+        '  `$outputContext.AccountReference` to `\'Currently not available\'` at the start, and to the real',
+        '  reference once it has one.',
+        '',
+        '## Converting a script',
+        '',
+        'In v1, HelloID hands a script its input as JSON strings in separate variables, and the script',
+        'answers by writing one JSON object to the output. In v2, the input is in objects that are ready',
+        'to use, and the script answers by setting properties of `$outputContext`. These tables are what',
+        'that comes down to; the supplier\'s scripts show it in use.',
+        '',
+        '### Input',
+        '',
+        '| PowerShell v1 | PowerShell v2 |',
+        '|---|---|',
+        '| `$configuration \\| ConvertFrom-Json` | `$actionContext.Configuration` |',
+        '| `$person \\| ConvertFrom-Json` | `$personContext.Person` |',
+        '| `$manager \\| ConvertFrom-Json` | `$personContext.Manager` |',
+        '| `$accountReference \\| ConvertFrom-Json` | `$actionContext.References.Account` |',
+        '| `$managerAccountReference \\| ConvertFrom-Json` | `$actionContext.References.ManagerAccount` |',
+        '| `$permissionReference \\| ConvertFrom-Json` | `$actionContext.References.Permission` |',
+        '| `$operation \\| ConvertFrom-Json` | `$actionContext.Operation` |',
+        '| `($entitlementContext \\| ConvertFrom-Json).CurrentPermissions` | `$actionContext.CurrentPermissions` |',
+        '| `$resourceContext \\| ConvertFrom-Json` | `$resourceContext` (the data is in `.SourceData`) |',
+        '| `$dryRun` | `$actionContext.DryRun` |',
+        '| the account object the script builds itself | `$actionContext.Data`, filled by the mapping |',
+        '',
+        'The v2 values are objects already: there is no `ConvertFrom-Json`. The supplier\'s scripts use',
+        'them where they are needed (`$actionContext.References.Account`,',
+        '`$actionContext.Configuration.<key>`) instead of copying them to short variables like `$p`, `$c`',
+        'and `$aRef` first: do the same.',
+        '',
+        'A v1 variable inside a double-quoted string needs `$( )` around its replacement:',
+        '`"$dryRun"` becomes `"$($actionContext.DryRun)"`.',
+        '',
+        '### Output',
+        '',
+        '| PowerShell v1, in the result object | PowerShell v2 |',
+        '|---|---|',
+        '| `Success = $success` | `$outputContext.Success = $success` |',
+        '| `AuditLogs = $auditLogs` | `$outputContext.AuditLogs.Add(...)` for each one |',
+        '| `AccountReference = $aRef` | `$outputContext.AccountReference = $aRef` |',
+        '| `Account = $account` | `$outputContext.Data = $account` |',
+        '| `PreviousAccount = $previousAccount` | `$outputContext.PreviousData = $previousAccount` |',
+        '| `SubPermissions = $subPermissions` | `$outputContext.SubPermissions.Add(...)` for each one |',
+        '| `ExportData = $exportData` | no counterpart: see "ExportData" |',
+        '| a permission written as JSON (retrieve script) | `$outputContext.Permissions.Add(...)` |',
+        '',
+        'There is no result object, and no `Write-Output ... | ConvertTo-Json` that sends it. As in the',
+        'supplier\'s scripts, audit logs are added to `$outputContext.AuditLogs` where they arise, and',
+        '`$outputContext.Success` is set where the script knows how it went, without variables like',
+        '`$success` and `$auditLogs` in between.',
+        '',
+        'Leave no other line behind that writes to the output only for HelloID to read. Functions that',
+        'return a value with `Write-Output` are fine, as their caller takes the value.',
+        '',
+        '### How sure these are',
+        '',
+        'Everything in the tables is used by HelloID\'s own v2 default scripts or by the supplier\'s scripts',
+        'above, except `$personContext.Manager`, which was written down from knowledge of v2. The',
+        'supplier\'s scripts also use `$actionContext.CorrelationConfiguration` (`.Enabled`,',
+        '`.AccountField`, `.PersonFieldValue`), `$actionContext.Origin` and',
+        '`$actionContext.PermissionDisplayName`.',
+        '',
+        'Do not use a property of these objects that you have not seen in the default scripts, the',
+        'supplier\'s scripts or HelloID\'s documentation',
+        '(`https://docs.helloid.com/en/index-en.html?contextId=migrationpsv2`). If a script needs one that',
+        'you could not check, use it and list it in your report.',
+        '',
+        '### What the scripts run in',
+        '',
+        '- The scripts run in PowerShell 7 (7.5, Core, when this was checked in October 2026). Do not use',
+        '  what only Windows PowerShell 5.1 has.',
+        '- Complex mappings are JavaScript. Which engine runs them is not known: keep to plain JavaScript',
+        '  of the kind the placeholder field `UserName` uses (functions, `const` and `let`, string',
+        '  methods, regular expressions), and nothing newer.',
+        '',
+        'What the two `Data` objects hold was checked in HelloID, in a create script:',
+        '',
+        '- `$actionContext.Data` has the mapping fields of the action that have a mode other than 0. A',
+        '  field whose value came out empty is there, as `$null`. A field with mode 0 is not there at',
+        '  all: reading it gives `$null`, and assigning to it fails, as the property does not exist. So',
+        '  do not set the mode 0 values on `$actionContext.Data`. Build the object the script sends',
+        '  from it (or add to it with `Add-Member`), the way the supplier\'s script does.',
+        '- `$outputContext.Data` is filled before the script starts, with all mapping fields of the',
+        '  action: the values of `$actionContext.Data`, and the fields with mode 0 as `$null`. So a',
+        '  script that sets nothing there still reports the mapped values, and a mode 0 value can be set',
+        '  directly (`$outputContext.Data.<field> = ...`). Replacing it as a whole, as the supplier\'s',
+        '  create script does with the account it made, works as well.',
+        '- Dates of the person arrive as text, like `09/19/2023 00:00:00`.',
+        '',
+        '### Per kind of script',
+        '',
+        '**Account create.** It sets `$outputContext.AccountReference` and `$outputContext.Data`. When',
+        'the script finds an existing account and takes that instead of making one (it "correlates"), it',
+        'also sets `$outputContext.AccountCorrelated = $true` at that point, as the supplier\'s script',
+        'does.',
+        '',
+        'The supplier\'s script finds the account with HelloID\'s correlation configuration',
+        '(`$actionContext.CorrelationConfiguration`). Do it that way when the v1 script looks for the',
+        'account by one value of the person in one property of the account: make that property a mapping',
+        'field, and set `correlationConfiguration` in the file to it (`enabled` true, `accountFieldId` the',
+        '`identifier` of the field, `personPropertyPath` the value of the person, like',
+        '`Person.ExternalId`). When the v1 script looks for the account by a value it works out itself,',
+        'keep its own way of finding it, in the supplier\'s structure, and leave `correlationConfiguration`',
+        'as it is, also when its `accountFieldId` is null. Say in your report which of the two you did.',
+        '',
+        '**Account update, enable, disable, delete.** They read the reference from',
+        '`$actionContext.References.Account`, and do not set it again: in the supplier\'s connector only',
+        'the create script sets `$outputContext.AccountReference`. If a v1 script changes the reference,',
+        'say so in your report. The update script also sets `$outputContext.PreviousData`, the way the',
+        'supplier\'s does.',
+        '',
+        '**Retrieve permissions.** Each permission the v1 script wrote as JSON is added instead:',
+        '`$outputContext.Permissions.Add($permission)`. A permission keeps its `DisplayName` and',
+        '`Identification`.',
+        '',
+        '**Grant, update, revoke permission.** `$actionContext.References.Permission` is the',
+        '`Identification` of the permission, with the properties the retrieve script gave it. Keep those',
+        'properties as the v1 retrieve script named them, also where the supplier\'s script names them',
+        'otherwise: HelloID has stored them for the permissions that persons already have. They set',
+        '`Success` and the audit logs.',
+        '',
+        '**Permission script for all actions** (`permissionActionScript`). The action is in',
+        '`$actionContext.Operation` ("grant", "update" or "revoke"), and the sub-permissions the person',
+        'has are in `$actionContext.CurrentPermissions`.',
+        '',
+        '**Resource scripts.** The data is in `$resourceContext.SourceData`. They set `Success` and the',
+        'audit logs.',
+        '',
+        '## The mapping',
+        '',
+        'In v1 a script builds its account object itself, usually as',
+        '`$account = [PSCustomObject]@{ ... }`. In v2 that belongs in the mapping: HelloID works out the',
+        'values per person and hands them to the script as `$actionContext.Data`. The supplier\'s scripts',
+        'take everything about the person from there, and do not read the person at all.',
+        '',
+        'The supplier\'s repository usually has its own mapping, as `fieldMapping.json`. Use its field',
+        'names for the properties that this system sends too, so the scripts can stay close to the',
+        'supplier\'s. Do not take over its other fields, or its values: the values are those of the v1',
+        'scripts.',
+        '',
+        'A mapping field:',
+        '',
+        '```json',
+        '{',
+        '  "identifier": "<new UUID>",',
+        '  "name": "givenName",',
+        '  "description": "",',
+        '  "type": 1,',
+        '  "mappingActions": [',
+        '    {',
+        '      "mappingActionId": "<new UUID>",',
+        '      "entitlementActions": [1, 3],',
+        '      "mode": 2,',
+        '      "value": "Person.Name.NickName",',
+        '      "usedInNotifications": false,',
+        '      "storeInAccountData": false',
+        '    }',
+        '  ]',
+        '}',
+        '```',
+        '',
+        '- `type`: 1 is text, 2 is an array.',
+        '- `entitlementActions`: the account scripts the mapping action is for. 1 is create, 2 is enable,',
+        '  3 is update, 4 is disable, 5 is delete. A field can have several mapping actions, for different',
+        '  scripts; give a script at most one per field.',
+        '- `mode` and `value`:',
+        '  - 0, none: `value` is `""`. The field exists, and the script sets it.',
+        '  - 1, fixed: `value` is the text.',
+        '  - 2, field: `value` is the path of a property of the person itself, like',
+        '    `Person.Name.NickName`. HelloID has a fixed list of these, and the account a person has in',
+        '    another system (`Person.Accounts...`) is not in it: HelloID throws such a value away when',
+        '    the file is imported, and the field ends up empty. Use mode 3 for those.',
+        '  - 3, complex: `value` is JavaScript that ends with the expression to use. It has `Person` and',
+        '    `Iteration`, and helpers like `deleteDiacriticalMarks`. The placeholder field `UserName` in',
+        '    an export taken after the migration was started is an example. This is also how a mapping',
+        '    reads the account a person has in another system, with the reference as it is in the scripts',
+        '    of the export, and without failing for a person who has no such account:',
+        '',
+        '    ```',
+        '    function getValue() {',
+        '        const account = Person.Accounts._<ID of that system, without dashes>;',
+        '        if (typeof account === \'undefined\' || account === null) { return null; }',
+        '        return account.userPrincipalName;',
+        '    }',
+        '',
+        '    getValue();',
+        '    ```',
+        '- A dot in a field name makes a nested object in `$actionContext.Data`.',
+        '',
+        'Make the mapping from the account objects of the account scripts: a field for each property, with',
+        'a mapping action for each script that has it.',
+        '',
+        '- A property that is just a value of the person (`$p.Name.NickName`) gets mode 2.',
+        '- A property that is a value of the account the person has in another system',
+        '  (`$p.Accounts._<ID>.userPrincipalName`) gets mode 3, as shown above. Mode 2 cannot read it.',
+        '- A property that is an expression gets mode 3 only when the JavaScript is certain to give the',
+        '  same value for every person. Otherwise it gets mode 0 and stays in the script.',
+        '- A property that is not text (`$true`, a number, a nested object) gets mode 0 and stays in the',
+        '  script: a fixed value is text, and the target system may refuse it.',
+        '',
+        'Then have the script take the mapped values from `$actionContext.Data`, as the supplier\'s',
+        'script does, and set the mode 0 ones itself. What goes to the target system has to be the same as',
+        'before. If you cannot be sure of that for a script, have it work the values out itself as the v1',
+        'script did, give its fields mode 0, and say so in your report: a script that still works matters',
+        'more than a mapping that decides everything.',
+        '',
+        'Every property a script puts in `$outputContext.Data` should be a mapping field for that script.',
+        '',
+        '### ExportData',
+        '',
+        'In v1, `ExportData` was what other systems could read of an account, as',
+        '`Person.Accounts._<system ID without dashes>.<property>`. In v2, they read the fields of',
+        '`$outputContext.Data` that have `storeInAccountData` set to true.',
+        '',
+        'For every property of a script\'s `ExportData`: make it a mapping field with mode 0 and',
+        '`storeInAccountData` true for that script (or set that on the field if it exists already), and',
+        'have the script set it in `$outputContext.Data` with the value it had. Keep the names exactly,',
+        'capitals included.',
+        '',
+        'Look at `usedBy` in the export. It lists the systems that read this system\'s accounts, and where.',
+        'If any of them reads a property that your file no longer provides, that system breaks: name it',
+        'in your report.',
+        '',
+        '## What not to do',
+        '',
+        '- Do not run the scripts. They hold the addresses and settings of real systems, and running one',
+        '  can change real accounts. Checking their syntax is fine.',
+        '- Do not print, copy elsewhere or put in your report the values in `scriptConfiguration` or',
+        '  anything that looks like a password, key or token.',
+        '- Do not change what the system does: no features it did not have, also not when the supplier\'s',
+        '  script has them, and no other API versions for the calls it makes. Each change in behaviour is',
+        '  one the person has to find and test with the system switched off.',
+        '- Do not change the settings form, the thresholds, the rules, the notifications or the name of',
+        '  the system.',
+        '- Do not guess silently. Where a script does something this file does not cover, convert it as',
+        '  well as you can and put it in your report.',
+        '',
+        '## Check your work',
+        '',
+        'Run `verify` on every import file. It checks that:',
+        '',
+        '- the file differs from the export only in the type, the scripts, the mapping fields and the',
+        '  `migration` object, so also that the ID and the name of the system are those of the export;',
+        '- no script still has a v1 variable in it, or writes its result as JSON. The pattern is the one',
+        '  the import uses: `$configuration`, `$person`, `$manager`, `$accountReference`,',
+        '  `$managerAccountReference`, `$permissionReference`, `$operation`, `$entitlementContext` and',
+        '  `$dryRun`, each as a whole word and in any capitals. `$personContext` and `$actionContext` are',
+        '  other words, and do not match. Comments and strings count: a comment that names `$dryRun` keeps',
+        '  its task from being ticked off, so reword it;',
+        '- every script parses, and has the line endings it had;',
+        '- every mapping field and mapping action has an ID of its own, and valid numbers, and no',
+        '  mapping action in mode 2 reads the account in another system;',
+        '- the report has HelloID\'s checklist in it.',
+        '',
+        'It lists as "CHECK" what may be right but deserves a look, like a script that is identical to the',
+        'export.',
+        '',
+        'What it cannot check is yours to check:',
+        '',
+        '- Next to the supplier\'s script, each of yours differs only where the system does something else',
+        '  or has other settings. Compare them to be sure.',
+        '- Go over each v1 script once more for anything it does that yours no longer does.',
+        '- Every property a script reads from `$actionContext.Data` is a mapping field for that script.',
+        '',
+        '## Report',
+        '',
+        'Write this as `migration.json` in the folder of each system. `build` puts it in the import file',
+        'as the top-level `migration` object:',
+        '',
+        '```json',
+        '{',
+        '  "convertedFrom": "<name of the export file>",',
+        '  "checklist": {',
+        '    "isMappingConfigConverted": true,',
+        '    "isCreateAccountScriptConverted": true,',
+        '    "isEnableAccountScriptConverted": true,',
+        '    "isUpdateAccountScriptConverted": true,',
+        '    "isDisableAccountScriptConverted": true,',
+        '    "isDeleteAccountScriptConverted": true,',
+        '    "convertedPermissionDefinitions": { "<name of the permission set>": true },',
+        '    "convertedResourceScripts": { "<name of the resource>": true }',
+        '  },',
+        '  "notes": [',
+        '    { "where": "accountCreate", "text": "..." }',
+        '  ]',
+        '}',
+        '```',
+        '',
+        '`checklist` has the shape of HelloID\'s own. Use the keys of `migrationStatus.checklist` when the',
+        'export has it; otherwise the names of the permission sets and of the resources.',
+        '',
+        'The import acts on it: a task that is true here gets ticked off in HelloID once your file is',
+        'imported, and when all of them are true the import completes the migration, which cannot be',
+        'undone. So true means that no person has to convert anything more for that task, and that you',
+        'would let it run as it is. Set a task to false when a part of it is left for a person, or when',
+        'you had to guess at something that decides whether it works, and say in a note what is left:',
+        'one false task keeps the migration open until a person has looked at it.',
+        'A task with nothing to convert (a script that is null) is true.',
+        '',
+        '`notes` is what the person has to know before trusting the file: which supplier\'s script each',
+        'script was modelled on, what of the v1 script was carried over into it, what of the supplier\'s',
+        'script was left out, where you could not follow the supplier, what you were not sure of or could',
+        'not check, and other systems that may be affected. No note for what simply went by the tables',
+        'above.',
+        '',
+        'The notes are written once, in the file. Do not repeat them in your answer. Your answer has,',
+        'per system:',
+        '',
+        '- the name of the import file, and whether `verify` found no problems;',
+        '- the tasks you set to false, and why;',
+        '- what the system will do differently from before, if anything;',
+        '- the questions that are still open, for the person to answer.',
+        '',
+        'Systems that came out the same can share one entry.',
+        '',
+        'End your answer with what the person does next, in this order:',
+        '',
+        '1. Import your file with the import button of the HelloID UX improvements userscript. When the',
+        '   migration of the system is not started yet, the import asks whether to start it: that cannot',
+        '   be undone, and from then on the system is disabled until the migration is completed.',
+        '2. Read the list of differences before confirming it. The import ticks off the tasks of',
+        '   HelloID\'s checklist that your file converts. When that is all of them, it completes the',
+        '   migration and leaves the system disabled.',
+        '3. If tasks are left open: do those by hand, tick them off in HelloID and complete the',
+        '   migration there.',
+        '4. Test each script in HelloID with its preview, which runs it as a dry run, and only then',
+        '   enable the system.',
+    ].join('\n') + '\n';
+
+    // What the handoff has the agent work with: writes the scripts of an
+    // export to files, puts them back into an import file, and checks
+    // that file. PowerShell, as the agents run on Windows.
+    const MIGRATION_TOOL_FILE_NAME = 'HelloID-Migration-Tool.ps1';
+    const MIGRATION_TOOL = [
+        '#Requires -Version 7.2',
+        '<#',
+        '.SYNOPSIS',
+        '    Helper for migrating HelloID PowerShell v1 target systems to PowerShell v2.',
+        '    It goes with "HelloID PowerShell v2 migration - handoff for Claude.md".',
+        '',
+        '.DESCRIPTION',
+        '    extract  Writes the scripts of an export to a folder, one file each, and',
+        '             lists them with a hash per script and per function, so identical',
+        '             ones are converted once.',
+        '    build    Makes the import file: the export with the scripts of that folder,',
+        '             the type of a PowerShell v2 system and, when the folder has them,',
+        '             mapping.json (the mapping fields) and migration.json (the report).',
+        '    verify   Checks an import file against its export.',
+        '',
+        '    The JSON is never read into PowerShell objects: only the parts named above',
+        '    are replaced, and everything else is written back as it was.',
+        '',
+        '.EXAMPLE',
+        '    pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 extract -Export \'System - id - date.json\'',
+        '    pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 build -Export \'System - id - date.json\'',
+        '    pwsh -ExecutionPolicy Bypass -File HelloID-Migration-Tool.ps1 verify -Export \'System - id - date.json\'',
+        '#>',
+        '[CmdletBinding()]',
+        'param(',
+        '    [Parameter(Mandatory, Position = 0)]',
+        '    [ValidateSet(\'extract\', \'build\', \'verify\')]',
+        '    [string]$Command,',
+        '',
+        '    # The export of the system',
+        '    [Parameter(Mandatory)]',
+        '    [string]$Export,',
+        '',
+        '    # The folder with the scripts. Default: the export\'s name without ".json"',
+        '    [string]$Folder,',
+        '',
+        '    # The import file. Default: the export\'s name with " - v2 import" before ".json"',
+        '    [string]$Import',
+        ')',
+        '',
+        '$ErrorActionPreference = \'Stop\'',
+        'Set-StrictMode -Version 3',
+        '',
+        '$exportPath = (Resolve-Path -LiteralPath $Export).Path',
+        '$baseName = [System.IO.Path]::GetFileNameWithoutExtension($exportPath)',
+        '$directory = [System.IO.Path]::GetDirectoryName($exportPath)',
+        'if (-not $Folder) { $Folder = Join-Path $directory $baseName }',
+        'if (-not $Import) { $Import = Join-Path $directory "$baseName - v2 import.json" }',
+        '',
+        '$v2Type = \'powershell-target\'',
+        '# What HelloID hands a v1 script. The import uses the same pattern: it does not match the v2',
+        '# names ($personContext is not $person followed by the end of a word).',
+        '$v1Variable = [regex]::new(\'\\$(configuration|person|manager|accountReference|managerAccountReference|\' +',
+        '    \'permissionReference|operation|entitlementContext|dryRun)\\b\', \'IgnoreCase\')',
+        '$writesResult = [regex]::new(\'Write-Output[^\\r\\n|]*\\|\\s*ConvertTo-Json\', \'IgnoreCase\')',
+        '$checklistScripts = [ordered]@{',
+        '    isCreateAccountScriptConverted  = \'accountCreate\'',
+        '    isEnableAccountScriptConverted  = \'accountEnable\'',
+        '    isUpdateAccountScriptConverted  = \'accountUpdate\'',
+        '    isDisableAccountScriptConverted = \'accountDisable\'',
+        '    isDeleteAccountScriptConverted  = \'accountDelete\'',
+        '}',
+        '',
+        'function Read-Json([string]$Path) {',
+        '    $text = [System.IO.File]::ReadAllText($Path).TrimStart([char]0xFEFF)',
+        '    # (the comma keeps PowerShell from taking the node apart)',
+        '    return , [System.Text.Json.Nodes.JsonNode]::Parse($text)',
+        '}',
+        '',
+        'function Write-Json([System.Text.Json.Nodes.JsonNode]$Node, [string]$Path) {',
+        '    $options = [System.Text.Json.JsonSerializerOptions]::new()',
+        '    $options.WriteIndented = $true',
+        '    $options.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping',
+        '    [System.IO.File]::WriteAllText($Path, $Node.ToJsonString($options), [System.Text.UTF8Encoding]::new($false))',
+        '}',
+        '',
+        'function Get-SafeName([string]$Name) {',
+        '    return ($Name -replace \'[\\\\/:*?"<>|]+\', \'_\').Trim()',
+        '}',
+        '',
+        'function Get-Hash([string]$Text) {',
+        '    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($Text -replace "`r", \'\'))',
+        '    return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).Substring(0, 8)',
+        '}',
+        '',
+        '# The scripts of an export or import file: where each one is in the JSON, and the file it is',
+        '# kept in. Scripts that are null are listed too, without text.',
+        'function Get-Scripts([System.Text.Json.Nodes.JsonNode]$Data) {',
+        '    $scripts = [System.Collections.Generic.List[object]]::new()',
+        '    $add = {',
+        '        param($Owner, $Key, $Name, $File, $Kind)',
+        '        $node = $Owner[$Key]',
+        '        $scripts.Add([PSCustomObject]@{',
+        '                Owner = $Owner',
+        '                Key   = $Key',
+        '                Name  = $Name',
+        '                File  = $File',
+        '                Kind  = $Kind',
+        '                Text  = if ($null -eq $node) { $null } else { $node.ToString() }',
+        '            })',
+        '    }',
+        '    $configuration = $Data[\'configuration\']',
+        '    if ($null -ne $configuration[\'scripts\']) {',
+        '        foreach ($entry in @($configuration[\'scripts\'])) {',
+        '            & $add $configuration[\'scripts\'] $entry.Key $entry.Key "$($entry.Key).ps1" \'account\'',
+        '        }',
+        '    }',
+        '    if ($null -ne $configuration[\'permissions\']) {',
+        '        foreach ($set in $configuration[\'permissions\']) {',
+        '            $setName = $set[\'displayName\'].ToString()',
+        '            foreach ($entry in @($set)) {',
+        '                if ($entry.Key -notmatch \'Script$\') { continue }',
+        '                & $add $set $entry.Key "permission set `"$setName`", $($entry.Key)" `',
+        '                (Join-Path \'permissions\' (Get-SafeName $setName) "$($entry.Key).ps1") \'permission\'',
+        '            }',
+        '        }',
+        '    }',
+        '    if ($Data[\'resources\'] -is [System.Text.Json.Nodes.JsonArray]) {',
+        '        foreach ($resource in $Data[\'resources\']) {',
+        '            $resourceName = $resource[\'displayName\'].ToString()',
+        '            foreach ($entry in @($resource)) {',
+        '                if ($entry.Key -notmatch \'script$\' -or $entry.Value -isnot [System.Text.Json.Nodes.JsonValue]) { continue }',
+        '                & $add $resource $entry.Key "resource `"$resourceName`", $($entry.Key)" `',
+        '                (Join-Path \'resources\' (Get-SafeName $resourceName) "$($entry.Key).ps1") \'resource\'',
+        '            }',
+        '        }',
+        '    }',
+        '    return $scripts',
+        '}',
+        '',
+        'function Get-Functions([string]$Script) {',
+        '    $tokens = $null',
+        '    $errors = $null',
+        '    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Script, [ref]$tokens, [ref]$errors)',
+        '    return $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) |',
+        '        ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Hash = Get-Hash $_.Extent.Text; Lines = ($_.Extent.EndLineNumber - $_.Extent.StartLineNumber + 1) } }',
+        '}',
+        '',
+        'function Get-ParseErrors([string]$Script) {',
+        '    $tokens = $null',
+        '    $errors = $null',
+        '    $null = [System.Management.Automation.Language.Parser]::ParseInput($Script, [ref]$tokens, [ref]$errors)',
+        '    return $errors',
+        '}',
+        '',
+        '# The paths at which two JSON values differ',
+        'function Compare-Json($Left, $Right, [string]$Path = \'\') {',
+        '    if ($Left -is [System.Text.Json.Nodes.JsonObject] -and $Right -is [System.Text.Json.Nodes.JsonObject]) {',
+        '        $keys = [System.Collections.Generic.List[string]]::new()',
+        '        foreach ($entry in @($Left)) { $keys.Add($entry.Key) }',
+        '        foreach ($entry in @($Right)) { if (-not $keys.Contains($entry.Key)) { $keys.Add($entry.Key) } }',
+        '        foreach ($key in $keys) {',
+        '            $child = if ($Path) { "$Path.$key" } else { $key }',
+        '            if (-not $Left.ContainsKey($key)) { "$child (added)" }',
+        '            elseif (-not $Right.ContainsKey($key)) { "$child (removed)" }',
+        '            else { Compare-Json $Left[$key] $Right[$key] $child }',
+        '        }',
+        '        return',
+        '    }',
+        '    if ($Left -is [System.Text.Json.Nodes.JsonArray] -and $Right -is [System.Text.Json.Nodes.JsonArray] -and',
+        '        $Left.Count -eq $Right.Count) {',
+        '        for ($i = 0; $i -lt $Left.Count; $i++) { Compare-Json $Left[$i] $Right[$i] "$Path[$i]" }',
+        '        return',
+        '    }',
+        '    $leftText = if ($null -eq $Left) { \'null\' } else { $Left.ToJsonString() }',
+        '    $rightText = if ($null -eq $Right) { \'null\' } else { $Right.ToJsonString() }',
+        '    if ($leftText -cne $rightText) { $Path }',
+        '}',
+        '',
+        'switch ($Command) {',
+        '    \'extract\' {',
+        '        $data = Read-Json $exportPath',
+        '        $scripts = Get-Scripts $data',
+        '        $defaults = $data[\'defaultScripts\']',
+        '        $seenScripts = @{}',
+        '        $seenFunctions = @{}',
+        '        Write-Output "System: $($data[\'displayName\']) ($($data[\'systemId\'])), type $($data[\'templateIdentifier\'])"',
+        '        Write-Output "Folder: $Folder"',
+        '        Write-Output \'\'',
+        '        foreach ($script in $scripts) {',
+        '            if ([string]::IsNullOrWhiteSpace($script.Text)) {',
+        '                Write-Output "$($script.Name): null, nothing to convert"',
+        '                continue',
+        '            }',
+        '            $path = Join-Path $Folder $script.File',
+        '            $null = New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($path))',
+        '            [System.IO.File]::WriteAllText($path, $script.Text, [System.Text.UTF8Encoding]::new($false))',
+        '',
+        '            $hash = Get-Hash $script.Text',
+        '            $lines = ($script.Text -split "`n").Count',
+        '            $notes = @()',
+        '            if ($seenScripts.ContainsKey($hash)) { $notes += "IDENTICAL to $($seenScripts[$hash])" } else { $seenScripts[$hash] = $script.Name }',
+        '            if ($null -ne $defaults -and $null -ne $defaults[$script.Key] -and',
+        '                (Get-Hash $defaults[$script.Key].ToString()) -eq $hash) { $notes += "HelloID\'s default script, never edited" }',
+        '            if ($script.Text -match \'(?m)^#\\s*(HelloID-Conn-\\S+)\') { $notes += "header: $($Matches[1])" }',
+        '            Write-Output "$($script.Name): $($script.File), $lines lines, hash $hash$(if ($notes) { \' [\' + ($notes -join \'; \') + \']\' })"',
+        '            foreach ($function in Get-Functions $script.Text) {',
+        '                $key = "$($function.Name):$($function.Hash)"',
+        '                $same = if ($seenFunctions.ContainsKey($key)) { " [same as in $($seenFunctions[$key])]" } else { $seenFunctions[$key] = $script.Name; \'\' }',
+        '                Write-Output "    function $($function.Name): $($function.Lines) lines, hash $($function.Hash)$same"',
+        '            }',
+        '        }',
+        '        Write-Output \'\'',
+        '        Write-Output \'Convert the files in the folder in place. Add mapping.json (the array of mapping fields) and\'',
+        '        Write-Output \'migration.json (the report) to the folder, then run "build" and "verify".\'',
+        '    }',
+        '',
+        '    \'build\' {',
+        '        $data = Read-Json $exportPath',
+        '        foreach ($script in Get-Scripts $data) {',
+        '            $path = Join-Path $Folder $script.File',
+        '            if (-not (Test-Path -LiteralPath $path)) {',
+        '                if (-not [string]::IsNullOrWhiteSpace($script.Text)) { throw "Missing in the folder: $($script.File). Run `"extract`" first." }',
+        '                continue',
+        '            }',
+        '            $text = [System.IO.File]::ReadAllText($path).TrimStart([char]0xFEFF)',
+        '            # The line endings the script had in the export',
+        '            if ($null -ne $script.Text -and $script.Text.Contains("`r`n")) { $text = ($text -replace "`r?`n", "`r`n") }',
+        '            $script.Owner[$script.Key] = [System.Text.Json.Nodes.JsonValue]::Create([string]$text)',
+        '        }',
+        '        $data[\'templateIdentifier\'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$v2Type)',
+        '        $data[\'configuration\'][\'templateIdentifier\'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$v2Type)',
+        '',
+        '        $mappingPath = Join-Path $Folder \'mapping.json\'',
+        '        if (Test-Path -LiteralPath $mappingPath) {',
+        '            $fields = Read-Json $mappingPath',
+        '            if ($fields -isnot [System.Text.Json.Nodes.JsonArray]) { throw \'mapping.json has to be an array of mapping fields.\' }',
+        '            if ($null -eq $data[\'configuration\'][\'mappingConfiguration\']) {',
+        '                $data[\'configuration\'][\'mappingConfiguration\'] = [System.Text.Json.Nodes.JsonObject]::new()',
+        '            }',
+        '            $data[\'configuration\'][\'mappingConfiguration\'][\'fields\'] = $fields',
+        '        }',
+        '        else { Write-Warning \'No mapping.json in the folder: the mapping is that of the export.\' }',
+        '',
+        '        $migrationPath = Join-Path $Folder \'migration.json\'',
+        '        if (Test-Path -LiteralPath $migrationPath) { $data[\'migration\'] = Read-Json $migrationPath }',
+        '        else { Write-Warning \'No migration.json in the folder: the import file has no report, and the import ticks nothing off.\' }',
+        '',
+        '        Write-Json $data $Import',
+        '        Write-Output "Written: $Import"',
+        '        Write-Output \'Run "verify" next.\'',
+        '    }',
+        '',
+        '    \'verify\' {',
+        '        $original = Read-Json $exportPath',
+        '        $data = Read-Json (Resolve-Path -LiteralPath $Import).Path',
+        '        $problems = [System.Collections.Generic.List[string]]::new()',
+        '        $warnings = [System.Collections.Generic.List[string]]::new()',
+        '',
+        '        # Only the type, the scripts, the mapping fields and the report may differ',
+        '        $scripts = Get-Scripts $data',
+        '        $allowed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)',
+        '        foreach ($path in \'templateIdentifier\', \'configuration.templateIdentifier\', \'migration (added)\') { $null = $allowed.Add($path) }',
+        '        foreach ($difference in Compare-Json $original $data) {',
+        '            if ($allowed.Contains($difference)) { continue }',
+        '            if ($difference -match \'^configuration\\.mappingConfiguration\\.fields(\\[|$)\') { continue }',
+        '            if ($difference -match \'^configuration\\.scripts\\.\\w+$\') { continue }',
+        '            if ($difference -match \'^configuration\\.permissions\\[\\d+\\]\\.\\w+Script$\') { continue }',
+        '            if ($difference -match \'^resources\\[\\d+\\]\\.\\w*[sS]cript$\') { continue }',
+        '            $problems.Add("Differs from the export, and should not: $difference")',
+        '        }',
+        '        foreach ($path in \'templateIdentifier\', \'configuration.templateIdentifier\') {',
+        '            $node = $data; foreach ($part in $path.Split(\'.\')) { $node = $node[$part] }',
+        '            if ("$node" -ne $v2Type) { $problems.Add("$path is `"$node`", not `"$v2Type`"") }',
+        '        }',
+        '',
+        '        # The scripts',
+        '        foreach ($script in $scripts) {',
+        '            if ([string]::IsNullOrWhiteSpace($script.Text)) { continue }',
+        '            $lineNumber = 0',
+        '            foreach ($line in ($script.Text -split "`r?`n")) {',
+        '                $lineNumber++',
+        '                foreach ($match in $v1Variable.Matches($line)) {',
+        '                    $problems.Add("$($script.Name), line ${lineNumber}: v1 variable $($match.Value) (comments and strings count: the import leaves the task open)")',
+        '                }',
+        '                if ($writesResult.IsMatch($line)) { $problems.Add("$($script.Name), line ${lineNumber}: still writes a result as JSON") }',
+        '            }',
+        '            foreach ($parseError in Get-ParseErrors $script.Text) {',
+        '                $problems.Add("$($script.Name), line $($parseError.Extent.StartLineNumber): does not parse: $($parseError.Message)")',
+        '            }',
+        '            $before = Get-Scripts $original | Where-Object { $_.Name -eq $script.Name } | Select-Object -First 1',
+        '            if ($null -ne $before -and $null -ne $before.Text) {',
+        '                if ($before.Text.Contains("`r`n") -and $script.Text -match "(?<!`r)`n") { $problems.Add("$($script.Name): has lines that end without a carriage return, unlike the export") }',
+        '                if ($before.Text -ceq $script.Text) { $warnings.Add("$($script.Name): identical to the export (not converted?)") }',
+        '            }',
+        '            if ($script.Text -notmatch \'\\$outputContext\\b\') { $warnings.Add("$($script.Name): never uses `$outputContext") }',
+        '        }',
+        '',
+        '        # The mapping',
+        '        $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)',
+        '        $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)',
+        '        $fieldIds = @()',
+        '        $guid = [guid]::Empty',
+        '        $fields = $data[\'configuration\'][\'mappingConfiguration\']?[\'fields\']',
+        '        if ($null -eq $fields -or $fields.Count -eq 0) { $warnings.Add(\'The mapping has no fields.\') }',
+        '        else {',
+        '            foreach ($field in $fields) {',
+        '                $name = "$($field[\'name\'])"',
+        '                $id = "$($field[\'identifier\'])"',
+        '                $fieldIds += $id',
+        '                if (-not $name) { $problems.Add(\'A mapping field has no name.\') }',
+        '                if (-not $names.Add($name)) { $problems.Add("Mapping field `"$name`": the name is used twice (capitals do not count).") }',
+        '                if (-not [guid]::TryParse($id, [ref]$guid) -or -not $ids.Add($id)) { $problems.Add("Mapping field `"$name`": identifier `"$id`" is not a UUID of its own.") }',
+        '                if ("$($field[\'type\'])" -notin \'1\', \'2\') { $problems.Add("Mapping field `"$name`": type $($field[\'type\']) is not 1 or 2.") }',
+        '                $actionsSeen = @{}',
+        '                if ($null -eq $field[\'mappingActions\'] -or $field[\'mappingActions\'].Count -eq 0) { $problems.Add("Mapping field `"$name`": no mapping actions.") ; continue }',
+        '                foreach ($action in $field[\'mappingActions\']) {',
+        '                    $actionId = "$($action[\'mappingActionId\'])"',
+        '                    if (-not [guid]::TryParse($actionId, [ref]$guid) -or -not $ids.Add($actionId)) { $problems.Add("Mapping field `"$name`": mappingActionId `"$actionId`" is not a UUID of its own.") }',
+        '                    if ("$($action[\'mode\'])" -notin \'0\', \'1\', \'2\', \'3\') { $problems.Add("Mapping field `"$name`": mode $($action[\'mode\']) is not 0, 1, 2 or 3.") }',
+        '                    if ("$($action[\'mode\'])" -eq \'2\' -and "$($action[\'value\'])" -match \'^\\s*Person\\.Accounts\\.\') { $problems.Add("Mapping field `"$name`": mode 2 (field) cannot read the account in another system: HelloID throws the value away. Use mode 3 (complex), with the reference in its expression.") }',
+        '                    if ($action[\'value\'] -isnot [System.Text.Json.Nodes.JsonValue]) { $problems.Add("Mapping field `"$name`": value has to be a text (`"`" for mode 0).") }',
+        '                    foreach ($flag in \'usedInNotifications\', \'storeInAccountData\') {',
+        '                        if ("$($action[$flag])" -notin \'true\', \'false\') { $problems.Add("Mapping field `"$name`": $flag has to be true or false.") }',
+        '                    }',
+        '                    foreach ($number in $action[\'entitlementActions\']) {',
+        '                        if ("$number" -notin \'1\', \'2\', \'3\', \'4\', \'5\') { $problems.Add("Mapping field `"$name`": action $number is not 1 to 5.") }',
+        '                        if ($actionsSeen.ContainsKey("$number")) { $problems.Add("Mapping field `"$name`": action $number is in more than one mapping action.") }',
+        '                        $actionsSeen["$number"] = $true',
+        '                    }',
+        '                }',
+        '            }',
+        '        }',
+        '        $correlation = $data[\'configuration\'][\'correlationConfiguration\']',
+        '        if ($null -ne $correlation -and "$($correlation[\'enabled\'])" -eq \'true\' -and "$($correlation[\'accountFieldId\'])" -notin $fieldIds) {',
+        '            $problems.Add(\'Correlation is on, but its accountFieldId is not the identifier of a mapping field in the file.\')',
+        '        }',
+        '',
+        '        # The report',
+        '        $checklist = $data[\'migration\']?[\'checklist\']',
+        '        if ($null -eq $checklist) { $problems.Add(\'No migration.checklist: the import ticks nothing off.\') }',
+        '        else {',
+        '            $expected = @(\'isMappingConfigConverted\') + @($checklistScripts.Keys)',
+        '            foreach ($key in $expected) { if ("$($checklist[$key])" -notin \'true\', \'false\') { $problems.Add("migration.checklist.$key has to be true or false.") } }',
+        '            foreach ($set in $data[\'configuration\'][\'permissions\']) {',
+        '                $setName = "$($set[\'displayName\'])"',
+        '                if ("$($checklist[\'convertedPermissionDefinitions\']?[$setName])" -notin \'true\', \'false\') { $problems.Add("migration.checklist.convertedPermissionDefinitions has no true or false for `"$setName`".") }',
+        '            }',
+        '            if ($null -eq $checklist[\'convertedResourceScripts\']) { $problems.Add(\'migration.checklist.convertedResourceScripts is missing ({} when there are no resources).\') }',
+        '            $open = $original[\'configuration\'][\'migrationStatus\']?[\'checklist\']',
+        '            if ($null -ne $open) {',
+        '                foreach ($difference in Compare-Json $open $checklist) {',
+        '                    if ($difference -match \'\\((added|removed)\\)$\') { $problems.Add("migration.checklist does not have the keys of HelloID\'s checklist: $difference") }',
+        '                }',
+        '            }',
+        '        }',
+        '        if ($data[\'migration\']?[\'notes\'] -isnot [System.Text.Json.Nodes.JsonArray]) { $problems.Add(\'migration.notes has to be an array.\') }',
+        '',
+        '        foreach ($warning in $warnings) { Write-Output "CHECK   $warning" }',
+        '        foreach ($problem in $problems) { Write-Output "PROBLEM $problem" }',
+        '        Write-Output \'\'',
+        '        if ($problems.Count) {',
+        '            Write-Output "$($problems.Count) problem(s). Fix them in the folder, then run `"build`" and `"verify`" again."',
+        '            exit 1',
+        '        }',
+        '        Write-Output "No problems found in $([System.IO.Path]::GetFileName($Import))$(if ($warnings.Count) { " ($($warnings.Count) to check)" })."',
+        '        Write-Output \'Not checked here: whether each script still does what the v1 script did.\'',
+        '    }',
+        '}',
+    ].join('\r\n') + '\r\n';
+
+    // Only PowerShell v1 systems are to be migrated
+    const canMigrate = (entry) => entry.templateIdentifier === POWERSHELL_V1;
+
+    async function collectMigrationExport(name, report) {
+        const data = await collectSystemExport(name, report);
+        const open = isPlainObject(data.configuration.migrationStatus);
+        if (data.templateIdentifier !== POWERSHELL_V1 && !(data.templateIdentifier === POWERSHELL_V2 && open)) {
+            throw new Error(data.templateIdentifier === POWERSHELL_V2
+                ? `"${name}" is a PowerShell v2 system without an open migration: there is nothing to convert.`
+                : `"${name}" is of type "${data.templateIdentifier}": only PowerShell v1 systems are migrated.`);
+        }
+        return data;
+    }
+
+    function migrationNotice(data) {
+        const started = data.templateIdentifier === POWERSHELL_V2;
+        return `Three files were saved: the export of "${data.displayName}", and in your downloads folder ` +
+               `"${HANDOFF_FILE_NAME}" and "${MIGRATION_TOOL_FILE_NAME}" (your browser may ask whether this site ` +
+               'may download more than one file, and whether to keep a PowerShell file).\n\n' +
+               'Give all three to a Claude agent, with the exports of the other systems to migrate: the ' +
+               'handoff and the tool are the same for all of them. The agent answers with a file per system ' +
+               'for the Import button.\n\n' +
+               (started
+                   ? 'The migration of this system is started, so the file of the agent can be imported right away.'
+                   : 'The migration of this system is not started yet. The import of the file of the agent ' +
+                     'asks whether to start it: from then on the system is disabled until the migration is ' +
+                     'completed.') +
+               warn(data.secretsIncluded ? '\n\nThe export has the SECRETS of the system in it.' : '') +
+               warn(data.couldNotRead ? `\n\nThe export was saved without: ${data.couldNotRead.join(', ')}.` : '');
+    }
+
+    // appliesTo: (the system in HelloID's list) -> has the button a use
+    // for it? The button is only shown for the systems it is for.
+    // extraFiles: { name, text, type } of what is saved with the export
     const EXPORT_KINDS = {
+        migration: {
+            title: 'Export for the migration to PowerShell v2: the configuration, and the handoff and tool for a ' +
+                   'Claude agent',
+            icon: 'fa-solid fa-wand-magic-sparkles',
+            suffix: ' - PowerShell v1 to v2',
+            steps: CONFIGURATION_STEPS,
+            collect: collectMigrationExport,
+            notice: migrationNotice,
+            appliesTo: canMigrate,
+            extraFiles: [
+                { name: HANDOFF_FILE_NAME, text: HANDOFF, type: 'text/markdown' },
+                { name: MIGRATION_TOOL_FILE_NAME, text: MIGRATION_TOOL, type: 'text/plain' },
+            ],
+        },
         configuration: {
             title: 'Export the configuration to a JSON file',
             icon: 'fa-solid fa-download',
@@ -2251,10 +3358,26 @@
             steps: GRANTED_STEPS,
             collect: collectGrantedExport,
             notice: (data) => (data.complete ? ''
-                : 'The file may not have all granted entitlements: HelloID returned as many rows as were asked ' +
-                  'for. Raise the setting "Grids: max rows to fetch" and export again.'),
+                : warn('The file may not have all granted entitlements: HelloID returned as many rows as were ' +
+                       'asked for. Raise the setting "Grids: max rows to fetch" and export again.')),
         },
     };
+
+    // The export buttons that are only for some systems, with the name
+    // of their system (see refreshExportButtons)
+    const LIMITED_EXPORT_CLASS = 'tm-export-limited';
+    const limitedExports = new WeakMap(); // button -> { getName, kind }
+
+    // Shows those buttons for the systems they are for, and only for
+    // those: a system that isn't known (yet) doesn't have them
+    function refreshExportButtons() {
+        document.querySelectorAll(`.${LIMITED_EXPORT_CLASS}`).forEach(btn => {
+            const { getName, kind } = limitedExports.get(btn) ?? {};
+            const entry = systemEntries.get(getName?.());
+            const display = entry && kind?.appliesTo(entry) ? '' : 'none';
+            if (btn.style.display !== display) btn.style.display = display;
+        });
+    }
 
     // getName is called at click time
     function createExportButton(getName, className = 'btn btn-default btn-xs', kind = EXPORT_KINDS.configuration) {
@@ -2262,6 +3385,12 @@
         btn.type = 'button';
         btn.className = className;
         btn.title = kind.title;
+        if (kind.appliesTo) {
+            btn.classList.add(LIMITED_EXPORT_CLASS);
+            limitedExports.set(btn, { getName, kind });
+            const entry = systemEntries.get(getName());
+            if (!entry || !kind.appliesTo(entry)) btn.style.display = 'none';
+        }
         const icon = document.createElement('i');
         icon.className = kind.icon;
         btn.appendChild(icon);
@@ -2297,9 +3426,19 @@
     // With confirm: Cancel and Continue; resolves to true for Continue.
     // With alternative (a label): a button in between, for another way to
     // continue; resolves to 'alternative' for that one.
+    // With content (an element): that is shown instead of the text, which
+    // is then only what the Copy button copies.
+    // With confirmLabel, confirmClass and confirmIcon: another Continue
+    // button (e.g. HelloID's yellow Confirm).
+    // Errors and warnings in the text (see error and warn) are shown
+    // bold, errors red; with any, the buttons that go on are disabled for
+    // the first seconds.
     const DIALOG_CLASS = 'tm-dialog';
 
-    function showDialog(title, text, { confirm = false, alternative = null } = {}) {
+    function showDialog(title, text, {
+        confirm = false, alternative = null, content = null,
+        confirmLabel = 'Continue', confirmClass = 'btn-primary', confirmIcon = null,
+    } = {}) {
         return new Promise(resolve => {
             const dialog = document.createElement('dialog');
             dialog.className = DIALOG_CLASS;
@@ -2307,30 +3446,42 @@
             const heading = document.createElement('h5');
             heading.textContent = title;
 
-            const body = document.createElement('pre');
-            body.textContent = text;
+            const body = content ?? document.createElement('pre');
+            if (content) content.classList.add('tm-dialog-content');
+            else renderMessage(body, text);
             body.tabIndex = 0; // can take the focus, so the keyboard scrolls it
 
             const footer = document.createElement('div');
             footer.className = 'tm-dialog-footer';
-            const button = (label, className, onClick) => {
+            const button = (label, className, onClick, iconClass = null) => {
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = `btn btn-sm ${className}`;
                 btn.textContent = label;
+                if (iconClass) {
+                    const icon = document.createElement('i');
+                    icon.className = iconClass;
+                    btn.prepend(icon, ' ');
+                }
                 btn.addEventListener('click', onClick);
                 footer.appendChild(btn);
                 return btn;
             };
             const copy = button('Copy text', 'btn-primary tm-dialog-copy', async () => {
-                copy.textContent = await copyToClipboard(text) ? 'Copied' : 'Copy failed';
+                copy.textContent = await copyToClipboard(withoutMarks(text)) ? 'Copied' : 'Copy failed';
                 setTimeout(() => { copy.textContent = 'Copy text'; }, SETTINGS.copyFeedbackMs);
             });
             copy.style.marginRight = 'auto'; // on the left, the others on the right
-            if (confirm) button('Cancel', 'btn-default', () => dialog.close('cancel'));
+            if (confirm) {
+                button('Cancel', 'btn-default', () => dialog.close('cancel'), confirmIcon && 'fa-solid fa-xmark');
+            }
             // (as valid a choice as Continue: the same color)
-            if (alternative) button(alternative, 'btn-primary', () => dialog.close('alternative'));
-            const ok = button(confirm ? 'Continue' : 'Close', 'btn-primary', () => dialog.close('ok'));
+            const other = alternative ? button(alternative, 'btn-primary', () => dialog.close('alternative')) : null;
+            const ok = confirm ? button(confirmLabel, confirmClass, () => dialog.close('ok'), confirmIcon)
+                : button('Close', 'btn-primary', () => dialog.close('ok'));
+            if (!content && hasWarnings(text)) holdButtons([other, ok].filter(Boolean));
+            // (Escape is Cancel in a confirmation, and Close otherwise)
+            dialog.addEventListener('cancel', (e) => { if (!confirm && ok.disabled) e.preventDefault(); });
 
             // Also closed with Escape: that counts as Cancel
             dialog.addEventListener('close', () => {
@@ -2346,7 +3497,7 @@
             dialog.showModal();
             // Not the primary button for a confirmation: Enter shouldn't
             // start an import by accident
-            (confirm ? body : ok).focus();
+            (confirm || ok.disabled ? body : ok).focus();
         });
     }
 
@@ -2358,15 +3509,18 @@
     //   failBusy():      the job stopped: its busy steps failed
     //   close():         closes the card, without the user
     //   finish(message): adds the closing text, lets the user close the
-    //                    card; resolves when that happens
+    //                    card (some seconds later, when a step failed or
+    //                    the text has warnings); resolves when that happens
     const PROGRESS_ICONS = { waiting: '•', busy: '⏳', done: '✅', failed: '❌', skipped: '–' };
 
     function showProgress(title, names) {
         const states = names.map(() => 'waiting');
         const details = names.map(() => '');
         let closing = '';
-        const text = () => names.map((name, i) =>
-            `${PROGRESS_ICONS[states[i]]} ${name}${details[i] ? ` (${details[i]})` : ''}`).join('\n') + closing;
+        const text = () => names.map((name, i) => {
+            const line = `${PROGRESS_ICONS[states[i]]} ${name}${details[i] ? ` (${details[i]})` : ''}`;
+            return states[i] === 'failed' ? error(line) : line;
+        }).join('\n') + closing;
 
         const dialog = document.createElement('dialog');
         dialog.className = DIALOG_CLASS;
@@ -2374,7 +3528,7 @@
         heading.textContent = title;
         const body = document.createElement('pre');
         body.tabIndex = 0;
-        const render = () => { body.textContent = text(); };
+        const render = () => renderMessage(body, text());
 
         const footer = document.createElement('div');
         footer.className = 'tm-dialog-footer';
@@ -2384,7 +3538,7 @@
         copy.textContent = 'Copy text';
         copy.style.marginRight = 'auto';
         copy.addEventListener('click', async () => {
-            copy.textContent = await copyToClipboard(text()) ? 'Copied' : 'Copy failed';
+            copy.textContent = await copyToClipboard(withoutMarks(text())) ? 'Copied' : 'Copy failed';
             setTimeout(() => { copy.textContent = 'Copy text'; }, SETTINGS.copyFeedbackMs);
         });
         const close = document.createElement('button');
@@ -2426,8 +3580,15 @@
             finish(message) {
                 closing = `\n\n${message}`;
                 render();
-                close.disabled = false;
-                close.focus();
+                // The job is over. With warnings or a failed step: Close
+                // only some seconds after that.
+                if (hasWarnings(text())) {
+                    holdButtons([close]);
+                    body.focus();
+                } else {
+                    close.disabled = false;
+                    close.focus();
+                }
                 return closed;
             },
         };
@@ -2458,6 +3619,9 @@
     //   note:   what else the user should know, for the summary
     //   changes: (configuration, current) -> the names of the parts it
     //           would change, when that's not simply what differs in body
+    //   applies: (configuration) -> can the step be sent for this file?
+    //           A step that can't is left out; what it would have changed
+    //           is shown as not importable.
     const GENERAL_FIELDS = ['displayName', 'description', 'icon', 'isDisabled', 'executeOnPremises',
         'limitConcurrentActionsConfiguration'];
     // For every type: these are stored apart from the type's configuration
@@ -2631,9 +3795,15 @@
         // The correlation field is given by its ID in the system as it is
         // then (after the mapping step: its new ID), found by its name.
         // On or off as in the file.
+        // HelloID refuses the request without a field, so a file without
+        // one (a system that never had correlation, as its scripts do
+        // that themselves) has nothing to send here.
         {
             name: 'Correlation',
             usesFieldIds: true,
+            applies: (configuration) => configuration.correlationConfiguration?.enabled === true ||
+                (configuration.mappingConfiguration?.fields ?? [])
+                    .some(f => f.identifier === configuration.correlationConfiguration?.accountFieldId),
             path: (id) => `/connector/powershell-target/api/configuration/${id}/correlation-configuration`,
             method: 'POST',
             body: (configuration, current) => {
@@ -2697,9 +3867,9 @@
     function missingDependencies(configuration, systems) {
         const missing = (configuration.dependOnSystems ?? []).filter(d => !findDependency(d, systems));
         if (!missing.length) return '';
-        return '\n\nThe system depends on systems whose ID is not in this HelloID environment. They are left ' +
-               'out of "Depends on systems"; add them by hand when needed:\n' +
-               missing.map(d => `  - ${d.displayName ?? '?'} (ID ${d.systemId})`).join('\n');
+        return warn('\n\nThe system depends on systems whose ID is not in this HelloID environment. They are ' +
+                    'left out of "Depends on systems"; add them by hand when needed:\n' +
+                    missing.map(d => `  - ${d.displayName ?? '?'} (ID ${d.systemId})`).join('\n'));
     }
 
     // Is there a target system with this name already?
@@ -2993,8 +4163,8 @@
         };
         const unsendable = all.filter(n => n.notificationSystemId && !senderHere(n.notificationSystemId));
         const skipped = !unsendable.length ? ''
-            : '\n\nThese notifications of the file are not imported: what sends them (their notification ' +
-              'system) is not in this HelloID environment:\n' + unsendable.map(n => `  - ${n.name}`).join('\n');
+            : warn('\n\nThese notifications of the file are not imported: what sends them (their notification ' +
+                   'system) is not in this HelloID environment:\n' + unsendable.map(n => `  - ${n.name}`).join('\n'));
         const inFile = all.filter(n => !unsendable.includes(n))
             .map(n => ({ ...n, notificationSystemId: senderHere(n.notificationSystemId) }));
         const list = await fetchFromGateway(`${NOTIFICATIONS_PATH}?skip=0&take=${SETTINGS.fetchAllTake}` +
@@ -3090,7 +4260,7 @@
                     ...missing.filter(m => !(retrieving && m.entitlement.type === 'Permission'))
                         .map(m => `"${m.name}": ${entitlementLabel(m.entitlement)} is not an entitlement of the system`)];
                 return !lines.length ? ''
-                    : `\n\nNot linked in business rules:\n${lines.map(line => `  - ${line}`).join('\n')}`;
+                    : warn(`\n\nNot linked in business rules:\n${lines.map(line => `  - ${line}`).join('\n')}`);
             },
         };
 
@@ -3333,10 +4503,12 @@
         const keysOf = (...objects) => [...new Set(objects.flatMap(o => Object.keys(o ?? {})))];
         return keysOf(body, currentBody).flatMap(key => {
             if (key === 'mappingConfiguration') {
-                // By name and without the IDs, which an import changes
+                // By name and without the IDs, which an import changes. An
+                // empty value is the same as none: HelloID stores "" as null.
                 const withoutIds = ({ identifier, mappingActions, ...field }) => ({
                     ...field,
-                    mappingActions: (mappingActions ?? []).map(({ mappingActionId, ...action }) => action),
+                    mappingActions: (mappingActions ?? []).map(({ mappingActionId, ...action }) =>
+                        ({ ...action, value: action.value ?? '' })),
                 });
                 const fieldsOf = (c) => new Map((c.mappingConfiguration?.fields ?? []).map(f => [f.name, withoutIds(f)]));
                 const mine = fieldsOf(body);
@@ -3419,6 +4591,133 @@
         });
     }
 
+    // --- Import: the checklist of a migration to PowerShell v2 ---
+    // A system whose migration to PowerShell v2 is started has a
+    // checklist of what is to be converted: the mapping, the account
+    // scripts, and each permission set and resource (see the export for
+    // the migration). The import ticks a task off when the file says it
+    // converts it ("migration.checklist", as the handoff asks for), its
+    // scripts in the file don't look like v1 scripts any more, and
+    // HelloID has them after the import.
+    // When that leaves no task open, the import completes the migration,
+    // and then disables the system: HelloID may enable it again on
+    // completing (it was disabled for the migration), and nothing should
+    // run before the new scripts are tested.
+    const MIGRATION_CHECKLIST_PATH = (id) =>
+        `/connector/powershell-target/api/configuration/${id}/update-migration-checklist`;
+    const COMPLETE_MIGRATION_PATH = (id) =>
+        `/connector/powershell-target/api/configuration/${id}/complete-migration`;
+    const START_MIGRATION_PATH = (id) => `/connector/powershell-target/api/configuration/${id}/start-migration`;
+    const MIGRATION_DOCUMENTATION = 'https://docs.helloid.com/en/index-en.html?contextId=migrationpsv2';
+
+    // A PowerShell v2 file for a system that is still a v1 system: the
+    // import can start HelloID's migration of the system itself. That
+    // can't be undone, so it asks first, with the warning HelloID shows
+    // for its own button (the same texts, and its yellow Confirm).
+    // Resolves to true when the migration was started; false: cancelled.
+    const START_MIGRATION_QUESTION = 'Are you sure you want to start migrating the system?';
+    // Each as [before, in bold, after]
+    const START_MIGRATION_WARNINGS = [
+        ['The migration is ', 'irreversible', '.'],
+        ['The system is ', 'disabled', ' until the migration is completed.'],
+        ['', 'Manual', ' changes are required to complete the migration.'],
+        ['Existing configuration will be preserved.', '', ''],
+    ];
+
+    async function startMigration(system) {
+        const intro = `"${system.displayName}" is a PowerShell v1 system, and the file is for PowerShell v2. ` +
+                      'To import it, the migration of the system has to be started first.';
+        const backup = 'A backup of the current (v1) configuration is downloaded first.';
+
+        const content = document.createElement('div');
+        const paragraph = (text) => {
+            const p = document.createElement('p');
+            p.textContent = text;
+            content.appendChild(p);
+            return p;
+        };
+        paragraph(intro);
+        const list = document.createElement('ul');
+        START_MIGRATION_WARNINGS.forEach(([before, bold, after]) => {
+            const item = document.createElement('li');
+            const strong = document.createElement('strong');
+            strong.textContent = bold;
+            item.append(before, strong, after);
+            list.appendChild(item);
+        });
+        content.appendChild(list);
+        const link = document.createElement('a');
+        link.href = MIGRATION_DOCUMENTATION;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = 'documentation';
+        paragraph('').append('See the ', link, ' for more information.');
+        paragraph(backup);
+
+        const text = `${START_MIGRATION_QUESTION}\n\n${intro}\n\n` +
+            START_MIGRATION_WARNINGS.map(parts => `  - ${parts.join('')}`).join('\n') +
+            `\n\nSee the documentation for more information: ${MIGRATION_DOCUMENTATION}\n\n${backup}`;
+        if (!await showDialog(START_MIGRATION_QUESTION, text, {
+            confirm: true, content, confirmLabel: 'Confirm', confirmClass: 'btn-warning', confirmIcon: 'fa-solid fa-check',
+        })) {
+            return false;
+        }
+        await downloadBackup(system.displayName.trim());
+        await sendToGateway(START_MIGRATION_PATH(encodeURIComponent(system.systemId)), 'POST', {});
+        return true;
+    }
+    // What HelloID hands a v1 script, and a v2 script doesn't have
+    const V1_VARIABLE = new RegExp('\\$(configuration|person|manager|accountReference|managerAccountReference|' +
+                                   'permissionReference|operation|entitlementContext|dryRun)\\b', 'i');
+    const CHECKLIST_ACCOUNT_SCRIPTS = {
+        isCreateAccountScriptConverted: 'accountCreate',
+        isEnableAccountScriptConverted: 'accountEnable',
+        isUpdateAccountScriptConverted: 'accountUpdate',
+        isDisableAccountScriptConverted: 'accountDisable',
+        isDeleteAccountScriptConverted: 'accountDelete',
+    };
+
+    // The tasks of a checklist, each with:
+    //   label:   for the user
+    //   path:    where it is in the checklist
+    //   scripts: its scripts in the configuration (of the file)
+    //   differs: (changed parts, see changedParts) -> is that part of
+    //            the configuration another one than the system has?
+    function migrationTasks(checklist, configuration) {
+        const scriptsOf = (item) => Object.entries(item ?? {})
+            .filter(([key, value]) => /script$/i.test(key) && typeof value === 'string').map(([, value]) => value);
+        const named = (items, name) => (items ?? []).find(item => item?.displayName === name);
+        return [
+            {
+                label: 'Field configuration',
+                path: ['isMappingConfigConverted'],
+                scripts: [],
+                differs: (changes) => changes.some(c => c.startsWith(MAPPING_FIELD)),
+            },
+            ...Object.entries(CHECKLIST_ACCOUNT_SCRIPTS).filter(([key]) => key in checklist).map(([key, script]) => ({
+                label: `Account script ${script}`,
+                path: [key],
+                scripts: [configuration.scripts?.[script]].filter(value => typeof value === 'string'),
+                differs: (changes) => changes.includes(`scripts.${script}`),
+            })),
+            ...Object.keys(checklist.convertedPermissionDefinitions ?? {}).map(name => ({
+                label: `Permission set "${name}"`,
+                path: ['convertedPermissionDefinitions', name],
+                scripts: scriptsOf(named(configuration.permissions, name)),
+                differs: (changes) => changes.some(c => c.startsWith(`${PERMISSION_SET}"${name}"`)),
+            })),
+            ...Object.keys(checklist.convertedResourceScripts ?? {}).map(name => ({
+                label: `Resource "${name}"`,
+                path: ['convertedResourceScripts', name],
+                scripts: scriptsOf(named(configuration.resources, name)),
+                differs: (changes) => changes.some(c => c.startsWith(`${RESOURCE}"${name}"`)),
+            })),
+        ];
+    }
+
+    // Is the task at this path ticked off in a checklist?
+    const isTicked = (checklist, path) => path.reduce((value, key) => value?.[key], checklist) === true;
+
     // false: cancelled
     async function importSystem() {
         const text = await pickImportFile();
@@ -3487,12 +4786,33 @@
         const missing = missingDependencies(data.configuration, systems);
         let system = systems.find(s => s?.systemId === systemId);
         const created = !system;
+        // A file for a migration is for the system it was made from, and
+        // never makes a new one
+        const fileChecklist = isPlainObject(data.migration?.checklist) ? data.migration.checklist : null;
+        if (created && fileChecklist) {
+            throw new Error(`The file is for the migration of "${fileName}" (ID ${systemId}), but this HelloID ` +
+                            'environment has no target system with that ID. Nothing was imported, and no new ' +
+                            'system was made: the system ID in the file has to be that of the system to migrate.');
+        }
         if (created) system = await createSystemFor(data, fileName, systemId, steps, systems);
         if (!system) return false; // cancelled
+        // A v2 file for a v1 system: its migration is started first, when
+        // the user confirms that (see startMigration)
+        const migrationStarted = system.templateIdentifier === POWERSHELL_V1 &&
+                                 data.templateIdentifier === POWERSHELL_V2;
+        if (migrationStarted) {
+            if (!await startMigration(system)) return false;
+            system = { ...system, templateIdentifier: POWERSHELL_V2 };
+        }
         if (system.templateIdentifier !== data.templateIdentifier) {
             throw new Error(`The file is of a system of type "${data.templateIdentifier}", ` +
                             `but "${system.displayName}" is of type "${system.templateIdentifier}".`);
         }
+        // For the messages from here on: starting it is not undone by
+        // stopping the import
+        const startedNote = !migrationStarted ? ''
+            : `\n\nThe migration of "${system.displayName}" to PowerShell v2 was started just now. It stays ` +
+              'started, and the system disabled, also when the import is cancelled or fails.';
 
         const id = encodeURIComponent(system.systemId);
         const currentPath = CONNECTOR_EXPORTS[system.templateIdentifier]?.(id).configuration;
@@ -3526,8 +4846,9 @@
             ...(Array.isArray(data.configuration.dependOnSystems)
                 ? { dependOnSystems: resolveDependencies(data.configuration, systems) } : {}),
             // A new system starts disabled, whatever the file says, so it
-            // does nothing before it has been checked
-            ...(created ? { isDisabled: true } : {}),
+            // does nothing before it has been checked. So does a system
+            // whose migration is open: HelloID keeps it disabled.
+            ...(created || isPlainObject(current.migrationStatus) ? { isDisabled: true } : {}),
         };
         const { requests: newNotifications, skipped: notificationsSkipped } =
             await notificationRequests(data, systemId, system);
@@ -3541,14 +4862,34 @@
         // Everything that differs, and which of it a known request can write
         // (a part that several requests send is listed with the first one)
         const importable = new Set();
-        const work = steps.map(step => {
+        const applicable = steps.filter(step => step.applies?.(configuration) ?? true);
+        const work = applicable.map(step => {
             const changes = (step.changes?.(configuration, current) ??
                              changedParts(step.body(configuration, current, systems), step.body(current, current, systems)))
                 .filter(c => !importable.has(c));
             changes.forEach(c => importable.add(c));
             return { step, changes };
         }).filter(w => w.changes.length);
-        const others = changedParts(configuration, current).filter(c => !importable.has(c));
+        // (the state of a migration is HelloID's own, not a part to import)
+        const others = changedParts(configuration, current)
+            .filter(c => !importable.has(c) && c !== 'migrationStatus');
+
+        // An open migration: the tasks of its checklist that the file
+        // says it converts. Those whose scripts still look like v1
+        // scripts are left open.
+        const openChecklist = isPlainObject(current.migrationStatus?.checklist) && fileChecklist
+            ? current.migrationStatus.checklist : null;
+        const claimed = !openChecklist ? [] : migrationTasks(openChecklist, configuration)
+            .filter(task => isTicked(fileChecklist, task.path) && !isTicked(openChecklist, task.path));
+        const stillV1 = claimed.filter(task => task.scripts.some(script => V1_VARIABLE.test(script)));
+        const tickable = claimed.filter(task => !stillV1.includes(task));
+        const leftOpen = !stillV1.length ? ''
+            : warn('\n\nNot ticked off in the migration checklist, as the file says they are converted but their ' +
+                   'scripts still use PowerShell v1 variables ($person, $dryRun, ...):\n' +
+                   stillV1.map(task => `  - ${task.label}`).join('\n'));
+        // The migration can be completed when that leaves no task open
+        const mayComplete = Boolean(openChecklist) && migrationTasks(openChecklist, configuration)
+            .every(task => isTicked(openChecklist, task.path) || tickable.some(t => t.label === task.label));
 
         // A new name must not be in use by another system: stop right here
         if (!created && importable.has('displayName') && typeof configuration.displayName === 'string' &&
@@ -3559,23 +4900,24 @@
 
         const from = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ` +
                      `${data.exportedAt ?? '?'}`;
-        const skipped = (notCompared ? `\n\nResources were not compared: ${notCompared}.` : '') + missing +
+        const skipped = warn(notCompared ? `\n\nResources were not compared: ${notCompared}.` : '') + missing +
                         notificationsSkipped + ruleWork.skipped;
         const describe = (title, changes) => `${title}:\n` + changes.map(c => `  - ${c}`).join('\n');
-        const unsupported = others.length ? `\n\n${describe('Not importable, left as is', others)}` : '';
-        if (!work.length && !newNotifications.length && !ruleDrafts.length) {
+        const unsupported = warn(others.length ? `\n\n${describe('Not importable, left as is', others)}` : '');
+        if (!work.length && !newNotifications.length && !ruleDrafts.length && !tickable.length && !mayComplete) {
             await showDialog('Import', `${from}\n\n` + (created ? `Created "${system.displayName}". ` : '') +
                 (others.length
                     ? `Nothing to import into "${system.displayName}".${unsupported}`
-                    : `"${system.displayName}" already has the configuration of the file.`) + skipped);
+                    : `"${system.displayName}" already has the configuration of the file.`) + skipped + leftOpen +
+                startedNote);
             return true;
         }
 
         // What to send: the steps with changes, plus, when the mapping is
         // replaced, the steps that point at mapping fields (new IDs)
         const replacesMapping = work.some(w => w.step.resetsFieldIds);
-        const plan = steps.filter(step => work.some(w => w.step === step) ||
-                                          (replacesMapping && step.usesFieldIds));
+        const plan = applicable.filter(step => work.some(w => w.step === step) ||
+                                               (replacesMapping && step.usesFieldIds));
         const parts = plan.map(step => {
             const changes = work.find(w => w.step === step)?.changes;
             const title = step.name + (step.note ? ` (${step.note})` : '');
@@ -3589,6 +4931,23 @@
             parts.push(describe('Business rules (saved as DRAFTS, not published: publish them yourself in HelloID)',
                 ruleDrafts.flatMap(r => r.changes)));
         }
+        if (tickable.length) {
+            parts.push(describe('Migration checklist (ticked off at the end, for what HelloID then has of the file)',
+                tickable.map(task => task.label)));
+        }
+        if (mayComplete) {
+            parts.push(describe('Migration to PowerShell v2', [
+                'COMPLETED when all the requests above succeed and no task of the checklist is left open. ' +
+                'This cannot be undone.',
+                strong('the system is then DISABLED, also when it was enabled before the migration: enable it ' +
+                       'yourself once you have tested the scripts'),
+            ]));
+        } else if (openChecklist) {
+            parts.push(warn(describe('Migration to PowerShell v2', [
+                'NOT completed: tasks of its checklist stay open. The system stays disabled until you ' +
+                'complete the migration in HelloID.',
+            ])));
+        }
 
         // Build every request once before sending any, so a problem in the
         // file stops the import before anything is changed. (After the
@@ -3600,13 +4959,22 @@
         // A system that was just made was confirmed already, and has
         // nothing to back up
         if (!created) {
-            if (!await showDialog('Import', `${from}\n\nThis will overwrite in, or add to, "${system.displayName}":\n\n` +
-                                  `${parts.join('\n\n')}${unsupported}${skipped}\n\n` +
-                                  'A backup of the current configuration is downloaded first.', { confirm: true })) {
+            if (!await showDialog('Import', `${from}${startedNote}\n\n` +
+                                  `This will overwrite in, or add to, "${system.displayName}":\n\n` +
+                                  `${parts.join('\n\n')}${unsupported}${skipped}${leftOpen}\n\n` +
+                                  (migrationStarted ? 'The backup was downloaded before the migration was started.'
+                                      : 'A backup of the current configuration is downloaded first.'),
+                                  { confirm: true })) {
                 return false;
             }
-            await downloadBackup(system.displayName.trim());
+            // (a migration that was just started: the backup is of before that)
+            if (!migrationStarted) await downloadBackup(system.displayName.trim());
         }
+
+        // What the last steps find out, for each other and for the message
+        let checklistNote = '';
+        let checklistDone = mayComplete && !tickable.length; // nothing to tick: it is done already
+        let migrationCompleted = false;
 
         // Send, in order, showing each request and how it went; the first
         // error stops the import
@@ -3615,6 +4983,61 @@
             ...plan.flatMap(step => step.requests?.(configuration, current) ?? [...(step.before ?? []), step]),
             ...newNotifications,
             ...ruleDrafts,
+            // Last, so it is only reached when everything was imported:
+            // ticks off what HelloID now has as the file has it
+            ...(!tickable.length ? [] : [{
+                name: 'Migration checklist',
+                run: async (systemId) => {
+                    const now = await loadCurrent();
+                    const checklist = structuredClone(now.migrationStatus?.checklist ?? null);
+                    if (!isPlainObject(checklist)) throw new Error('HelloID has no open migration for the system (any more).');
+                    const changes = changedParts(configuration, now);
+                    const done = tickable.filter(task => !task.differs(changes));
+                    done.forEach(({ path }) => {
+                        path.slice(0, -1).reduce((value, key) => value[key], checklist)[path.at(-1)] = true;
+                    });
+                    if (done.length) await sendToGateway(MIGRATION_CHECKLIST_PATH(systemId), 'POST', checklist);
+
+                    const list = (tasks) => tasks.map(task => `  - ${task.label}`).join('\n');
+                    const differing = tickable.filter(task => !done.includes(task));
+                    const open = migrationTasks(checklist, configuration).filter(task => !isTicked(checklist, task.path));
+                    checklistNote = (done.length ? `\n\nTicked off in the migration checklist:\n${list(done)}` : '') +
+                        error(differing.length ? '\n\nNot ticked off, as HelloID does not have them as they are in the ' +
+                                            `file:\n${list(differing)}\n  What differs: ` +
+                                            changes.filter(c => differing.some(task => task.differs([c]))).join(', ')
+                            : '') +
+                        error(open.length ? `\n\nStill open in the migration checklist:\n${list(open)}` : '');
+                    checklistDone = open.length === 0;
+                },
+            }]),
+            // Then the migration itself, when no task is left open, and
+            // right after it the system is disabled (HelloID may have
+            // enabled it again)
+            ...(!mayComplete ? [] : [
+                {
+                    name: 'Complete the migration',
+                    when: () => checklistDone,
+                    run: async (systemId) => {
+                        await sendToGateway(COMPLETE_MIGRATION_PATH(systemId), 'POST', {});
+                        migrationCompleted = true;
+                    },
+                },
+                {
+                    name: 'Disable the system',
+                    when: () => migrationCompleted,
+                    run: async (systemId) => {
+                        try {
+                            const now = await loadCurrent();
+                            await sendToGateway(`/connector/powershell-target/api/configuration/${systemId}/general`,
+                                'POST', { ...Object.fromEntries(GENERAL_FIELDS.map(f => [f, now[f]])), isDisabled: true });
+                            if ((await loadCurrent()).isDisabled !== true) throw new Error('HelloID still shows it as enabled.');
+                        } catch (e) {
+                            throw new Error('The migration is COMPLETED, but the system could not be disabled. ' +
+                                            `Check it in HelloID NOW, and disable it there.\n${e?.message ?? e}`);
+                        }
+                    },
+                },
+            ]),
         ];
         const first = created ? 1 : 0; // a new system: it was made before this
         const progress = showProgress(
@@ -3640,11 +5063,11 @@
         } catch (e) {
             console.warn('[HelloID UX] Import failed', e);
             progress.set(index, 'failed');
-            await progress.finish(`Import failed: ${e?.message ?? e}\n\n` +
+            await progress.finish(`${error(`Import failed: ${e?.message ?? e}`)}\n\n` +
                 (index > first ? 'The steps before it were done; the ones after it were not. '
                     : created ? 'Only the new system was made. ' : 'Nothing was changed. ') +
                 (created ? 'The new system is in the list of target systems.'
-                    : 'The backup file has the configuration from before the import.'));
+                    : 'The backup file has the configuration from before the import.') + startedNote);
             // Already shown to the user
             throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
         }
@@ -3662,7 +5085,15 @@
               'them in HelloID (Business rules; they are marked as having a draft).';
         const disabled = !created ? ''
             : '\n\nThe new system is DISABLED. Check it, and enable it yourself when it is ready.';
-        await progress.finish(`Import finished.${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}\n\n` +
+        const migrationNote = !openChecklist ? ''
+            : migrationCompleted
+                ? '\n\nThe migration to PowerShell v2 is COMPLETED.\n' +
+                  strong('The system is DISABLED, so that nothing runs before the new scripts are tested. It ' +
+                         'stays disabled until you enable it yourself: test each script with its preview first.')
+                : error('\n\nThe migration to PowerShell v2 is NOT completed, as tasks of its checklist are still ' +
+                       'open. Do those in HelloID and complete the migration there. The system stays disabled ' +
+                       'until then.');
+        await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}\n\n` +
                               'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
@@ -3728,12 +5159,8 @@
     // The system as it is now, saved as a normal download (no save dialog:
     // that needs a click of its own)
     async function downloadBackup(name) {
-        const json = JSON.stringify(await collectSystemExport(name), null, 2);
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-        link.download = exportFileName(`${name} - backup before import`, name);
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+        downloadFile(JSON.stringify(await collectSystemExport(name), null, 2),
+            exportFileName(`${name} - backup before import`, name));
     }
 
     async function sendToGateway(path, method, body) {
@@ -3781,7 +5208,7 @@
             } catch (err) {
                 if (!err?.shown) console.warn('[HelloID UX] Import failed', err);
                 result = 'fa-solid fa-xmark';
-                if (!err?.shown) await showDialog('Import failed', String(err?.message ?? err));
+                if (!err?.shown) await showDialog('Import failed', error(String(err?.message ?? err)));
             }
             icon.className = result;
             btn.disabled = false;
@@ -3839,7 +5266,8 @@
 
         pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'),
             createExportButton(() => row.name),
-            createExportButton(() => row.name, undefined, EXPORT_KINDS.granted), configure);
+            createExportButton(() => row.name, undefined, EXPORT_KINDS.granted),
+            createExportButton(() => row.name, undefined, EXPORT_KINDS.migration), configure);
 
         // Summary since, Last updated, Actions, ...
         model.infoLabels.forEach(label => {
@@ -4691,6 +6119,12 @@
             overflow-wrap: anywhere;
             user-select: text;
         }
+        /* Errors in the message (see error); warnings are only bold */
+        .${DIALOG_CLASS} .tm-error { color: #c9302c; }
+        /* Content of its own instead of a message (see showDialog) */
+        .tm-dialog-content { flex: 1; min-height: 0; overflow: auto; }
+        .tm-dialog-content ul { padding-left: 20px; }
+        .tm-dialog-content li { margin: 6px 0; }
         .tm-dialog-footer { display: flex; gap: 8px; }
         /* Copy: the color of the main button, lighter */
         .tm-dialog-copy { opacity: .55; }
