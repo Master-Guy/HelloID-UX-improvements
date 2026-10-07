@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-05.2
+// @version      2026-10-07.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -39,7 +39,7 @@
 
         // Entitlements tab: wait this long after the last filter click
         // before reloading, so several buttons can be set in one go.
-        filterReloadDelayMs: 1500,
+        filterReloadDelayMs: 1000,
 
         // Copy buttons: how long the check/cross is shown after copying
         copyFeedbackMs: 1000,
@@ -241,9 +241,9 @@
     // =====================================================================
 
     const ButtonStatus = Object.freeze({
-        UNKNOWN:  'unknown',   // don't filter on this entitlement
-        ENABLED:  'enabled',   // only rules WITH this entitlement
-        DISABLED: 'disabled',  // only rules WITHOUT this entitlement
+        UNKNOWN:  'unknown',   // not filtering
+        ENABLED:  'enabled',   // only the rows that have it
+        DISABLED: 'disabled',  // only the rows that don't have it (Persons > Rules)
     });
 
     const statusOrder = Object.values(ButtonStatus);
@@ -288,22 +288,20 @@
         sessionSet(FILTER_STATE_KEY, state);
     }
 
+    // Per filter key: true when on
     const filterState = loadState();
-    const statusOf = (key) => filterState[key] || ButtonStatus.UNKNOWN;
+    const isFilterOn = (key) => filterState[key] === true;
 
     function nextStatus(current) {
         const i = statusOrder.indexOf(current);
         return statusOrder[(i + 1) % statusOrder.length];
     }
 
+    // No filter on: all rules. Otherwise the rules with an entitlement of
+    // any of the filters that are on.
     function matchesFilters(rule) {
-        return FILTERS.every(f => {
-            switch (statusOf(f.key)) {
-                case ButtonStatus.ENABLED:  return rule[f.field] === true;
-                case ButtonStatus.DISABLED: return rule[f.field] === false;
-                default:                    return true;
-            }
-        });
+        const active = FILTERS.filter(f => isFilterOn(f.key));
+        return !active.length || active.some(f => rule[f.field] === true);
     }
 
     // =====================================================================
@@ -379,6 +377,16 @@
         {
             pattern: new RegExp('/provisioning-api/api/target-systems([?]|$)'),
             onData: (systems) => rememberSystemIds(systems),
+        },
+        // Source systems: the IDs of the systems (for the links to their pages)
+        {
+            pattern: new RegExp('/provisioning-api/api/source-systems([?]|$)'),
+            onData: (systems) => rememberIds(sourceSystemIds, systems),
+        },
+        // Notification systems: the same
+        {
+            pattern: new RegExp('/notifications/api/notification/systems([?]|$)'),
+            onData: (systems) => rememberIds(notificationSystemIds, systems),
         },
     ];
     const watchFor = (url) => WATCHES.find(w => w.pattern.test(url));
@@ -695,7 +703,7 @@
     }
 
     // Reload after a short pause, so you can click the buttons several times
-    // to set the statuses you want before the data is fetched again.
+    // to set the filters you want before the data is fetched again.
     // Every click (on any of the three buttons) restarts the timer.
     let reloadTimer;
     function scheduleReload() {
@@ -715,8 +723,8 @@
         btn.appendChild(icon);
 
         const render = () => {
-            btn.dataset.status = statusOf(filter.key);
-            icon.style.color = statusColor[btn.dataset.status];
+            const on = isFilterOn(filter.key);
+            icon.style.color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
         };
         render();
 
@@ -725,7 +733,8 @@
             e.preventDefault();
             e.stopPropagation();
 
-            filterState[filter.key] = nextStatus(statusOf(filter.key));
+            if (isFilterOn(filter.key)) delete filterState[filter.key];
+            else filterState[filter.key] = true;
             saveState(filterState);
             render();
             scheduleReload();
@@ -1082,6 +1091,128 @@
         return btn;
     }
 
+    // --- Buttons that open a page: as links ---
+    // Some of HelloID's buttons open a page (Configure on a system's tile,
+    // the wrench of a rule): as buttons, they can only do so in the same
+    // tab. Ours is a link to that page, like HelloID's own links (e.g.
+    // "Edit rule"), so the browser's own ways work on it: Ctrl+click, the
+    // middle mouse button, and "Open in new tab" in its menu. A normal
+    // click does what HelloID's button does (openHere), without loading
+    // the page again. HelloID's button stays on the page, hidden.
+    // The address of each page is built here, as a button doesn't have one:
+    //   target system: #/target/systems/<type>/configuration/edit/<id>
+    //   source system: #/source/systems/edit/<id>
+    //   notification system: #/notifications/systems/edit/<id>
+    //   business rule: #/business/rules/edit/<id>
+    const PAGE_LINK_CLASS = 'tm-page-link';
+
+    const systemUrl = (name) => {
+        const system = systemEntries.get(name);
+        return system?.systemId && system.templateIdentifier
+            ? `#/target/systems/${encodeURIComponent(system.templateIdentifier)}/configuration/edit/` +
+              encodeURIComponent(system.systemId)
+            : null;
+    };
+
+    // Source systems and notification systems: their IDs by name, from
+    // HelloID's own lists of them (see WATCHES). Each apart, and apart
+    // from the target systems: systems of two kinds may have the same name.
+    const sourceSystemIds = new Map();
+    const notificationSystemIds = new Map();
+
+    function rememberIds(ids, systems) {
+        if (!Array.isArray(systems)) return;
+        systems.forEach(s => {
+            if (typeof s?.displayName === 'string' && s.systemId) ids.set(s.displayName.trim(), s.systemId);
+        });
+    }
+
+    // The tiles of those systems, and the page Configure opens
+    const TILE_LINKS = [
+        { tile: 'helloid-source-system-tile', ids: sourceSystemIds, page: '#/source/systems/edit/' },
+        { tile: 'helloid-notification-system-tile', ids: notificationSystemIds, page: '#/notifications/systems/edit/' },
+    ];
+
+    // getUrl is called when the link is about to be used: HelloID may
+    // reuse a tile or a row for another item, and the IDs may come in
+    // later. Without an address (yet), the link only does what the button did.
+    function createPageLink(getUrl, className, openHere, title = 'Configure') {
+        const link = document.createElement('a');
+        link.className = `${className} ${PAGE_LINK_CLASS}`;
+        link.title = title;
+        link.setAttribute('role', 'button');
+        link.style.cursor = 'pointer';
+        link.innerHTML = '<i aria-hidden="true" class="fa-solid fa-wrench"></i>';
+
+        const setHref = () => {
+            const url = getUrl();
+            if (!url) link.removeAttribute('href');
+            else if (link.getAttribute('href') !== url) link.setAttribute('href', url);
+        };
+        setHref();
+        ['pointerenter', 'focus', 'mousedown', 'contextmenu'].forEach(type => link.addEventListener(type, setHref));
+        // Keep the clicks away from the tile/row
+        ['mousedown', 'auxclick'].forEach(type => link.addEventListener(type, (e) => e.stopPropagation()));
+        link.addEventListener('click', (e) => {
+            e.stopPropagation();
+            // With a modifier key: the browser opens the link its own way
+            if (link.hasAttribute('href') && (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey)) return;
+            e.preventDefault();
+            openHere();
+        });
+        return link;
+    }
+
+    // Hides one of HelloID's buttons, and puts our link in its place
+    function replaceWithPageLink(button, getUrl, title) {
+        button.style.display = 'none';
+        button.after(createPageLink(getUrl, button.className, () => button.click(), title));
+    }
+
+    // Source and notification systems: Configure on the tiles
+    function addTileLinks() {
+        TILE_LINKS.forEach(({ tile: selector, ids, page }) => {
+            document.querySelectorAll(selector).forEach(tile => {
+                if (tile.querySelector(`.${PAGE_LINK_CLASS}`)) return;
+                const configureBtn = tile.querySelector('button[title="configure" i]');
+                if (!configureBtn) return;
+                const name = () => {
+                    const heading = tile.querySelector('h5.card-title');
+                    return (heading?.title || heading?.textContent || '').trim();
+                };
+                replaceWithPageLink(configureBtn, () => {
+                    const id = ids.get(name());
+                    return id ? `${page}${encodeURIComponent(id)}` : null;
+                });
+            });
+        });
+    }
+
+    // Target system > Entitlements tab and Persons > Rules tab: the wrench
+    // of each rule. The rule of a row comes from the grid, at the moment
+    // the link is used.
+    function addRuleLinks() {
+        const personRules = location.hash.includes(PERSON_RULES_ROUTE);
+        if (!isEntitlementsPage() && !personRules) return;
+        document.querySelectorAll(`${AG_GRIDS} helloid-ag-template-renderer button`).forEach(button => {
+            if (!button.querySelector('i.fa-wrench') || button.parentElement.querySelector(`.${PAGE_LINK_CLASS}`)) return;
+            // (Persons has more grids: only the one with the rules)
+            if (personRules && !hasHeader(button.closest(AG_GRIDS), PERSON_RULES_GRID)) return;
+            replaceWithPageLink(button, () => {
+                const index = parseInt(button.closest('[role="row"]')?.getAttribute('row-index'), 10);
+                const grid = button.closest(AG_GRIDS);
+                const ruleId = Number.isNaN(index) || !grid ? null
+                    : findGridApi(grid)?.getDisplayedRowAtIndex?.(index)?.data?.ruleId;
+                return ruleId ? `#/business/rules/edit/${encodeURIComponent(ruleId)}` : null;
+            }, 'Edit rule');
+        });
+    }
+
+    function addPageLinks() {
+        addTileLinks();
+        addRuleLinks();
+    }
+
     // --- Target systems overview: tiles (copy and export buttons) ---
     function addSystemTileCopyButtons() {
         document.querySelectorAll('helloid-provisioning-system-tile').forEach(tile => {
@@ -1098,9 +1229,13 @@
                 createExportButton(name, configureBtn.className, EXPORT_KINDS.granted),
                 createExportButton(name, configureBtn.className, EXPORT_KINDS.migration),
             );
+            // HelloID's own Configure button is hidden, and stands in for
+            // a normal click on our link (see createPageLink)
+            replaceWithPageLink(configureBtn, () => systemUrl(name()));
         });
         // (HelloID may have put another system in a tile)
         refreshExportButtons();
+        updateRuleFlags();
     }
 
     // --- Business rules: name columns in grids ---
@@ -1229,7 +1364,11 @@
     const VIEW_KEY = 'systemsView'; // 'list' or 'tiles'
 
     // Shorter column headers for some of the tile's labels
-    const LABEL_RENAMES = { 'Actions completed': 'Actions' };
+    const LABEL_RENAMES = {};
+
+    // Labels of the tile that get no column: "Actions completed" is the
+    // same number as the total of the recent actions (the (i) column)
+    const HIDDEN_LABELS = new Set(['Actions completed']);
 
     // Starting widths (px); the name column takes the remaining space,
     // but never less than nameMin. The info columns (Summary since, ...)
@@ -1237,7 +1376,7 @@
     const COLUMN_WIDTHS = { nameMin: 250, info: 40, progress: 120, action: 45 };
 
     // Info columns shown centered, without "..." (after LABEL_RENAMES)
-    const CENTERED_LABELS = new Set(['Actions']);
+    const CENTERED_LABELS = new Set();
 
     // Recent action columns: order and header icon. The tiles use the same
     // icon for several actions; these tell them apart. Actions not listed
@@ -1258,9 +1397,15 @@
     // Symbols HelloID shows next to a system's name. Each gets a filter
     // button in the Name header: grey = off, black = only systems with
     // that symbol (same colors as the Entitlements filters). With several
-    // on, a system needs all of them.
+    // on, a system needs any of them.
+    // The last two are our own symbols (see "Warnings about business
+    // rules"): text instead of an icon class.
     const SYSTEM_FLAGS = [
         { key: 'warning',  icon: 'fa-solid fa-warning',   match: '.fa-warning',   label: 'systems with warnings' },
+        { key: 'v1',       text: '⛓️‍💥', match: '.tm-flag-v1',
+            label: 'PowerShell v1 systems that business rules still use' },
+        { key: 'unused',   text: '🏁', match: '.tm-flag-unused',
+            label: 'enabled systems that no business rule uses' },
         { key: 'disabled', icon: 'fa-solid fa-power-off', match: '.fa-power-off', label: 'disabled systems' },
     ];
     const FLAG_FILTERS_KEY = 'tm-helloid-system-flags'; // in sessionStorage
@@ -1276,7 +1421,7 @@
         return SYSTEM_FLAGS.filter(f => extras?.querySelector(f.match)).map(f => f.key);
     }
 
-    const matchesFlags = (flags, active) => active.every(k => flags.includes(k));
+    const matchesFlags = (flags, active) => !active.length || active.some(k => flags.includes(k));
 
     // Sortable columns: the name, and these info columns (dates). Each has
     // a sort button in its header: an up-down arrows icon (not sorted on this column), ▼ or ▲.
@@ -1419,6 +1564,134 @@
     const isListView = () => GM_getValue(VIEW_KEY, 'list') === 'list';
     const uniqueBy = (arr, key) => [...new Map(arr.map(x => [key(x), x])).values()];
 
+    // --- Warnings about business rules ---
+    // Two symbols of our own next to a system's name, where HelloID shows
+    // its warnings:
+    //   v1:     a PowerShell v1 system (deprecated) that business rules
+    //           still have entitlements of: those rules need another system
+    //   unused: an enabled system that no business rule has an entitlement
+    //           of: it can be disabled or removed
+    // They are put on the tiles; the list copies the symbols of the tiles,
+    // and the filter buttons find them there (see SYSTEM_FLAGS).
+    // The number of rules comes from HelloID's overview of the rules of a
+    // system: one request per system, a few at a time, in the background.
+    // The numbers are kept as long as the grids' cache, also when going
+    // to other pages and back.
+    const RULE_FLAG_CLASS = 'tm-system-flag';
+    const systemRules = new Map(); // system ID -> { count (null: could not be read), time }
+    const rulesProgress = { loading: false, pending: 0 };
+
+    const tileName = (tile) => tile.querySelector('h5.system-header')?.textContent.trim() ?? '';
+    const tileExtras = (tile) => tile.querySelector('h5.system-header')?.parentElement?.nextElementSibling;
+
+    // Reads the numbers that are missing or old, for the systems on the page
+    async function loadSystemRules() {
+        if (!gateway || rulesProgress.loading) return;
+        rulesProgress.loading = true;
+        try {
+            // Until nothing is left: HelloID may add tiles meanwhile
+            while (await loadSystemRulesOnce());
+        } finally {
+            rulesProgress.loading = false;
+            rulesProgress.pending = 0;
+            updateRulesInfo();
+        }
+    }
+
+    let systemsListRead = 0; // when we last read the list of systems ourselves
+
+    // false: nothing to read (any more)
+    async function loadSystemRulesOnce() {
+        const isOld = (system) => {
+            const known = systemRules.get(system.systemId);
+            return !known || Date.now() - known.time > CACHE_MAX_AGE_MS;
+        };
+        const names = [...document.querySelectorAll(SYSTEM_TILE)].map(tileName).filter(Boolean);
+        // Systems on the page that HelloID's own list of systems didn't
+        // have (it may come in parts): read the whole list
+        if (names.some(name => !systemEntries.has(name)) && Date.now() - systemsListRead > CACHE_MAX_AGE_MS) {
+            systemsListRead = Date.now();
+            await fetchSystems().catch(e => console.warn('[HelloID UX] Could not read the list of systems', e));
+        }
+        const systems = uniqueBy(names.map(name => systemEntries.get(name)).filter(s => s?.systemId), s => s.systemId)
+            .filter(isOld);
+        if (!systems.length) return false;
+
+        rulesProgress.pending = systems.length;
+        updateRulesInfo();
+        for (let i = 0; i < systems.length; i += USED_BY_BATCH) {
+            await Promise.all(systems.slice(i, i + USED_BY_BATCH).map(async (system) => {
+                let count = null;
+                try {
+                    const overview = await fetchFromGateway(
+                        `/api/connectors/shared/rules/published/${encodeURIComponent(system.systemId)}` +
+                        `/entitlements-overview?skip=0&take=${SETTINGS.fetchAllTake}`);
+                    // Only the rules that have an entitlement for this system
+                    count = (overview.pageData ?? [])
+                        .filter(r => RULE_ENTITLEMENT_FIELDS.some(f => r[f] === true)).length;
+                } catch (e) {
+                    console.warn(`[HelloID UX] Could not read the business rules of "${system.displayName}"`, e);
+                }
+                systemRules.set(system.systemId, { count, time: Date.now() });
+                rulesProgress.pending--;
+            }));
+            updateRulesInfo();
+            updateRuleFlags(); // the list follows the tiles
+        }
+        return true;
+    }
+
+    // Next to the number of systems: how many are still being checked
+    function updateRulesInfo() {
+        if (!systemList) return;
+        const { pending } = rulesProgress;
+        setText(systemList.checking, pending > 0
+            ? `Checking the business rules of ${pending} more system${pending === 1 ? '' : 's'}...` : '');
+    }
+
+    // Which of our symbols a tile should have: key -> text on hover
+    function ruleFlagsFor(tile) {
+        const system = systemEntries.get(tileName(tile));
+        const count = systemRules.get(system?.systemId)?.count;
+        if (typeof count !== 'number') return {};
+        if (count > 0) {
+            return system.templateIdentifier !== POWERSHELL_V1 ? {} : {
+                v1: `PowerShell v1 system (deprecated) that ${count} business rule${count === 1 ? ' still has' : 's still have'} ` +
+                    'entitlements of. Migrate it to PowerShell v2, or take it out of those rules.',
+            };
+        }
+        const disabled = tileExtras(tile)?.querySelector('.fa-power-off');
+        return disabled ? {} : {
+            unused: 'No business rule has an entitlement of this system. Disable or remove it when it is no longer needed.',
+        };
+    }
+
+    // Puts our symbols on the tiles, and takes away the ones that no
+    // longer apply. Only touches the page when something differs.
+    function updateRuleFlags() {
+        document.querySelectorAll(SYSTEM_TILE).forEach(tile => {
+            const extras = tileExtras(tile);
+            if (!extras) return;
+            const wanted = ruleFlagsFor(tile);
+            SYSTEM_FLAGS.filter(f => f.text).forEach(flag => {
+                let symbol = extras.querySelector(flag.match);
+                const title = wanted[flag.key];
+                if (!title) {
+                    symbol?.remove();
+                    return;
+                }
+                if (!symbol) {
+                    symbol = document.createElement('span');
+                    symbol.className = `${RULE_FLAG_CLASS} ${flag.match.slice(1)}`;
+                    symbol.textContent = flag.text;
+                    symbol.style.cursor = 'default';
+                    extras.appendChild(symbol);
+                }
+                if (symbol.title !== title) symbol.title = title;
+            });
+        });
+    }
+
     // Everything shown on a tile, read from its DOM
     function readTile(tile) {
         const nameEl = tile.querySelector('h5.system-header');
@@ -1478,7 +1751,8 @@
             return i === -1 ? ACTION_COLUMNS.length : i;
         };
         return {
-            infoLabels: [...new Set(rows.flatMap(r => r.info.map(i => i.label)))],
+            infoLabels: [...new Set(rows.flatMap(r => r.info.map(i => i.label)))]
+                .filter(label => !HIDDEN_LABELS.has(label)),
             // Sorted like ACTION_COLUMNS (stable, so unknown actions keep
             // the tiles' order), with our icons
             actions: uniqueBy(rows.flatMap(r => r.actions), a => a.name)
@@ -1653,7 +1927,7 @@
         const nameTh = th('Name');
         nameTh.dataset.sortKey = NAME_SORT_KEY;
         pinButtons(nameTh, ...SYSTEM_FLAGS.map(createFlagButton), createSortButton(NAME_SORT_KEY));
-        nameTh.style.paddingRight = '140px'; // room for the buttons with their counts
+        nameTh.style.paddingRight = '140px'; // room for the buttons; set to what they need in applySystemsView()
         headRow.appendChild(nameTh);
         model.infoLabels.forEach(l => {
             const label = LABEL_RENAMES[l] ?? l;
@@ -1691,7 +1965,8 @@
         btn.className = 'btn btn-default btn-xs';
         btn.dataset.flag = flag.key;
         const icon = document.createElement('i');
-        icon.className = flag.icon;
+        if (flag.icon) icon.className = flag.icon;
+        else Object.assign(icon, { textContent: flag.text }).style.fontStyle = 'normal';
         btn.append(icon, ' ', document.createElement('span'));
         btn.addEventListener('mousedown', (e) => e.stopPropagation());
         btn.addEventListener('click', (e) => {
@@ -5254,13 +5529,9 @@
             nameCell.appendChild(extras);
         }
 
-        // Configure: clicks the tile's own button, so HelloID handles it
-        const configure = document.createElement('button');
-        configure.type = 'button';
-        configure.className = 'btn btn-default btn-xs';
-        configure.title = 'Configure';
-        configure.innerHTML = '<i aria-hidden="true" class="fa-solid fa-wrench"></i>';
-        configure.addEventListener('click', () => {
+        // Configure: a link (see createPageLink); a normal click
+        // clicks the tile's own button, so HelloID handles it
+        const configure = createPageLink(() => systemUrl(row.name), 'btn btn-default btn-xs', () => {
             findTileByName(row.name)?.querySelector('button[title="Configure" i]')?.click();
         });
 
@@ -5269,7 +5540,7 @@
             createExportButton(() => row.name, undefined, EXPORT_KINDS.granted),
             createExportButton(() => row.name, undefined, EXPORT_KINDS.migration), configure);
 
-        // Summary since, Last updated, Actions, ...
+        // Summary since, Last updated, ...
         model.infoLabels.forEach(label => {
             const value = row.info.find(i => i.label === label)?.value ?? '';
             const cell = td(value);
@@ -5353,12 +5624,30 @@
             const n = flagCounts[flag.key] ?? 0;
             const color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
             if (btn.style.color !== color) btn.style.color = color;
+            // Our own symbols have colors of their own: grey when off
+            if (flag.text) {
+                const filter = on ? '' : 'grayscale(1) opacity(.5)';
+                const icon = btn.querySelector('i');
+                if (icon.style.filter !== filter) icon.style.filter = filter;
+            }
             setText(btn.querySelector('span'), String(n));
             const title = on
                 ? `Showing only ${flag.label} (${n}). Click to show all.`
                 : `Show only ${flag.label} (${n})`;
             if (btn.title !== title) btn.title = title;
+            // Only the symbols that some system has (or that filter now,
+            // so the filter can be turned off)
+            const display = n > 0 || on ? '' : 'none';
+            if (btn.style.display !== display) btn.style.display = display;
         });
+        // Room in the Name header for the buttons that are shown
+        const nameTh = table.querySelector('thead th');
+        const buttons = nameTh?.querySelector(`.${PINNED_CLASS}`);
+        if (buttons?.offsetWidth) {
+            const padding = `${buttons.offsetWidth + 12}px`;
+            if (nameTh.style.paddingRight !== padding) nameTh.style.paddingRight = padding;
+        }
+        updateRulesInfo();
 
         // Sort buttons: black ▲/▼ for the column that's sorted on, a grey icon
         // for the others; and the rows in that order
@@ -5443,7 +5732,11 @@
             applySystemsView();
         });
 
-        toolbar.append(search, count, toggle);
+        // How many systems are still being checked (see updateRulesInfo)
+        const checking = document.createElement('small');
+        checking.className = 'text-muted';
+
+        toolbar.append(search, count, checking, toggle);
 
         const card = document.createElement('div');
         card.className = 'card tm-system-table-card';
@@ -5456,12 +5749,13 @@
         card.appendChild(scroller);
 
         wrapper.append(toolbar, card);
-        return { wrapper, table, search, count };
+        return { wrapper, table, search, count, checking };
     }
 
     // Rebuild the rows (and the header, if the columns changed) from the tiles
     function renderSystemList() {
         if (!systemList) return;
+        loadSystemRules(); // in the background; the symbols follow
         const rows = [...document.querySelectorAll(SYSTEM_TILE)].map(readTile);
         const signature = systemsSignature(rows);
 
@@ -6230,6 +6524,7 @@
                 if (isEntitlementsPage()) addFilterOptions();
                 addStyles();
                 addCopyButtons();
+                addPageLinks();
                 setupSystemList();
                 addImportButton();
                 addGridFlagButtons();
