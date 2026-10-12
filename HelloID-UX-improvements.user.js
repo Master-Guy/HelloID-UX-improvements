@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-12.1
+// @version      2026-10-12.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -336,7 +336,7 @@
         // Business rules > Entitlements tab
         {
             pattern: /\/rules\/api\/entitlements(\?|$)/,
-            filter: (all) => filterByFlags(FLAG_GRIDS.entitlements, all),
+            filter: (all) => filterUsedEntitlements(filterByFlags(FLAG_GRIDS.entitlements, all)),
             grid: 'helloid-entitlement-grid ag-grid-angular',
         },
         // Business rules > Evaluations: actions of the selected evaluation
@@ -1263,6 +1263,8 @@
         // second and third column) and its persons (a single column)
         { host: 'helloid-rule-entitlement-grid', columns: [2, 3] },
         { host: 'helloid-persons-in-rule', header: null },
+        // Entitlements tab: the entitlements themselves
+        ...['System', 'Entitlement'].map(header => ({ host: 'helloid-entitlement-grid', header })),
         { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
         // Its persons: a single column without a header, so any column
         { host: 'helloid-stored-persons-in-rule', header: null },
@@ -6095,6 +6097,89 @@
     }
 
     // =====================================================================
+    // Business rules > Entitlements: filter on "Rules"
+    // =====================================================================
+    // The Rules header gets a filter button (≥1): grey = all entitlements,
+    // black = only the entitlements that at least one business rule has.
+    // On the request, like the icon filters of this grid, and on top of
+    // those: with both on, a row needs both.
+
+    const USED_FILTER_CLASS = 'tm-used-entitlements-filter';
+    const USED_FILTER_KEY = 'tm-helloid-used-entitlements'; // in sessionStorage
+    const USED_FILTER_HEADER = 'Rules';
+
+    const usedOnly = () => sessionGet(USED_FILTER_KEY, false) === true;
+
+    // Called with the rows the icon filters left (see INTERCEPTS)
+    const filterUsedEntitlements = (rows) => (usedOnly() ? rows.filter(e => e.ruleCount > 0) : rows);
+
+    function updateUsedFilterButtons() {
+        const on = usedOnly();
+        const color = statusColor[on ? ButtonStatus.ENABLED : ButtonStatus.UNKNOWN];
+        const title = on
+            ? 'Showing only the entitlements that business rules have. Click to show all.'
+            : 'Show only the entitlements that at least one business rule has';
+        document.querySelectorAll(`.${USED_FILTER_CLASS}`).forEach(btn => {
+            if (btn.style.color !== color) btn.style.color = color;
+            if (btn.title !== title) btn.title = title;
+        });
+    }
+
+    function addUsedEntitlementsFilter() {
+        document.querySelectorAll(FLAG_GRIDS.entitlements.grid).forEach(gridEl => {
+            const existing = gridEl.querySelector(`.${USED_FILTER_CLASS}`);
+            if (existing) {
+                fitUsedFilterColumn(gridEl, existing); // until the grid is ready for it
+                return;
+            }
+            // (found before our button adds its text to the header)
+            const header = [...gridEl.querySelectorAll('.ag-header-cell')]
+                .find(h => h.textContent.trim().toLowerCase() === USED_FILTER_HEADER.toLowerCase());
+            if (!header) return;
+
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `btn btn-default btn-xs ${USED_FILTER_CLASS}`;
+            btn.textContent = '≥1';
+            // On the right side of the header: after the label, wherever
+            // the grid puts that in the wrapper
+            Object.assign(btn.style, { flexShrink: '0', marginLeft: 'auto', order: '1' });
+            btn.addEventListener('mousedown', (e) => e.stopPropagation());
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                sessionSet(USED_FILTER_KEY, !usedOnly());
+                updateUsedFilterButtons();
+                // Load the rows again, through the filter
+                const api = findGridApi(gridEl);
+                if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
+                else api?.refreshInfiniteCache?.();
+            });
+            (header.querySelector('.ag-header-cell-comp-wrapper') ?? header).appendChild(btn);
+            updateUsedFilterButtons();
+
+            fitUsedFilterColumn(gridEl, btn);
+        });
+    }
+
+    // Room in the column for the header's text and the button: the column
+    // is narrow, and the header cuts off what doesn't fit. Once per
+    // button, as soon as the grid can be reached and the button is drawn.
+    const fittedUsedFilters = new WeakSet();
+
+    function fitUsedFilterColumn(gridEl, btn) {
+        if (fittedUsedFilters.has(btn)) return;
+        const header = btn.closest('.ag-header-cell');
+        const api = findGridApi(gridEl);
+        if (!header || !api || !btn.offsetWidth) return;
+        fittedUsedFilters.add(btn);
+        const label = header.querySelector('.ag-header-cell-text');
+        const style = getComputedStyle(header);
+        setMinColumnWidth(api, header.getAttribute('col-id'), Math.ceil((label?.scrollWidth ?? 40) + btn.offsetWidth +
+            (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)) + 16);
+    }
+
+    // =====================================================================
     // Persons > Rules: filter on the status ("in rule")
     // =====================================================================
     // The Status header gets a filter button: grey = all rules, black =
@@ -6215,8 +6300,8 @@
     ];
     const MINUTE_MS = 60 * 1000;
     const DAY_MS = 24 * 60 * MINUTE_MS;
-    // The minutes the pickers offer; another minute can still be typed,
-    // and is used as typed
+    // The default "From" is on a quarter. (The fields themselves take any
+    // minute: Chrome's picker ignores a step.)
     const HISTORY_STEP_MINUTES = 15;
 
     // The range a visit of the tab starts with: from 24 hours ago (the
@@ -6302,7 +6387,6 @@
                 text.textContent = label;
                 const input = document.createElement('input');
                 input.type = 'datetime-local';
-                input.step = String(HISTORY_STEP_MINUTES * 60);
                 input.className = 'form-control input-sm';
                 input.value = values[key] ?? '';
                 input.addEventListener('change', save);
@@ -6738,6 +6822,12 @@
         if (sessionGet(HISTORY_RANGE_KEY, null) !== null) sessionSet(HISTORY_RANGE_KEY, null);
         historyDefault = null;
 
+        // Business rules > Entitlements: filter on "Rules"
+        if (usedOnly()) {
+            sessionSet(USED_FILTER_KEY, false);
+            updateUsedFilterButtons();
+        }
+
         // Persons > Rules: status filter
         if (ruleStatus() !== ButtonStatus.UNKNOWN) {
             sessionSet(RULE_STATUS_KEY, null);
@@ -6769,6 +6859,7 @@
                 setupSystemList();
                 addImportButton();
                 addGridFlagButtons();
+                addUsedEntitlementsFilter();
                 hideLimitWarnings();
                 addRuleStatusFilter();
                 addFilterPanelSearch();
