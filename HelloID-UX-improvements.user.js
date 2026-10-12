@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-07.1
+// @version      2026-10-12.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -319,6 +319,8 @@
     const NOTIFICATIONS_ROUTE = '/notifications/configurations';
     const PERSON_RULES_ROUTE = '/persons/overview?tab=Rules';
     const PERSON_RULES_GRID = 'Condition Summary'; // a header only this grid has
+    const HISTORY_ROUTE = `${ENTITLEMENTS_ROUTE}?tab=History`;
+    const HISTORY_GRID = 'Finished on'; // a header only this grid has
 
     // Paged requests that are fetched in full instead, so they can be
     // filtered here; the app then gets only the page it asked for.
@@ -327,6 +329,7 @@
     // limitWarning: text of the page's "only the first N rows" warning,
     //   which no longer applies once all rows are fetched
     // route: only on pages with this in their address
+    // active: () -> is it in use right now? (default: yes)
     const INTERCEPTS = [
         // Target system > Entitlements tab
         { pattern: /\/entitlements-overview(\?|$)/, filter: (all) => all.filter(matchesFilters) },
@@ -355,9 +358,18 @@
             filter: (all) => filterPersonRules(all),
             route: PERSON_RULES_ROUTE,
         },
+        // Entitlements > History tab: only while a range of "Finished on"
+        // is set, as the history can be long
+        {
+            pattern: new RegExp('/rule-enforcement/api/actions/history/overview([?]|$)'),
+            filter: (all) => filterHistory(all),
+            route: HISTORY_ROUTE,
+            active: () => hasHistoryRange(),
+        },
     ];
     const onPage = (route) => !route || location.hash.includes(route);
-    const interceptFor = (url) => INTERCEPTS.find(i => i.pattern.test(url) && onPage(i.route));
+    const interceptFor = (url) => INTERCEPTS
+        .find(i => i.pattern.test(url) && onPage(i.route) && (i.active?.() ?? true));
 
     // HelloID's API server, as seen in its own requests: where it is and
     // the headers (login) to send along. For requests of our own.
@@ -1244,7 +1256,13 @@
     // route: only on pages with this in their address (for hosts that
     // are used on many pages). Without host: any grid on that page.
     // requires: only grids that also have a column with this header.
+    // columns: for a grid without headers, the columns by their place
+    // (the first one is 1).
     const NAME_COLUMNS = [
+        // Entitlements tab, of the selected entitlement: its rules (the
+        // second and third column) and its persons (a single column)
+        { host: 'helloid-rule-entitlement-grid', columns: [2, 3] },
+        { host: 'helloid-persons-in-rule', header: null },
         { host: 'helloid-rules-grid', colId: 'name' },          // Rules tab
         // Its persons: a single column without a header, so any column
         { host: 'helloid-stored-persons-in-rule', header: null },
@@ -1272,10 +1290,21 @@
     // Body cells of the name columns, in all grids on the page
     function nameCells() {
         const here = NAME_COLUMNS.filter(c => !c.route || location.hash.includes(c.route));
-        return here.flatMap(({ host, colId, header, requires }) =>
+        return here.flatMap(({ host, colId, header, requires, columns }) =>
             [...document.querySelectorAll(`${host ?? ''} ag-grid-angular`)].flatMap(grid => {
                 if (!hasHeader(grid, requires)) return [];
                 const rows = 'div.ag-body-viewport div[role="row"]';
+                // By place: as the grid numbers its cells, or else in
+                // the order they are in the row
+                if (columns) {
+                    return [...grid.querySelectorAll(rows)].flatMap(row => {
+                        const cells = [...row.querySelectorAll('div[col-id]')];
+                        const numbered = cells.some(c => c.hasAttribute('aria-colindex'));
+                        return columns.map(n => (numbered
+                            ? cells.find(c => c.getAttribute('aria-colindex') === String(n))
+                            : cells[n - 1])).filter(Boolean);
+                    });
+                }
                 // Any column: the grid may have no header at all
                 if (!colId && header == null) return [...grid.querySelectorAll(`${rows} div[col-id]`)];
                 const ids = colId ? [colId]
@@ -1289,7 +1318,10 @@
 
     // Text of the cell without our own button. Cells with a second,
     // smaller line (a description under the name): only the first line.
+    // A person shown with a circle of initials in front: only the name.
     function cellTextWithout(cell, btn) {
+        const username = cell.querySelector('.username-with-icon .username');
+        if (username) return username.innerText ?? username.textContent;
         const firstLine = cell.querySelector('.truncate-ellipse');
         if (firstLine) return firstLine.innerText ?? firstLine.textContent;
         return [...cell.childNodes]
@@ -3935,6 +3967,53 @@
                 (sameAgentSelection(configuration.agentSelection, current.agentSelection) ? [] : ['agentSelection']),
         },
     ];
+    // The requests that make the system's permission sets those of the
+    // file. HelloID takes the whole list in a request, but refuses one
+    // that adds or deletes more than one set. So: a request per set to
+    // add, one per set to delete, and a last one for what changed in the
+    // sets that stay (not along with the others: HelloID may not take
+    // that either). Each is built from the sets as the system has them
+    // at that moment, as HelloID gives a new set an ID of its own.
+    const PERMISSIONS_PATH = (id) => `/connector/powershell-target/api/configuration/${id}/permissions`;
+
+    function permissionRequests(configuration, current) {
+        // By ID, or else by name (see changedParts)
+        const match = (set, sets) => sets.find(o => o.identification === set.identification) ??
+            sets.find(o => o.displayName === set.displayName);
+        const withoutId = ({ identification, ...set }) => JSON.stringify(set);
+        const fileSets = configuration.permissions ?? [];
+        const currentSets = current.permissions ?? [];
+        const read = async (id) =>
+            (await fetchFromGateway(`/connector/powershell-target/api/configuration/${id}`)).permissions ?? [];
+        const send = (id, permissions) => sendToGateway(PERMISSIONS_PATH(id), 'POST', { permissions });
+
+        const changed = fileSets.some(set => match(set, currentSets) &&
+                                             withoutId(set) !== withoutId(match(set, currentSets)));
+        return [
+            ...fileSets.filter(set => !match(set, currentSets)).map(set => ({
+                name: `Permission set "${set.displayName}" (new)`,
+                run: async (id) => send(id, [...await read(id), set]),
+            })),
+            ...currentSets.filter(set => !match(set, fileSets)).map(set => ({
+                name: `Permission set "${set.displayName}" (delete)`,
+                run: async (id) => {
+                    const now = await read(id);
+                    const gone = match(set, now);
+                    if (gone) await send(id, now.filter(o => o !== gone));
+                },
+            })),
+            // The sets of the file, in its order, with the IDs they have here
+            ...(!changed ? [] : [{
+                name: 'Permission sets (changes)',
+                run: async (id) => {
+                    const now = await read(id);
+                    await send(id, fileSets.map(set => (
+                        { ...set, identification: match(set, now)?.identification ?? set.identification })));
+                },
+            }]),
+        ];
+    }
+
     const POWERSHELL_IMPORT_STEPS = [
         {
             name: 'General settings',
@@ -3987,10 +4066,14 @@
             changes: (configuration, current) => changedParts(configuration, current)
                 .filter(c => c.startsWith(RESOURCE)),
         },
-        // All permission sets (with their scripts) in one request
+        // The permission sets (with their scripts): a request per set that
+        // is added or deleted, then one for the sets that changed (see
+        // permissionRequests)
         {
             name: 'Permissions',
-            path: (id) => `/connector/powershell-target/api/configuration/${id}/permissions`,
+            note: 'set by set: adds the new ones, deletes the ones that are not in the file, then changes the others',
+            requests: permissionRequests,
+            path: PERMISSIONS_PATH,
             method: 'POST',
             body: (configuration) => ({ permissions: configuration.permissions ?? [] }),
             changes: (configuration, current) => changedParts(configuration, current)
@@ -6112,6 +6195,142 @@
     }
 
     // =====================================================================
+    // Entitlements > History: filter on "Finished on"
+    // =====================================================================
+    // HelloID's filter card of this tab (systems, types, ...) gets two
+    // fields more: only the actions that finished from and/or up to a
+    // moment. HelloID's request has nothing for that, so while a moment
+    // is set, all rows (of HelloID's own filters) are fetched once and
+    // filtered on the request (see Response interception). The history
+    // can be long: without a moment set, the grid loads as HelloID does.
+    // A visit of the tab starts with "From" at 24 hours ago; "Clear"
+    // takes that away too.
+    // The moments are in the browser's own time, like the grid shows them.
+
+    const HISTORY_RANGE_KEY = 'tm-helloid-history-range'; // in sessionStorage: { from, to }
+    const HISTORY_RANGE_CLASS = 'tm-history-range';
+    const HISTORY_RANGE_FIELDS = [
+        { key: 'from', label: 'From' },
+        { key: 'to', label: 'Up to' },
+    ];
+    const MINUTE_MS = 60 * 1000;
+    const DAY_MS = 24 * 60 * MINUTE_MS;
+    // The minutes the pickers offer; another minute can still be typed,
+    // and is used as typed
+    const HISTORY_STEP_MINUTES = 15;
+
+    // The range a visit of the tab starts with: from 24 hours ago (the
+    // quarter before that), without an end. Worked out once per visit,
+    // so all pages of the grid get the same rows.
+    let historyDefault = null;
+    function defaultHistoryRange() {
+        if (!historyDefault) {
+            const d = new Date(Date.now() - DAY_MS);
+            d.setMinutes(Math.floor(d.getMinutes() / HISTORY_STEP_MINUTES) * HISTORY_STEP_MINUTES, 0, 0);
+            const two = (n) => String(n).padStart(2, '0');
+            historyDefault = {
+                from: `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}` +
+                      `T${two(d.getHours())}:${two(d.getMinutes())}`,
+            };
+        }
+        return historyDefault;
+    }
+
+    // What the fields have (as typed: "2026-10-12T09:58"), and as times.
+    // Nothing stored: the default. Stored without a moment: cleared.
+    const historyRangeValues = () => {
+        const range = sessionGet(HISTORY_RANGE_KEY, null);
+        return isPlainObject(range) ? range : defaultHistoryRange();
+    };
+    const historyRange = () => {
+        const time = (value) => {
+            const t = typeof value === 'string' && value ? new Date(value).getTime() : NaN;
+            return Number.isNaN(t) ? null : t;
+        };
+        const values = historyRangeValues();
+        return { from: time(values.from), to: time(values.to) };
+    };
+    const hasHistoryRange = () => Object.values(historyRange()).some(t => t !== null);
+
+    // Called with all rows (see INTERCEPTS). "Up to" a minute: that whole
+    // minute. An action that hasn't finished is in no range.
+    function filterHistory(all) {
+        const { from, to } = historyRange();
+        return all.filter(row => {
+            const t = row?.finishedOn ? new Date(row.finishedOn).getTime() : NaN;
+            return !Number.isNaN(t) && (from === null || t >= from) && (to === null || t < to + MINUTE_MS);
+        });
+    }
+
+    function reloadHistory() {
+        document.querySelectorAll(AG_GRIDS).forEach(gridEl => {
+            if (!hasHeader(gridEl, HISTORY_GRID)) return;
+            const api = findGridApi(gridEl);
+            if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
+            else api?.refreshInfiniteCache?.();
+        });
+    }
+
+    function setHistoryRange(values) {
+        const filled = Object.fromEntries(Object.entries(values).filter(([, value]) => value));
+        sessionSet(HISTORY_RANGE_KEY, filled); // (empty: cleared, not the default)
+        reloadHistory(); // through the filter, or as HelloID loads it again
+    }
+
+    // The fields, in HelloID's filter card of the tab
+    function addHistoryRangeFilter() {
+        if (!location.hash.includes(HISTORY_ROUTE)) return;
+        document.querySelectorAll('helloid-filter-panels').forEach(host => {
+            if (host.querySelector(`.${HISTORY_RANGE_CLASS}`)) return;
+            const firstPanel = host.querySelector('.filter-panel');
+            if (!firstPanel) return;
+
+            const box = document.createElement('div');
+            box.className = HISTORY_RANGE_CLASS;
+            const header = document.createElement('div');
+            header.className = 'card-header';
+            header.textContent = HISTORY_GRID;
+            box.appendChild(header);
+
+            const values = historyRangeValues();
+            const inputs = {};
+            const save = () => setHistoryRange(
+                Object.fromEntries(HISTORY_RANGE_FIELDS.map(f => [f.key, inputs[f.key].value])));
+            HISTORY_RANGE_FIELDS.forEach(({ key, label }) => {
+                const row = document.createElement('label');
+                const text = document.createElement('small');
+                text.textContent = label;
+                const input = document.createElement('input');
+                input.type = 'datetime-local';
+                input.step = String(HISTORY_STEP_MINUTES * 60);
+                input.className = 'form-control input-sm';
+                input.value = values[key] ?? '';
+                input.addEventListener('change', save);
+                // Keep typing away from the page's own key handlers
+                input.addEventListener('keydown', (e) => {
+                    if (e.key !== 'Escape') e.stopPropagation();
+                });
+                inputs[key] = input;
+                row.append(text, input);
+                box.appendChild(row);
+            });
+
+            const clear = document.createElement('a');
+            clear.className = 'btn btn-xs btn-default';
+            clear.textContent = 'Clear';
+            clear.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                Object.values(inputs).forEach(input => { input.value = ''; });
+                save();
+            });
+            box.appendChild(clear);
+
+            firstPanel.parentElement.appendChild(box);
+        });
+    }
+
+    // =====================================================================
     // All grids: resizable columns
     // =====================================================================
 
@@ -6383,6 +6602,23 @@
             vertical-align: middle;
             margin-left: 6px;
         }
+        /* Entitlements > History: the two moments in HelloID's filter card */
+        .${HISTORY_RANGE_CLASS} {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+            padding: 0 10px;
+        }
+        .${HISTORY_RANGE_CLASS} label {
+            display: flex;
+            flex-direction: column;
+            margin: 0;
+            font-weight: normal;
+        }
+        .${HISTORY_RANGE_CLASS} .card-header { font-weight: bold; }
+        .${HISTORY_RANGE_CLASS} input { width: 200px; }
+
         .tm-progress { display: flex; align-items: center; gap: 6px; }
         .tm-progress .progress { flex: 1; height: 10px; margin: 0; }
 
@@ -6497,6 +6733,11 @@
             applySystemsView();
         }
 
+        // Entitlements > History: range of "Finished on", back to its
+        // default (worked out again, from now)
+        if (sessionGet(HISTORY_RANGE_KEY, null) !== null) sessionSet(HISTORY_RANGE_KEY, null);
+        historyDefault = null;
+
         // Persons > Rules: status filter
         if (ruleStatus() !== ButtonStatus.UNKNOWN) {
             sessionSet(RULE_STATUS_KEY, null);
@@ -6531,6 +6772,7 @@
                 hideLimitWarnings();
                 addRuleStatusFilter();
                 addFilterPanelSearch();
+                addHistoryRangeFilter();
                 makeGridsResizable();
                 applyPageColumnWidths();
             });
