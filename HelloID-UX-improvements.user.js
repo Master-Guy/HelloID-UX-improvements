@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-12.2
+// @version      2026-10-22.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -10,11 +10,15 @@
 // @match        https://*.helloid.training/*
 // @include      /^https:\/\/[^\/]*helloid[^\/]*\//
 // @icon         https://www.svgrepo.com/show/530424/copy.svg
+// @require      https://cdnjs.cloudflare.com/ajax/libs/marked/18.0.14/lib/marked.umd.min.js#sha256=e67a06aa3661785f8ab4ee803094651c04570630814df305b492decef588d905
 // @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      api.github.com
+// @connect      raw.githubusercontent.com
 // @sandbox      JavaScript
 // ==/UserScript==
 
@@ -47,6 +51,10 @@
         // Target system export: also write the values of password fields
         // to the file. Off: those values are replaced by "***".
         exportSecrets: false,
+
+        // Target system from GitHub: a GitHub token (no scopes needed) for
+        // more than GitHub's 60 requests an hour without one. Empty: none.
+        githubToken: '',
     });
 
     const SETTINGS_KEY = 'settings';
@@ -187,6 +195,16 @@
             hint: 'yes or no',
         },
         {
+            path: 'githubToken',
+            label: 'GitHub: token',
+            description: 'Target system from GitHub: without a token, GitHub allows 60 requests an hour (a ' +
+                         'connector takes 2). A personal access token without any scopes raises that to 5000. ' +
+                         'It is only sent to api.github.com.',
+            parse: (v) => v,
+            hint: 'a GitHub token',
+            secret: true,
+        },
+        {
             path: 'filterReloadDelayMs',
             label: 'Target system entitlements: filter reload delay (ms)',
             description: 'Target system > Entitlements tab: how long to wait after the last click on a filter button before the page reloads, ' +
@@ -201,12 +219,13 @@
         const current = getPath(overrides, def.path);
         const defaultValue = getPath(DEFAULTS, def.path);
 
+        // A secret is never shown: only whether it is set
         const input = prompt(
             `${def.label}\n\n` +
             `${def.description}\n\n` +
-            `Default: ${defaultValue}\n` +
+            (def.secret ? `Currently: ${current ? 'set' : 'not set'}\n` : `Default: ${defaultValue}\n`) +
             `Leave empty to use the default.`,
-            current ?? ''
+            def.secret ? '' : current ?? ''
         );
         if (input === null) return; // cancelled
 
@@ -227,7 +246,8 @@
     }
 
     for (const def of SETTING_DEFS) {
-        GM_registerMenuCommand(`${def.label}: ${getPath(SETTINGS, def.path)}`, () => editSetting(def));
+        const value = getPath(SETTINGS, def.path);
+        GM_registerMenuCommand(`${def.label}: ${def.secret ? (value ? 'set' : 'not set') : value}`, () => editSetting(def));
     }
 
     GM_registerMenuCommand('Reset all settings to defaults', () => {
@@ -1228,18 +1248,24 @@
     // --- Target systems overview: tiles (copy and export buttons) ---
     function addSystemTileCopyButtons() {
         document.querySelectorAll('helloid-provisioning-system-tile').forEach(tile => {
-            if (tile.querySelector(`.${COPY_BTN_CLASS}`)) return;
-
             const configureBtn = tile.querySelector('button[title="configure" i]');
             if (!configureBtn) return;
 
             // The name at click time: HelloID may reuse a tile for another system
             const name = () => tile.querySelector('h5')?.innerText.trim() ?? '';
+            if (tile.querySelector(`.${COPY_BTN_CLASS}`)) {
+                // Buttons of extensions that came after ours
+                const present = [...tile.querySelectorAll('[data-tm-extension]')].map(el => el.dataset.tmExtension);
+                configureBtn.before(...createExtensionButtons(name, configureBtn.className, present));
+                return;
+            }
+
             configureBtn.before(
                 createCopyButton(name, configureBtn.className),
                 createExportButton(name, configureBtn.className),
                 createExportButton(name, configureBtn.className, EXPORT_KINDS.granted),
                 createExportButton(name, configureBtn.className, EXPORT_KINDS.migration),
+                ...createExtensionButtons(name, configureBtn.className),
             );
             // HelloID's own Configure button is hidden, and stands in for
             // a normal click on our link (see createPageLink)
@@ -1433,7 +1459,8 @@
     // that symbol (same colors as the Entitlements filters). With several
     // on, a system needs any of them.
     // The last two are our own symbols (see "Warnings about business
-    // rules"): text instead of an icon class.
+    // rules"): text instead of an icon class. Extensions add theirs after
+    // these, with titleFor (see "Extensions").
     const SYSTEM_FLAGS = [
         { key: 'warning',  icon: 'fa-solid fa-warning',   match: '.fa-warning',   label: 'systems with warnings' },
         { key: 'v1',       text: '⛓️‍💥', match: '.tm-flag-v1',
@@ -1700,13 +1727,27 @@
         };
     }
 
-    // Puts our symbols on the tiles, and takes away the ones that no
-    // longer apply. Only touches the page when something differs.
+    // Which symbols of extensions a tile should have: key -> text on hover
+    function extensionFlagsFor(tile) {
+        const system = systemEntries.get(tileName(tile));
+        return Object.fromEntries(SYSTEM_FLAGS.filter(f => f.titleFor).map(flag => {
+            try {
+                return [flag.key, flag.titleFor(system)];
+            } catch (e) {
+                console.warn(`[HelloID UX] Extension symbol "${flag.key}" failed`, e);
+                return [flag.key, null];
+            }
+        }));
+    }
+
+    // Puts our symbols (and those of extensions) on the tiles, and takes
+    // away the ones that no longer apply. Only touches the page when
+    // something differs.
     function updateRuleFlags() {
         document.querySelectorAll(SYSTEM_TILE).forEach(tile => {
             const extras = tileExtras(tile);
             if (!extras) return;
-            const wanted = ruleFlagsFor(tile);
+            const wanted = { ...ruleFlagsFor(tile), ...extensionFlagsFor(tile) };
             SYSTEM_FLAGS.filter(f => f.text).forEach(flag => {
                 let symbol = extras.querySelector(flag.match);
                 const title = wanted[flag.key];
@@ -2351,6 +2392,9 @@
             systemEntries.set(s.displayName.trim(), s);
         });
         refreshExportButtons();
+        systemsListeners.forEach(listener => {
+            try { listener(); } catch (e) { console.warn('[HelloID UX] Extension failed on the list of systems', e); }
+        });
     }
 
     // The steps of the export, for its progress: report(key, state, detail)
@@ -3686,6 +3730,8 @@
             const display = entry && kind?.appliesTo(entry) ? '' : 'none';
             if (btn.style.display !== display) btn.style.display = display;
         });
+        // The same for the buttons of extensions
+        extensionButtons.forEach(button => button.refresh?.());
     }
 
     // getName is called at click time
@@ -5085,6 +5131,17 @@
 
         let data;
         try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        return importData(data);
+    }
+
+    // Imports the configuration of an export (data) into its system, or
+    // into a new one when this environment doesn't have it.
+    // options:
+    //   partial: the file only has some parts: the others keep what the
+    //            system has (a file made from a GitHub repository)
+    //   confirmedNew: a new system was confirmed already: no question
+    //   finishNote: added to the closing message
+    async function importData(data, { partial = false, confirmedNew = false, finishNote = '' } = {}) {
         if (!isPlainObject(data?.configuration) || typeof data.templateIdentifier !== 'string') {
             throw new Error('The file is not an export of a target system.');
         }
@@ -5154,7 +5211,7 @@
                             'environment has no target system with that ID. Nothing was imported, and no new ' +
                             'system was made: the system ID in the file has to be that of the system to migrate.');
         }
-        if (created) system = await createSystemFor(data, fileName, systemId, steps, systems);
+        if (created) system = await createSystemFor(data, fileName, systemId, steps, systems, confirmedNew);
         if (!system) return false; // cancelled
         // A v2 file for a v1 system: its migration is started first, when
         // the user confirms that (see startMigration)
@@ -5194,9 +5251,17 @@
             }),
         });
         const current = await loadCurrent();
+        const fileConfiguration = restoreSecrets(data.configuration, current);
         const configuration = {
-            ...restoreSecrets(data.configuration, current),
-            resources: data.resources,
+            // A partial file: what it doesn't have stays as it is, also
+            // within the scripts and the mapping
+            ...(partial ? current : {}),
+            ...fileConfiguration,
+            ...(partial ? {
+                scripts: { ...current.scripts, ...fileConfiguration.scripts },
+                mappingConfiguration: { ...current.mappingConfiguration, ...fileConfiguration.mappingConfiguration },
+            } : {}),
+            resources: data.resources ?? (partial ? current.resources : undefined),
             // The tags and agent pools of the file; a file without them
             // (an older export), or with the same ones, changes nothing
             agentSelection: !Array.isArray(data.agents?.selected) ||
@@ -5453,7 +5518,7 @@
                 : error('\n\nThe migration to PowerShell v2 is NOT completed, as tasks of its checklist are still ' +
                        'open. Do those in HelloID and complete the migration there. The system stays disabled ' +
                        'until then.');
-        await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}\n\n` +
+        await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}${finishNote}\n\n` +
                               'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
@@ -5464,7 +5529,7 @@
     // of systems, or null when cancelled. Everything that can be checked
     // is checked first, so no empty system is left behind for a file that
     // can't be imported.
-    async function createSystemFor(data, fileName, systemId, steps, systems) {
+    async function createSystemFor(data, fileName, systemId, steps, systems, confirmed = false) {
         const createPath = CREATE_PATHS[data.templateIdentifier];
         if (!createPath) {
             throw new Error(`The system of the file ("${fileName}", ID ${systemId}) was not found in this ` +
@@ -5482,7 +5547,7 @@
         const empty = { systemId: '', isNew: true, resources: [], mappingConfiguration: configuration.mappingConfiguration };
         steps.forEach(step => step.body(configuration, empty, systems));
 
-        if (!await showDialog('Import: new system',
+        if (!confirmed && !await showDialog('Import: new system',
             `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}\n\n` +
             `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n` +
             `A NEW target system "${name}" (type ${data.templateIdentifier}) will be created, and the ` +
@@ -5518,9 +5583,9 @@
 
     // The system as it is now, saved as a normal download (no save dialog:
     // that needs a click of its own)
-    async function downloadBackup(name) {
+    async function downloadBackup(name, label = 'backup before import') {
         downloadFile(JSON.stringify(await collectSystemExport(name), null, 2),
-            exportFileName(`${name} - backup before import`, name));
+            exportFileName(`${name} - ${label}`, name));
     }
 
     async function sendToGateway(path, method, body) {
@@ -5577,6 +5642,908 @@
         addBtn.before(btn);
     }
 
+    // --- Target system from GitHub ---
+    // The GitHub button (next to the Import button) lists Tools4ever's
+    // target connectors on GitHub, like HelloID's own "Create System" does
+    // for source systems, and shows the README of the one you pick. Create
+    // turns the repository into an import file (see repositoryImport),
+    // which is imported into a new, disabled system.
+    // HelloID's catalog only has source systems, so GitHub is asked
+    // directly: the list with its search API, a repository's latest
+    // release and its files with its REST API, the files themselves from
+    // raw.githubusercontent.com. Without a token (see the settings),
+    // GitHub allows 60 requests an hour, and 10 searches a minute; a
+    // repository takes 2.
+    const GITHUB_OWNER = 'Tools4everBV';
+    const GITHUB_PREFIX = 'HelloID-Conn-Prov-Target-';
+    const GITHUB_API = 'https://api.github.com';
+    const GITHUB_RAW = 'https://raw.githubusercontent.com';
+    const GITHUB_BTN_CLASS = 'tm-github-system';
+    const GITHUB_CACHE_MS = 60 * 60 * 1000; // the list and the repositories are kept this long
+    // GitHub's logo (Octicons "mark-github"): Font Awesome's brand icons
+    // may not be on the page
+    const GITHUB_LOGO = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true" ' +
+        'style="vertical-align: -2px"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 ' +
+        '0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 ' +
+        '0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 ' +
+        '1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 ' +
+        '1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>';
+
+    // A request to GitHub; the answer as JSON, or as text. A token (when
+    // set) only goes to the API.
+    function githubRequest(url, { text = false } = {}) {
+        const api = url.startsWith(GITHUB_API);
+        return new Promise((resolve, reject) => GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            headers: {
+                ...(api ? { Accept: 'application/vnd.github+json' } : {}),
+                ...(api && SETTINGS.githubToken ? { Authorization: `Bearer ${SETTINGS.githubToken}` } : {}),
+            },
+            anonymous: true,
+            timeout: 30000,
+            onload: (response) => {
+                if (response.status >= 200 && response.status < 300) {
+                    if (text) {
+                        resolve(response.responseText);
+                        return;
+                    }
+                    try { resolve(JSON.parse(response.responseText)); } catch { reject(new Error(`GitHub did not answer with JSON for ${url}`)); }
+                    return;
+                }
+                const header = (name) => (response.responseHeaders ?? '')
+                    .match(new RegExp(`^${name}:\\s*(.*)$`, 'mi'))?.[1]?.trim();
+                if ((response.status === 403 || response.status === 429) && header('x-ratelimit-remaining') === '0') {
+                    const reset = new Date(Number(header('x-ratelimit-reset')) * 1000);
+                    reject(Object.assign(new Error(`GitHub's limit of requests is reached, until ${reset.toLocaleTimeString()}.` +
+                        (SETTINGS.githubToken ? '' : ' Without a token GitHub allows 60 requests an hour: set one in the ' +
+                                                     'Tampermonkey menu ("GitHub: token") for more.')), { status: response.status }));
+                    return;
+                }
+                reject(Object.assign(new Error(`GitHub answered ${response.status} for ${url}`), { status: response.status }));
+            },
+            onerror: () => reject(new Error('GitHub could not be reached.')),
+            ontimeout: () => reject(new Error('GitHub did not answer within 30 seconds.')),
+        }));
+    }
+
+    const encodeGitPath = (path) => String(path).split('/').map(encodeURIComponent).join('/');
+    const githubRawUrl = (repo, ref, path) =>
+        `${GITHUB_RAW}/${GITHUB_OWNER}/${encodeURIComponent(repo)}/${encodeGitPath(ref)}/${encodeGitPath(path)}`;
+    const githubBlobUrl = (repo, ref, path = '') =>
+        `https://github.com/${GITHUB_OWNER}/${encodeURIComponent(repo)}/blob/${encodeGitPath(ref)}/${encodeGitPath(path)}`;
+
+    // The name to show: the description without " - Target" (as HelloID
+    // does for source systems), or else the repository's name
+    const repositoryTitle = (repo) => (repo.description ?? '').replace(/\s*[-–]?\s*target\s*$/i, '').trim() ||
+        repo.name.slice(GITHUB_PREFIX.length).replace(/-/g, ' ');
+
+    let githubList = null; // { time, repos }
+
+    // The target connectors, by name; archived ones left out
+    async function listGithubRepositories(refresh = false) {
+        if (!refresh && githubList && Date.now() - githubList.time < GITHUB_CACHE_MS) return githubList.repos;
+        const query = encodeURIComponent(`org:${GITHUB_OWNER} ${GITHUB_PREFIX} in:name`);
+        const found = [];
+        for (let page = 1; page <= 10; page++) {
+            const answer = await githubRequest(`${GITHUB_API}/search/repositories?q=${query}&per_page=100&page=${page}`);
+            const items = answer.items ?? [];
+            found.push(...items);
+            if (!items.length || found.length >= (answer.total_count ?? 0)) break;
+        }
+        const repos = uniqueBy(found.filter(r => r.name?.startsWith(GITHUB_PREFIX) && !r.archived &&
+                                                 r.owner?.login === GITHUB_OWNER), r => r.id)
+            .map(r => ({
+                id: r.id,
+                name: r.name,
+                title: repositoryTitle(r),
+                description: r.description ?? '',
+                topics: r.topics ?? [],
+                defaultBranch: r.default_branch,
+                url: r.html_url,
+            }))
+            .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+        githubList = { time: Date.now(), repos };
+        return repos;
+    }
+
+    // A repository's latest release (or its default branch, without one)
+    // and its files: { ref, release: { tag, date } | null, paths, truncated }
+    const githubDetails = new Map(); // repository name -> { time, promise }
+
+    function loadRepositoryDetails(repo) {
+        const known = githubDetails.get(repo.name);
+        if (known && Date.now() - known.time < GITHUB_CACHE_MS) return known.promise;
+        const base = `${GITHUB_API}/repos/${GITHUB_OWNER}/${encodeURIComponent(repo.name)}`;
+        const promise = (async () => {
+            let release = null;
+            try {
+                const latest = await githubRequest(`${base}/releases/latest`);
+                release = { tag: latest.tag_name, date: latest.published_at };
+            } catch (e) {
+                if (e.status !== 404) throw e; // 404: no release
+            }
+            const ref = release?.tag ?? repo.defaultBranch;
+            const tree = await githubRequest(`${base}/git/trees/${encodeURIComponent(ref)}?recursive=1`);
+            return {
+                ref,
+                release,
+                paths: (tree.tree ?? []).filter(t => t.type === 'blob').map(t => t.path),
+                truncated: tree.truncated === true,
+            };
+        })();
+        githubDetails.set(repo.name, { time: Date.now(), promise });
+        promise.catch(() => githubDetails.delete(repo.name)); // tried again next time
+        return promise;
+    }
+
+    // What a repository's files are for HelloID. Tools4ever's connectors
+    // have the account scripts, configuration.json and fieldMapping.json
+    // in their root, and a folder per permission set (permissions/<name>,
+    // sometimes deeper or elsewhere). Some have variants in a folder of
+    // their own (e.g. correlateOnly, guestInvite): another set of account
+    // scripts, configuration and mapping. Files are found by name, in any
+    // case.
+    const ACCOUNT_FILES = {
+        'create.ps1': 'accountCreate',
+        'update.ps1': 'accountUpdate',
+        'enable.ps1': 'accountEnable',
+        'disable.ps1': 'accountDisable',
+        'delete.ps1': 'accountDelete',
+        'import.ps1': 'accountImport',
+    };
+    const SETUP_FILES = {
+        'configuration.json': 'configuration',
+        'fieldmapping.json': 'mapping',
+        'uniquenesscheck.ps1': 'uniqueness',
+    };
+    // A permission set with a script per action, and one with dynamic
+    // (sub)permissions; a folder may have both
+    const PERMISSION_FILES = {
+        static: {
+            'permissions.ps1': 'retrievePermissionsScript',
+            'grantpermission.ps1': 'grantPermissionScript',
+            'revokepermission.ps1': 'revokePermissionScript',
+            'updatepermission.ps1': 'updatePermissionScript',
+            'import.ps1': 'permissionImportScript',
+            'importpermission.ps1': 'permissionImportScript',
+            'importpermissions.ps1': 'permissionImportScript',
+        },
+        dynamic: {
+            'subpermission.ps1': 'permissionActionScript',
+            'subpermissions.ps1': 'permissionActionScript',
+            'importsubpermission.ps1': 'permissionImportScript',
+            'importsubpermissions.ps1': 'permissionImportScript',
+            'subpermissionimport.ps1': 'permissionImportScript',
+            'subpermissionsimport.ps1': 'permissionImportScript',
+        },
+    };
+    const PERMISSION_MARKERS = ['permissions.ps1', 'grantpermission.ps1', 'revokepermission.ps1',
+        'subpermission.ps1', 'subpermissions.ps1'];
+    const ACCOUNT_LABELS = {
+        accountCreate: 'Create', accountUpdate: 'Update', accountEnable: 'Enable',
+        accountDisable: 'Disable', accountDelete: 'Delete', accountImport: 'Import',
+    };
+
+    function planRepository(paths) {
+        const byFolder = new Map(); // folder -> Map(lowercase file name -> path)
+        paths.forEach(path => {
+            const slash = path.lastIndexOf('/');
+            const folder = slash < 0 ? '' : path.slice(0, slash);
+            if (!byFolder.has(folder)) byFolder.set(folder, new Map());
+            byFolder.get(folder).set(path.slice(slash + 1).toLowerCase(), path);
+        });
+        // role -> path, for the files of a folder that have a role
+        const filesOf = (folder, names) => {
+            const files = byFolder.get(folder) ?? new Map();
+            return Object.fromEntries(Object.entries(names).filter(([name]) => files.has(name))
+                .map(([name, role]) => [role, files.get(name)]));
+        };
+        // Without a fieldMapping.json, another mapping export (e.g. mapping.json)
+        const otherMapping = (folder) => [...(byFolder.get(folder)?.entries() ?? [])]
+            .find(([name]) => /mapping.*\.json$/.test(name))?.[1];
+        const setupOf = (folder) => {
+            const files = filesOf(folder, SETUP_FILES);
+            const mapping = files.mapping ?? otherMapping(folder);
+            return { ...files, ...(mapping ? { mapping } : {}), scripts: filesOf(folder, ACCOUNT_FILES) };
+        };
+        const isPermissionFolder = (folder) => folder !== '' && !folder.startsWith('.') &&
+            PERMISSION_MARKERS.some(name => byFolder.get(folder)?.has(name));
+
+        const permissionSets = [];
+        [...byFolder.keys()].filter(isPermissionFolder).sort().forEach(folder => {
+            const label = folder.replace(/^permissions\//i, '');
+            const kinds = Object.keys(PERMISSION_FILES)
+                .map(kind => ({ dynamic: kind === 'dynamic', files: filesOf(folder, PERMISSION_FILES[kind]) }))
+                .filter(({ dynamic, files }) => (dynamic ? files.permissionActionScript
+                    : files.retrievePermissionsScript || files.grantPermissionScript || files.revokePermissionScript));
+            kinds.forEach(({ dynamic, files }) => permissionSets.push({
+                name: dynamic && kinds.length > 1 ? `${label} (dynamic)` : label,
+                dynamic,
+                files,
+                // Both in one folder: two ways to do the same; the first by default
+                selected: !(dynamic && kinds.length > 1),
+            }));
+        });
+        const variants = [...byFolder.keys()]
+            .filter(folder => folder && !folder.includes('/') && !folder.startsWith('.') && !isPermissionFolder(folder) &&
+                (Object.keys(filesOf(folder, ACCOUNT_FILES)).length || byFolder.get(folder).has('configuration.json')))
+            .sort()
+            .map(folder => ({ name: folder, ...setupOf(folder) }));
+        return {
+            main: setupOf(''),
+            variants,
+            permissionSets,
+            resources: paths.filter(path => /(^|\/)resources\.ps1$/i.test(path)),
+            icon: paths.find(path => /^icon\.png$/i.test(path)) ?? null,
+            readme: paths.find(path => /^readme\.md$/i.test(path)) ?? null,
+            paths,
+        };
+    }
+
+    // The files for a choice: a variant ('' for the main connector), and
+    // whether what the variant doesn't have comes from the main connector
+    function chosenFiles(plan, { variant = '', fallback = false, sets }) {
+        const own = plan.variants.find(v => v.name === variant) ?? null;
+        const pick = (get) => (own ? get(own) ?? (fallback ? get(plan.main) : undefined) : get(plan.main));
+        return {
+            configuration: pick(s => s.configuration),
+            mapping: pick(s => s.mapping),
+            uniqueness: pick(s => s.uniqueness),
+            scripts: Object.fromEntries(Object.values(ACCOUNT_FILES)
+                .map(role => [role, pick(s => s.scripts[role])]).filter(([, path]) => path)),
+            permissionSets: plan.permissionSets.filter(set => sets.has(set.name)),
+        };
+    }
+
+    const usedFiles = (chosen) => new Set([
+        chosen.configuration, chosen.mapping, chosen.uniqueness,
+        ...Object.values(chosen.scripts),
+        ...chosen.permissionSets.flatMap(set => Object.values(set.files)),
+    ].filter(Boolean));
+
+    // What the user can assign a file to (see showGithubPicker). The
+    // matching above only makes the first suggestion: any part can get
+    // any of the repository's scripts and JSON files.
+    const SETUP_SLOTS = [
+        ...Object.entries(ACCOUNT_LABELS).map(([key, label]) => ({ key, label: `${label} script` })),
+        { key: 'configuration', label: 'Configuration form' },
+        { key: 'mapping', label: 'Field mapping' },
+        { key: 'uniqueness', label: 'Uniqueness check' },
+    ];
+    const PERMISSION_SLOTS = [
+        { key: 'retrievePermissionsScript', label: 'Retrieve permissions', dynamic: false },
+        { key: 'grantPermissionScript', label: 'Grant', dynamic: false },
+        { key: 'updatePermissionScript', label: 'Update', dynamic: false },
+        { key: 'revokePermissionScript', label: 'Revoke', dynamic: false },
+        { key: 'permissionActionScript', label: 'All actions (subpermissions)', dynamic: true },
+        { key: 'permissionImportScript', label: 'Import', dynamic: null }, // both
+    ];
+    const isAssignable = (path) => /\.(ps1|psm1|json)$/i.test(path) && !path.startsWith('.');
+
+    // The files of a variant ('' for the main connector) for each part,
+    // '' for none
+    function presetFiles(plan, variant = '', fallback = false) {
+        const chosen = chosenFiles(plan, { variant, fallback, sets: new Set() });
+        return Object.fromEntries(SETUP_SLOTS.map(({ key }) =>
+            [key, (key in ACCOUNT_LABELS ? chosen.scripts[key] : chosen[key]) ?? '']));
+    }
+
+    // The starting point of the choices: the main connector, and the
+    // permission sets that were found
+    const newSetup = (repo, plan) => ({
+        name: repo.title,
+        variant: '',
+        fallback: false,
+        files: presetFiles(plan),
+        sets: plan.permissionSets.map(set => ({ name: set.name, dynamic: set.dynamic, include: set.selected, files: { ...set.files } })),
+    });
+
+    // The choices as files per part (as chosenFiles gives them)
+    function chosenFromSetup(setup) {
+        const file = (key) => setup.files[key] || undefined;
+        return {
+            configuration: file('configuration'),
+            mapping: file('mapping'),
+            uniqueness: file('uniqueness'),
+            scripts: Object.fromEntries(Object.keys(ACCOUNT_LABELS).map(key => [key, file(key)]).filter(([, path]) => path)),
+            permissionSets: setup.sets.filter(set => set.include).map(set => ({
+                name: set.name.trim(),
+                dynamic: set.dynamic,
+                files: Object.fromEntries(PERMISSION_SLOTS
+                    .filter(slot => slot.dynamic === null || slot.dynamic === set.dynamic)
+                    .map(slot => [slot.key, set.files[slot.key]]).filter(([, path]) => path)),
+            })),
+        };
+    }
+
+    // What stops the choices from being created
+    function setupProblems(chosen) {
+        const problems = [];
+        const names = chosen.permissionSets.map(set => set.name);
+        if (names.some(name => !name)) problems.push('Every permission set needs a name.');
+        const twice = names.filter((name, i) => name && names.indexOf(name) !== i);
+        if (twice.length) problems.push(`Permission sets need names of their own: ${[...new Set(twice)].join(', ')}.`);
+        chosen.permissionSets.forEach(set => {
+            if (set.dynamic && !set.files.permissionActionScript) {
+                problems.push(`Permission set "${set.name}" needs a script for all actions.`);
+            } else if (!set.dynamic && !set.files.grantPermissionScript && !set.files.revokePermissionScript) {
+                problems.push(`Permission set "${set.name}" needs a grant or revoke script.`);
+            }
+        });
+        return problems;
+    }
+
+    // The files that are not imported, grouped: the note of what a
+    // repository has that this doesn't cover (yet). unrecognized: those
+    // the matching found no part for.
+    function notImported(plan, chosen) {
+        const used = usedFiles(chosen);
+        const recognized = new Set([
+            ...plan.variants.flatMap(v => [v.configuration, v.mapping, v.uniqueness, ...Object.values(v.scripts)]),
+            ...plan.permissionSets.flatMap(set => Object.values(set.files)),
+            ...plan.resources,
+        ]);
+        const left = plan.paths.filter(path => !used.has(path) && !path.startsWith('.github/'));
+        const isDoc = (path) => /\.(md|png|jpe?g|gif|svg)$/i.test(path) || /(^|\/)\.gitignore$/i.test(path);
+        const other = left.filter(path => !plan.resources.includes(path) && !isDoc(path));
+        return {
+            resources: left.filter(path => plan.resources.includes(path)),
+            documentation: left.filter(isDoc),
+            other,
+            unrecognized: new Set(other.filter(path => !recognized.has(path))),
+        };
+    }
+
+    // fieldMapping.json is HelloID's own mapping export ("v1"): back to
+    // the configuration's format, with new IDs (see "Mapping (all
+    // fields)" in POWERSHELL_IMPORT_STEPS for the other way)
+    function mappingFromExport(file, path) {
+        if (!Array.isArray(file?.MappingFields)) throw new Error(`${path} is not a HelloID field mapping (it has no MappingFields).`);
+        const numberOf = (names, name, what, field) => {
+            const entry = Object.entries(names).find(([, n]) => n.toLowerCase() === String(name).toLowerCase());
+            if (!entry) throw new Error(`${path} has an unknown mapping ${what} "${name}" (field "${field}").`);
+            return Number(entry[0]);
+        };
+        const valueOf = (value) => {
+            if (typeof value !== 'string') return value ?? null;
+            try { return JSON.parse(value); } catch { return value; }
+        };
+        const fields = file.MappingFields.map(field => ({
+            identifier: crypto.randomUUID(),
+            name: field.Name,
+            description: field.Description ?? '',
+            type: numberOf(MAPPING_TYPES, field.Type ?? 'Text', 'type', field.Name),
+            mappingActions: (field.MappingActions ?? []).map(action => ({
+                mappingActionId: crypto.randomUUID(),
+                entitlementActions: (action.MapForActions ?? []).map(a => numberOf(MAPPING_ACTIONS, a, 'action', field.Name)),
+                mode: numberOf(MAPPING_MODES, action.MappingMode ?? 'None', 'mode', field.Name),
+                value: valueOf(action.Value),
+                usedInNotifications: action.UsedInNotifications === true,
+                storeInAccountData: action.StoreInAccountData === true,
+            })),
+        }));
+        const unique = (file.UniqueFieldNames ?? []).map(name => fields.find(f => f.name === name)?.identifier).filter(Boolean);
+        return { fields, unique };
+    }
+
+    // The import file for the chosen files of a repository: only the parts
+    // it has (see partial in importData)
+    async function repositoryImport(repo, details, plan, chosen, name) {
+        const paths = [...usedFiles(chosen)];
+        const texts = Object.fromEntries(await Promise.all(paths.map(async path =>
+            [path, await githubRequest(githubRawUrl(repo.name, details.ref, path), { text: true })])));
+        const text = (path) => (path ? texts[path] : null);
+        const json = (path, what) => {
+            try { return JSON.parse(texts[path].replace(/^﻿/, '')); } catch (e) {
+                throw new Error(`${what} (${path}) is not valid JSON: ${e.message}`);
+            }
+        };
+        const form = chosen.configuration ? json(chosen.configuration, 'The configuration') : [];
+        const fields = Array.isArray(form) ? form : form?.fields;
+        if (!Array.isArray(fields)) throw new Error(`${chosen.configuration} is not a list of configuration fields.`);
+        const mapping = chosen.mapping ? mappingFromExport(json(chosen.mapping, 'The field mapping'), chosen.mapping) : null;
+
+        const configuration = {
+            displayName: name,
+            description: [repo.description, `${repo.url} (${details.ref})`].filter(Boolean).join('\n'),
+            ...(plan.icon ? { icon: githubRawUrl(repo.name, details.ref, plan.icon) } : {}),
+            isDisabled: true,
+            scripts: Object.fromEntries(Object.entries(chosen.scripts).map(([role, path]) => [role, text(path)])),
+            scriptConfigurationForm: { fields },
+            // The defaults of the fields; secrets and the like are filled in afterwards
+            scriptConfiguration: Object.fromEntries(fields.filter(f => f?.key)
+                .map(f => [f.key, f.defaultValue ?? (f.type === 'checkbox' ? false : '')])),
+            permissions: chosen.permissionSets.map(set => ({
+                displayName: set.name,
+                identification: crypto.randomUUID(),
+                hasSubPermissions: set.dynamic,
+                useContextDataStorage: false,
+                useScriptToRetrievePermissions: Boolean(set.files.retrievePermissionsScript),
+                retrievePermissionsScript: text(set.files.retrievePermissionsScript),
+                useSeparateScriptForEachAction: !set.dynamic,
+                permissionActionScript: text(set.files.permissionActionScript),
+                grantPermissionScript: text(set.files.grantPermissionScript),
+                updatePermissionScript: text(set.files.updatePermissionScript),
+                revokePermissionScript: text(set.files.revokePermissionScript),
+                permissionImportScript: text(set.files.permissionImportScript),
+            })),
+            ...(mapping || chosen.uniqueness ? {
+                mappingConfiguration: {
+                    ...(mapping ? { fields: mapping.fields } : {}),
+                    ...(chosen.uniqueness || mapping?.unique.length ? {
+                        uniquenessConfiguration: {
+                            script: text(chosen.uniqueness),
+                            mappingEntitlementActions: [],
+                            selectedUniqueFields: mapping?.unique ?? [],
+                        },
+                    } : {}),
+                },
+            } : {}),
+        };
+        return {
+            exportedAt: details.ref,
+            exportedFrom: repo.url,
+            exportedBy: 'GitHub',
+            secretsIncluded: true,
+            systemId: crypto.randomUUID(), // not in this environment: a new system
+            displayName: name,
+            templateIdentifier: POWERSHELL_V2,
+            configuration,
+        };
+    }
+
+    // The README in a frame of its own, without scripts (it comes from
+    // GitHub, not from HelloID). Relative links and images point at the
+    // repository; links open in a new tab, except those within the page.
+    const README_STYLES = `
+        body { margin: 0; padding: 4px 16px 16px 4px; font: 14px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+               color: #1f2328; overflow-wrap: break-word; }
+        h1, h2 { padding-bottom: .3em; border-bottom: 1px solid #d1d9e0; }
+        h1 { font-size: 1.8em; } h2 { font-size: 1.4em; } h3 { font-size: 1.15em; }
+        a { color: #0969da; text-decoration: none; } a:hover { text-decoration: underline; }
+        img { max-width: 100%; }
+        code { padding: .2em .4em; background: #eff1f3; border-radius: 4px; font-size: 85%; }
+        pre { padding: 12px; background: #f6f8fa; border-radius: 6px; overflow: auto; }
+        pre code { padding: 0; background: none; font-size: 85%; }
+        table { border-collapse: collapse; margin: 0 0 16px; display: block; overflow: auto; }
+        th, td { padding: 6px 13px; border: 1px solid #d1d9e0; }
+        blockquote { margin: 0 0 16px; padding: 0 1em; color: #59636e; border-left: .25em solid #d1d9e0; }
+    `;
+
+    function readmeDocument(markdown, repo, ref) {
+        // The library (see @require), from the global scope: "marked" in this
+        // script is the helper for marking messages
+        const parse = [globalThis.marked, globalThis.window?.marked].find(lib => typeof lib?.parse === 'function');
+        if (!parse) throw new Error('The markdown library did not load. Reload the page and try again.');
+        // Parsed into an inert document: nothing in it runs here
+        const doc = new DOMParser().parseFromString(parse.parse(markdown, { gfm: true, async: false }), 'text/html');
+        const absolute = (value, base) => {
+            try { return new URL(value, base).href; } catch { return value; }
+        };
+        doc.querySelectorAll('script').forEach(el => el.remove()); // (they couldn't run in the frame anyway)
+        doc.querySelectorAll('[src]').forEach(el => {
+            const src = el.getAttribute('src').trim();
+            if (src) el.setAttribute('src', absolute(src, githubRawUrl(repo.name, ref, 'README.md')));
+        });
+        // Headings get the IDs GitHub gives them, for the README's own table of contents
+        const used = new Map();
+        doc.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(heading => {
+            const slug = heading.textContent.trim().toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s/g, '-');
+            const n = used.get(slug) ?? 0;
+            used.set(slug, n + 1);
+            if (!heading.id) heading.id = n ? `${slug}-${n}` : slug;
+        });
+        doc.querySelectorAll('a[href]').forEach(a => {
+            const href = a.getAttribute('href');
+            if (href.startsWith('#')) return;
+            a.setAttribute('href', absolute(href, githubBlobUrl(repo.name, ref, 'README.md')));
+            a.setAttribute('target', '_blank');
+            a.setAttribute('rel', 'noopener noreferrer');
+        });
+        return `<!doctype html><html><head><meta charset="utf-8"><style>${README_STYLES}</style></head>` +
+               `<body>${doc.body.innerHTML}</body></html>`;
+    }
+
+    // An element with properties and children (texts or elements)
+    function make(tag, props = {}, ...children) {
+        const el = Object.assign(document.createElement(tag), props);
+        el.append(...children.filter(child => child !== null && child !== undefined && child !== false));
+        return el;
+    }
+
+    // The popup: the connectors on the left, the chosen one on the right
+    // (its README, then what to create). Resolves when it is closed.
+    function showGithubPicker() {
+        return new Promise(resolve => {
+            addStyles();
+            const dialog = make('dialog', { className: `${DIALOG_CLASS} tm-github` });
+            const closeIcon = make('button', { type: 'button', className: 'btn-close', title: 'Close' });
+            const search = make('input', { type: 'search', className: 'form-control', placeholder: 'Search target connectors' });
+            const refresh = make('button', { type: 'button', className: 'btn btn-default', title: 'Refresh' },
+                make('i', { className: 'fa-solid fa-refresh' }));
+            const count = make('small', { className: 'text-muted' });
+            const list = make('div', { className: 'tm-github-repos' });
+            const detail = make('div', { className: 'tm-github-detail' },
+                make('div', { className: 'tm-github-message text-muted' }, 'Select a connector to see its README.'));
+            const status = make('small', { className: 'tm-github-status text-muted' });
+            const back = make('button', { type: 'button', className: 'btn btn-sm btn-default', hidden: true }, 'Back');
+            const close = make('button', { type: 'button', className: 'btn btn-sm btn-default' }, 'Close');
+            const create = make('button', { type: 'button', className: 'btn btn-sm btn-complete', disabled: true },
+                make('i', { className: 'fa-solid fa-plus' }), ' Create');
+            dialog.append(
+                make('div', { className: 'tm-github-header' }, make('h5', {}, 'Create target system from GitHub'), closeIcon),
+                make('div', { className: 'tm-github-body' },
+                    make('div', { className: 'tm-github-list' },
+                        make('div', { className: 'tm-github-search' }, search, refresh), count, list),
+                    detail),
+                make('div', { className: 'tm-dialog-footer' }, status, back, close, create));
+
+            let repos = [];
+            let selected = null; // { repo, details, plan }
+            let setup = null;    // the choices for the selected connector (kept when going back)
+            let onSetup = false; // on the second step: what to create
+            let busy = false;
+            let seq = 0;         // the latest selection; older answers are ignored
+
+            const setStatus = (text, isError = false) => {
+                status.textContent = text;
+                status.className = `tm-github-status ${isError ? 'text-danger' : 'text-muted'}`;
+            };
+            let setupError = null; // where the second step shows what's wrong
+            const message = (text, isError = false) => detail.replaceChildren(
+                make('div', { className: `tm-github-message ${isError ? 'text-danger' : 'text-muted'}` }, text));
+
+            // --- The list ---
+            const renderList = () => {
+                const words = toWords(search.value);
+                const shown = repos.filter(repo => matchesWords(`${repo.title} ${repo.name} ${repo.topics.join(' ')}`, words));
+                list.replaceChildren(...shown.map(repo => {
+                    const row = make('button', {
+                        type: 'button',
+                        className: `tm-github-repo${selected?.repo === repo ? ' active' : ''}`,
+                        title: `${repo.name}\n${repo.description}`,
+                    },
+                    make('img', { src: githubRawUrl(repo.name, repo.defaultBranch, 'Icon.png'), alt: '', loading: 'lazy' }),
+                    make('span', { className: 'tm-github-repo-text' },
+                        make('span', { className: 'tm-github-repo-title' }, repo.title),
+                        make('span', { className: 'tm-github-badges' },
+                            ...repo.topics.filter(t => !['provisioning', 'target'].includes(t)).slice(0, 3)
+                                .map(topic => make('span', { className: 'badge' }, topic)))));
+                    row.querySelector('img').addEventListener('error', (e) => { e.target.style.visibility = 'hidden'; });
+                    row.addEventListener('click', () => select(repo));
+                    return row;
+                }));
+                count.textContent = words.length ? `${shown.length} of ${repos.length} connectors` : `${repos.length} connectors`;
+            };
+            const loadList = async (fresh = false) => {
+                list.replaceChildren(make('div', { className: 'tm-github-message text-muted' }, 'Loading the connectors from GitHub...'));
+                try {
+                    repos = await listGithubRepositories(fresh);
+                    renderList();
+                } catch (e) {
+                    list.replaceChildren(make('div', { className: 'tm-github-message text-danger' }, String(e?.message ?? e)));
+                }
+            };
+
+            // --- The README of the chosen connector ---
+            const fileCheck = (ok, label, title) => make('div', { className: 'tm-github-file', title },
+                make('i', { className: ok ? 'fa-solid fa-check text-success' : 'fa-solid fa-xmark text-muted' }), ` ${label}`);
+
+            const infoHeader = (repo, details, plan) => {
+                const scripts = plan.main.scripts;
+                const releaseBadge = make('span', {
+                    className: 'badge',
+                    title: details.release ? `Released on: ${(details.release.date ?? '').slice(0, 10)}`
+                        : 'No release: the default branch',
+                }, make('i', { className: details.release ? 'fa-regular fa-tag' : 'fa-solid fa-code-branch' }), ` ${details.ref}`);
+                const icon = make('img', { className: 'tm-github-icon', alt: '' });
+                if (plan.icon) icon.src = githubRawUrl(repo.name, details.ref, plan.icon);
+                return make('div', { className: 'tm-github-info' },
+                    icon,
+                    make('div', { className: 'tm-github-title' },
+                        make('div', {},
+                            make('a', { href: repo.url, target: '_blank', rel: 'noopener noreferrer' }, make('strong', {}, repo.title)),
+                            ' ', make('i', { className: 'fa-solid fa-arrow-up-right-from-square' })),
+                        releaseBadge),
+                    make('div', { className: 'tm-github-files' },
+                        ...Object.entries(ACCOUNT_LABELS).map(([role, label]) =>
+                            fileCheck(Boolean(scripts[role]), label, scripts[role] ?? `No ${label.toLowerCase()} script`)),
+                        fileCheck(Boolean(plan.main.configuration), 'Configuration', plan.main.configuration ?? 'No configuration.json'),
+                        fileCheck(Boolean(plan.main.mapping), 'Mappings', plan.main.mapping ?? 'No fieldMapping.json'),
+                        fileCheck(plan.permissionSets.length > 0, `Permissions (${plan.permissionSets.length})`,
+                            plan.permissionSets.map(s => s.name).join('\n') || 'No permission scripts'),
+                        fileCheck(plan.variants.length > 0, `Variants (${plan.variants.length})`,
+                            plan.variants.map(v => v.name).join('\n') || 'No variants')));
+            };
+
+            const select = async (repo) => {
+                if (busy) return;
+                const mine = ++seq;
+                if (selected?.repo !== repo) setup = null;
+                selected = { repo, details: null, plan: null };
+                onSetup = false;
+                back.hidden = true;
+                create.disabled = true;
+                create.lastChild.textContent = ' Create';
+                setStatus('');
+                renderList();
+                message('Loading from GitHub...');
+                try {
+                    const details = await loadRepositoryDetails(repo);
+                    const plan = planRepository(details.paths);
+                    if (mine !== seq) return;
+                    selected = { repo, details, plan };
+                    const frame = make('iframe', { className: 'tm-github-readme', title: 'README' });
+                    // No scripts; links may open a tab of their own
+                    frame.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
+                    detail.replaceChildren(infoHeader(repo, details, plan), frame);
+                    create.disabled = false;
+                    if (details.truncated) setStatus('GitHub listed only part of the files of this repository.', true);
+                    const markdown = plan.readme
+                        ? await githubRequest(githubRawUrl(repo.name, details.ref, plan.readme), { text: true })
+                        : '_This repository has no README._';
+                    if (mine !== seq) return;
+                    frame.srcdoc = readmeDocument(markdown, repo, details.ref);
+                } catch (e) {
+                    if (mine === seq) message(String(e?.message ?? e), true);
+                }
+            };
+
+            // --- What to create ---
+            // Every part has a dropdown with the repository's scripts and
+            // JSON files, starting at what the matching found. A variant
+            // fills them in again. Permission sets can be changed, left
+            // out and added.
+            const showSetup = () => {
+                const { repo, details, plan } = selected;
+                setup = setup ?? newSetup(repo, plan);
+                onSetup = true;
+                back.hidden = false;
+                create.lastChild.textContent = ' Create target system';
+
+                const name = make('input', { type: 'text', className: 'form-control', value: setup.name });
+                name.addEventListener('input', () => { setup.name = name.value; });
+                const filesTable = make('table', { className: 'table table-condensed tm-github-table' });
+                const setsArea = make('div', { className: 'tm-github-sets' });
+                const notes = make('div');
+                setupError = make('p', { className: 'text-danger' });
+
+                // The files to choose from, by folder
+                const folders = new Map();
+                plan.paths.filter(isAssignable).forEach(path => {
+                    const folder = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+                    if (!folders.has(folder)) folders.set(folder, []);
+                    folders.get(folder).push(path);
+                });
+                const unmatched = () => notImported(plan, chosenFromSetup(setup)).unrecognized;
+                const fileSelect = (value, onChange) => {
+                    const select = make('select', { className: 'form-control input-sm' },
+                        make('option', { value: '' }, '(none)'),
+                        ...[...folders].map(([folder, paths]) => make('optgroup', { label: folder || '(root)' },
+                            ...paths.map(path => make('option', { value: path, title: path }, path.split('/').pop())))));
+                    select.value = value || '';
+                    select.addEventListener('change', () => {
+                        onChange(select.value);
+                        renderNotes();
+                    });
+                    return select;
+                };
+
+                const variant = plan.variants.length ? make('select', { className: 'form-control' },
+                    make('option', { value: '' }, 'Main connector'),
+                    ...plan.variants.map(v => make('option', { value: v.name }, v.name))) : null;
+                const fallback = make('input', { type: 'checkbox' });
+                const fallbackLabel = make('label', { className: 'tm-github-check' }, fallback,
+                    ' Take what this variant doesn\'t have from the main connector (see its README)');
+                const applyPreset = () => {
+                    fallbackLabel.hidden = !setup.variant;
+                    setup.files = presetFiles(plan, setup.variant, setup.fallback);
+                    renderFiles();
+                    renderNotes();
+                };
+                if (variant) {
+                    variant.value = setup.variant;
+                    variant.addEventListener('change', () => { setup.variant = variant.value; applyPreset(); });
+                }
+                fallback.checked = setup.fallback;
+                fallback.addEventListener('change', () => { setup.fallback = fallback.checked; applyPreset(); });
+                fallbackLabel.hidden = !setup.variant;
+
+                const renderFiles = () => filesTable.replaceChildren(make('tbody', {},
+                    ...SETUP_SLOTS.map(slot => make('tr', {},
+                        make('td', {}, slot.label),
+                        make('td', {}, fileSelect(setup.files[slot.key], (path) => { setup.files[slot.key] = path; }))))));
+
+                const renderSets = () => setsArea.replaceChildren(
+                    ...setup.sets.map(set => {
+                        const include = make('input', { type: 'checkbox', checked: set.include, title: 'Create this permission set' });
+                        const setName = make('input', { type: 'text', className: 'form-control input-sm', value: set.name,
+                            placeholder: 'Name of the permission set' });
+                        const mode = make('select', { className: 'form-control input-sm' },
+                            make('option', { value: 'static' }, 'A script per action'),
+                            make('option', { value: 'dynamic' }, 'One script for all actions (subpermissions)'));
+                        mode.value = set.dynamic ? 'dynamic' : 'static';
+                        include.addEventListener('change', () => {
+                            set.include = include.checked;
+                            renderSets();
+                            renderNotes();
+                        });
+                        setName.addEventListener('input', () => { set.name = setName.value; });
+                        mode.addEventListener('change', () => {
+                            set.dynamic = mode.value === 'dynamic';
+                            renderSets();
+                            renderNotes();
+                        });
+                        const slots = PERMISSION_SLOTS.filter(slot => slot.dynamic === null || slot.dynamic === set.dynamic);
+                        return make('div', { className: `tm-github-set${set.include ? '' : ' tm-github-set-off'}` },
+                            make('div', { className: 'tm-github-set-head' }, include, setName, mode),
+                            set.include ? make('table', { className: 'table table-condensed tm-github-table' }, make('tbody', {},
+                                ...slots.map(slot => make('tr', {},
+                                    make('td', {}, slot.label),
+                                    make('td', {}, fileSelect(set.files[slot.key], (path) => { set.files[slot.key] = path; })))))) : null);
+                    }),
+                    (() => {
+                        const add = make('button', { type: 'button', className: 'btn btn-xs btn-default' },
+                            make('i', { className: 'fa-solid fa-plus' }), ' Add permission set');
+                        add.addEventListener('click', () => {
+                            setup.sets.push({ name: '', dynamic: false, include: true, files: {} });
+                            renderSets();
+                            setsArea.querySelector('.tm-github-set:last-of-type input[type="text"]')?.focus();
+                        });
+                        return add;
+                    })());
+
+                const renderNotes = () => {
+                    const left = notImported(plan, chosenFromSetup(setup));
+                    const listOf = (paths) => make('ul', {}, ...paths.map(path => make('li', {}, make('code', {}, path),
+                        left.unrecognized.has(path) ? make('span', { className: 'badge tm-github-new', title:
+                            'No part was found for this file: assign it above if it belongs to one' }, 'not recognized') : null)));
+                    notes.replaceChildren(
+                        left.resources.length ? make('div', {},
+                            make('strong', {}, 'Not imported: resources'), ' (not supported yet; add them by hand)',
+                            listOf(left.resources)) : null,
+                        left.other.length ? make('div', {},
+                            make('strong', {}, 'Not imported: files without a part'),
+                            ' (assign them above, or check the README for what they are for)',
+                            listOf(left.other)) : null,
+                        left.documentation.length ? make('div', { className: 'text-muted' },
+                            `Not imported: ${left.documentation.length} documentation and image files (README, CHANGELOG, ...).`) : null);
+                };
+                renderFiles();
+                renderSets();
+                renderNotes();
+
+                detail.replaceChildren(make('div', { className: 'tm-github-setup' },
+                    infoHeader(repo, details, plan),
+                    make('label', {}, 'Name of the new target system'), name,
+                    variant ? make('div', {}, make('label', {}, 'Variant'),
+                        make('small', { className: 'text-muted' }, ' (fills in the files below again)'), variant, fallbackLabel) : null,
+                    make('label', {}, 'Account scripts, configuration and mapping'), filesTable,
+                    make('label', {}, 'Permission sets'), setsArea,
+                    notes,
+                    make('p', { className: 'text-muted' },
+                        'The new system is created DISABLED, with the defaults of the configuration form. Fill in the ' +
+                        'configuration, correlation and thresholds yourself, and test the scripts before you enable it.'),
+                    setupError));
+                if (unmatched().size) setStatus(`${unmatched().size} file(s) were not recognized: see the list below.`);
+                name.focus();
+            };
+
+            const finish = (value) => {
+                dialog.close();
+                resolve(value);
+            };
+
+            const createSystem = async () => {
+                const { repo, details, plan } = selected;
+                const name = setup.name.trim();
+                setupError.textContent = '';
+                if (!name) {
+                    setupError.textContent = 'Give the new target system a name.';
+                    return;
+                }
+                const chosen = chosenFromSetup(setup);
+                const problems = setupProblems(chosen);
+                if (problems.length) {
+                    setupError.textContent = problems.join(' ');
+                    return;
+                }
+                busy = true;
+                [create, back, close, refresh].forEach(b => { b.disabled = true; });
+                setStatus('Checking the name and loading the files from GitHub...');
+                try {
+                    if (!gateway) throw new Error('No request of HelloID seen yet. Reload the page and try again.');
+                    if (await fetchFromGateway(NAME_EXISTS_PATH(name)) === true) {
+                        throw new Error(`Another target system is already named "${name}".`);
+                    }
+                    const data = await repositoryImport(repo, details, plan, chosen, name);
+                    const left = notImported(plan, chosen);
+                    const note = [
+                        `\n\nFrom GitHub: ${repo.url} (${details.ref})` + (setup.variant ? `, variant "${setup.variant}"` : '') + '.',
+                        left.resources.length ? `Not imported, as resources aren't supported yet: ${left.resources.join(', ')}.` : '',
+                        left.other.length ? `Not imported (see the README): ${left.other.join(', ')}.` : '',
+                        strong('Next: fill in the configuration, set correlation, and test the scripts before you enable the system.'),
+                    ].filter(Boolean).join('\n');
+                    finish({ data, note });
+                } catch (e) {
+                    setupError.textContent = String(e?.message ?? e);
+                    setStatus('');
+                } finally {
+                    busy = false;
+                    [create, back, close, refresh].forEach(b => { b.disabled = false; });
+                }
+            };
+
+            search.addEventListener('input', renderList);
+            refresh.addEventListener('click', () => loadList(true));
+            back.addEventListener('click', () => select(selected.repo));
+            create.addEventListener('click', () => (onSetup ? createSystem() : showSetup()));
+            [close, closeIcon].forEach(b => b.addEventListener('click', () => { if (!busy) finish(null); }));
+            dialog.addEventListener('cancel', (e) => {
+                e.preventDefault(); // Escape: as Close, unless busy
+                if (!busy) finish(null);
+            });
+            dialog.addEventListener('close', () => dialog.remove());
+            dialog.addEventListener('keydown', (e) => e.stopPropagation());
+
+            document.body.appendChild(dialog);
+            dialog.showModal();
+            search.focus();
+            loadList();
+        });
+    }
+
+    // Next to the Import button
+    function addGithubButton() {
+        const addBtn = document.querySelector('button[data-cy="add-target-system"]');
+        if (!addBtn) return;
+        const existing = addBtn.parentElement.querySelector(`.${GITHUB_BTN_CLASS}`);
+        if (existing) {
+            if (!existing.dataset.spaced) evenOutSpacing(existing, addBtn); // until it could be measured
+            return;
+        }
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `btn btn-xs btn-default ${GITHUB_BTN_CLASS}`;
+        btn.title = 'Create a target system from one of Tools4ever\'s connectors on GitHub';
+        btn.innerHTML = GITHUB_LOGO;
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            try {
+                const picked = await showGithubPicker();
+                if (picked) await importData(picked.data, { partial: true, confirmedNew: true, finishNote: picked.note });
+            } catch (err) {
+                if (!err?.shown) {
+                    console.warn('[HelloID UX] Target system from GitHub failed', err);
+                    await showDialog('Target system from GitHub failed', error(String(err?.message ?? err)));
+                }
+            } finally {
+                btn.disabled = false;
+            }
+        });
+        addBtn.before(btn);
+        evenOutSpacing(btn, addBtn);
+    }
+
+    // The same space before our button as between it and HelloID's Add
+    // button (that one comes from HelloID's own layout)
+    function evenOutSpacing(btn, addBtn) {
+        const before = btn.previousElementSibling;
+        if (!before?.classList.contains(IMPORT_BTN_CLASS)) return;
+        const gap = (left, right) => right.getBoundingClientRect().left - left.getBoundingClientRect().right;
+        if (!btn.offsetWidth || !addBtn.offsetWidth || !before.offsetWidth) return; // not drawn yet
+        btn.dataset.spaced = '1';
+        const difference = gap(btn, addBtn) - gap(before, btn);
+        if (Math.abs(difference) >= 1) {
+            btn.style.marginLeft = `${(parseFloat(getComputedStyle(btn).marginLeft) || 0) + difference}px`;
+        }
+    }
+
     function findTileByName(name) {
         return [...document.querySelectorAll(SYSTEM_TILE)]
             .find(t => t.querySelector('h5.system-header')?.textContent.trim() === name);
@@ -5623,7 +6590,8 @@
         pinButtons(nameCell, createCopyButton(() => row.name, 'btn btn-default btn-xs'),
             createExportButton(() => row.name),
             createExportButton(() => row.name, undefined, EXPORT_KINDS.granted),
-            createExportButton(() => row.name, undefined, EXPORT_KINDS.migration), configure);
+            createExportButton(() => row.name, undefined, EXPORT_KINDS.migration),
+            ...createExtensionButtons(() => row.name, 'btn btn-default btn-xs'), configure);
 
         // Summary since, Last updated, ...
         model.infoLabels.forEach(label => {
@@ -6740,6 +7708,53 @@
         .tm-dialog-content ul { padding-left: 20px; }
         .tm-dialog-content li { margin: 6px 0; }
         .tm-dialog-footer { display: flex; gap: 8px; }
+
+        /* Target system from GitHub: like HelloID's "Create System" for
+           source systems (see showGithubPicker) */
+        .${DIALOG_CLASS}.tm-github { width: min(1500px, 95vw); height: min(900px, 90vh); max-height: none; }
+        .tm-github-header { display: flex; align-items: center; justify-content: space-between; }
+        .tm-github-body { flex: 1; min-height: 0; display: flex; gap: 20px; }
+        .tm-github-list { flex: 0 0 25%; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+        .tm-github-search { display: flex; gap: 6px; }
+        .tm-github-repos { flex: 1; min-height: 0; overflow: auto; border-top: 1px solid #e5e5e5; }
+        .tm-github-repo {
+            display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 6px;
+            border: none; border-bottom: 1px solid #e5e5e5; background: none; text-align: left;
+        }
+        .tm-github-repo:hover { background: #f5f5f5; }
+        .tm-github-repo.active { background: #e8f0fe; }
+        .tm-github-repo img { width: 32px; height: 32px; object-fit: contain; flex: none; }
+        .tm-github-repo-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+        .tm-github-repo-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tm-github-badges { display: flex; flex-wrap: wrap; gap: 3px; }
+        .tm-github .badge { font-weight: normal; }
+        .tm-github-badges .badge { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+        .tm-github-detail { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+        .tm-github-message { margin: auto; text-align: center; }
+        .tm-github-info { display: flex; align-items: center; gap: 12px; }
+        .tm-github-icon { width: 48px; height: 48px; object-fit: contain; }
+        .tm-github-title { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+        .tm-github-files { display: grid; grid-auto-flow: column; grid-template-rows: repeat(3, auto); gap: 2px 24px; }
+        .tm-github-file { white-space: nowrap; }
+        .tm-github-file i { width: 15px; }
+        .tm-github-readme { flex: 1; min-height: 0; width: 100%; border: 1px solid #e5e5e5; border-radius: 4px; }
+        .tm-github-setup { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 10px; }
+        .tm-github-setup > label, .tm-github-setup > div > label:not(.tm-github-check) { margin: 6px 0 0; font-weight: bold; }
+        .tm-github-check { display: block; font-weight: normal; margin: 2px 0; }
+        .tm-github-table { margin: 0; }
+        .tm-github-table td:first-child { width: 180px; }
+        .tm-github-setup ul { margin: 4px 0 8px; padding-left: 20px; }
+        .tm-github-table td { vertical-align: middle; }
+        .tm-github-table select { max-width: 520px; }
+        .tm-github-sets { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+        .tm-github-set { width: 100%; padding: 6px 8px; border: 1px solid #e5e5e5; border-radius: 4px; }
+        .tm-github-set-off { opacity: .6; }
+        .tm-github-set-head { display: flex; align-items: center; gap: 8px; }
+        .tm-github-set-head input[type="text"] { flex: 1; }
+        .tm-github-set-head select { flex: 0 0 auto; width: auto; }
+        .tm-github-set .tm-github-table { margin-top: 6px; }
+        .tm-github .tm-github-new { margin-left: 6px; background: #f0ad4e; color: #fff; }
+        .tm-github-status { margin-right: auto; align-self: center; }
         /* Copy: the color of the main button, lighter */
         .tm-dialog-copy { opacity: .55; }
         .tm-dialog-copy:hover, .tm-dialog-copy:focus { opacity: .8; }
@@ -6774,6 +7789,88 @@
             api.addEventListener?.('newColumnsLoaded', () => applyResizable(api));
         });
     }
+
+    // =====================================================================
+    // Extensions
+    // =====================================================================
+    // Other userscripts can build on this one (e.g. "HelloID Entra ID
+    // certificates"). They find what they need in window.HelloIDUX, and
+    // the event "helloid-ux-ready" tells them when it's there:
+    //   registerSystemFlag(flag): a symbol of their own next to the names
+    //       of target systems, with a filter button like 🏁:
+    //       { key, text, label, titleFor(system) }. titleFor gets the
+    //       system's entry in HelloID's list of systems, and gives the text
+    //       on hover, or null for no symbol.
+    //   registerSystemButton(button): a button of their own for each target
+    //       system, in the list and on the tiles, before Configure:
+    //       { key, create(getName, className) -> element, refresh() }.
+    //       getName gives the system's name at click time; refresh is
+    //       called when a tile may show another system.
+    //   refreshSystems(): their symbols changed: show them again
+    //   onSystems(listener): called when HelloID's list of systems came by
+    //   and the helpers below, as this script uses them.
+    const API_VERSION = 1;
+    const extensionButtons = [];
+    const systemsListeners = [];
+
+    // The list rebuilds its header (filter buttons) and rows
+    function rebuildSystemList() {
+        if (!systemList) return;
+        systemList.signature = null;
+        systemList.headSignature = null;
+        renderSystemList();
+    }
+
+    // The buttons of extensions for one system; present: the keys of
+    // those it has already
+    function createExtensionButtons(getName, className, present = []) {
+        return extensionButtons.filter(button => !present.includes(button.key)).map(button => {
+            try {
+                const el = button.create(getName, className);
+                el.dataset.tmExtension = button.key;
+                return el;
+            } catch (e) {
+                console.warn(`[HelloID UX] Extension button "${button.key}" failed`, e);
+                return null;
+            }
+        }).filter(Boolean);
+    }
+
+    const extensionApi = Object.freeze({
+        version: API_VERSION,
+        registerSystemFlag(flag) {
+            if (SYSTEM_FLAGS.some(f => f.key === flag.key)) return;
+            SYSTEM_FLAGS.push({ ...flag, match: `.tm-flag-${flag.key}` });
+            rebuildSystemList();
+        },
+        registerSystemButton(button) {
+            if (extensionButtons.some(b => b.key === button.key)) return;
+            extensionButtons.push(button);
+            rebuildSystemList();
+            addSystemTileCopyButtons();
+        },
+        refreshSystems() {
+            updateRuleFlags(); // the list follows the tiles
+            refreshExportButtons();
+        },
+        onSystems(listener) {
+            systemsListeners.push(listener);
+        },
+        systems: () => [...systemEntries.values()],
+        systemByName: (name) => systemEntries.get(name) ?? null,
+        isConnected: () => gateway !== null,
+        fetchFromGateway,
+        sendToGateway,
+        fetchSystems,
+        downloadBackup,
+        downloadFile,
+        showDialog,
+        showProgress,
+        copyToClipboard,
+        error,
+        warn,
+        strong,
+    });
 
     // =====================================================================
     // Filters reset on navigation
@@ -6858,6 +7955,7 @@
                 addPageLinks();
                 setupSystemList();
                 addImportButton();
+                addGithubButton();
                 addGridFlagButtons();
                 addUsedEntitlementsFilter();
                 hideLimitWarnings();
@@ -6876,4 +7974,7 @@
     } else {
         document.addEventListener('DOMContentLoaded', startObserver, { once: true });
     }
+
+    pageWindow.HelloIDUX = extensionApi;
+    pageWindow.dispatchEvent(new CustomEvent('helloid-ux-ready'));
 })();
