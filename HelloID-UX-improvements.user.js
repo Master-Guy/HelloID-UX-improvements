@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-22.1
+// @version      2026-10-26.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -2302,15 +2302,10 @@
         const ids = [...new Set(notifications.map(n => n.notificationSystemId).filter(Boolean))];
         return Promise.all(ids.map(async (systemId) => {
             try {
-                const read = await fetchFromGateway(`${NOTIFICATION_SYSTEMS_PATH}/${encodeURIComponent(systemId)}`);
                 // Its settings may hold secrets, like those of a target system
-                const settings = read.systemConfiguration;
-                if (SETTINGS.exportSecrets || !isPlainObject(settings)) return read;
-                return {
-                    ...read,
-                    systemConfiguration: Object.fromEntries(Object.entries(settings).map(([key, value]) =>
-                        [key, SECRET_NAME.test(key) && isFilled(value) ? EXPORT_MASK : value])),
-                };
+                // (see maskNotificationSystem)
+                return maskNotificationSystem(
+                    await fetchFromGateway(`${NOTIFICATION_SYSTEMS_PATH}/${encodeURIComponent(systemId)}`));
             } catch (e) {
                 console.warn(`[HelloID UX] Export: could not read notification system ${systemId}`, e);
                 return { systemId, couldNotRead: true };
@@ -4545,8 +4540,10 @@
             const { verifiedDomains, ...mail } = configuration ?? {};
             return { ...rest, configuration: mail };
         };
+        // (a value that is null is the same as none)
         const ordered = (value) => (Array.isArray(value) ? value.map(ordered)
-            : isPlainObject(value) ? Object.fromEntries(Object.keys(value).sort().map(k => [k, ordered(value[k])]))
+            : isPlainObject(value) ? Object.fromEntries(Object.keys(value).sort()
+                .filter(k => value[k] !== null && value[k] !== undefined).map(k => [k, ordered(value[k])]))
             : value ?? null);
         return JSON.stringify(ordered(content(a))) === JSON.stringify(ordered(content(b)));
     }
@@ -7791,6 +7788,654 @@
     }
 
     // =====================================================================
+    // Notifications: export and import
+    // =====================================================================
+    // Notification Configurations: an Export button in each row (next to
+    // the copy button), and Export all and Import buttons next to
+    // HelloID's +. Notification Systems: an Export button on each tile,
+    // and an Import button next to the +.
+    // The files work like those of target systems. What a file refers to
+    // (target systems, notification systems, templates) is in it by ID
+    // and by name, so the import finds it again in another environment.
+    // The import shows what differs, downloads a backup of what it
+    // overwrites, and writes after a confirmation. A new notification
+    // starts disabled.
+
+    const NOTIFICATION_SYSTEMS_ROUTE = '/notifications/systems';
+    const NOTIFICATION_SYSTEM_PATH = (id) => `${NOTIFICATION_SYSTEMS_PATH}/${encodeURIComponent(id)}`;
+    const NOTIFICATION_PATH = (id) => `${NOTIFICATIONS_PATH}/${encodeURIComponent(id)}`;
+    const ALL_NOTIFICATIONS_PATH = `${NOTIFICATIONS_PATH}?skip=0&take=${SETTINGS.fetchAllTake}&enabled=false&disabled=false`;
+    const NOTIFICATION_ROW_EXPORT_CLASS = 'tm-notification-export';
+    const NOTIFICATION_HEADER_CLASS = 'tm-notification-header';
+    // What the export adds to a notification, for another environment;
+    // left out again on import
+    const NOTIFICATION_NAMES = ['systemName', 'notificationSystemName', 'notificationSystemBuiltin', 'notificationTemplateName'];
+
+    const fileSafe = (name) => String(name).replace(/[\\/:*?"<>|]+/g, '_').trim();
+    const isoDate = () => new Date().toISOString().slice(0, 10);
+    const exportedBy = () => `HelloID UX improvements ${typeof GM_info !== 'undefined' ? GM_info.script.version : ''}`.trim();
+
+    // Values in nested objects, by a dotted key ("text.required"), as
+    // HelloID's forms name them
+    const getIn = (obj, path) => path.split('.').reduce((o, k) => (isPlainObject(o) ? o[k] : undefined), obj);
+    function setIn(obj, path, value) {
+        const keys = path.split('.');
+        const last = keys.pop();
+        const parent = keys.reduce((o, k) => (isPlainObject(o) ? o[k] : undefined), obj);
+        if (isPlainObject(parent) && last in parent) parent[last] = value;
+    }
+
+    // The values of a form (data) with its secrets as "***": the password
+    // fields of the form, and any value whose name says so
+    function maskValues(values, fields) {
+        if (SETTINGS.exportSecrets || !isPlainObject(values)) return values;
+        const copy = structuredClone(values);
+        const byName = (o) => Object.keys(o).forEach(key => {
+            if (isPlainObject(o[key])) byName(o[key]);
+            else if (SECRET_NAME.test(key) && isFilled(o[key])) o[key] = EXPORT_MASK;
+        });
+        byName(copy);
+        (fields ?? []).filter(f => f?.templateOptions?.type === 'password' && f.key)
+            .forEach(f => { if (isFilled(getIn(copy, f.key))) setIn(copy, f.key, EXPORT_MASK); });
+        return copy;
+    }
+
+    // Values the file left out ("***") get the value they have here, or
+    // else an empty one
+    function restoreValues(values, current) {
+        if (!isPlainObject(values)) return values;
+        const copy = structuredClone(values);
+        const walk = (o, path) => Object.keys(o).forEach(key => {
+            const at = path ? `${path}.${key}` : key;
+            if (isPlainObject(o[key])) walk(o[key], at);
+            else if (o[key] === EXPORT_MASK) o[key] = getIn(current, at) ?? '';
+        });
+        walk(copy, '');
+        return copy;
+    }
+
+    // A notification system with the secrets of its configuration as "***"
+    function maskNotificationSystem(system) {
+        const config = system?.systemConfiguration;
+        if (SETTINGS.exportSecrets || !isPlainObject(config)) return system;
+        return { ...system, systemConfiguration: { ...config, data: maskValues(config.data, config.fields) } };
+    }
+
+    // The key HelloID gives a target system in a notification's data
+    // references: its name, with only the letters and digits
+    const dataReferenceKey = (name) => String(name).replace(/[^A-Za-z0-9]/g, '');
+
+    // By ID, or else (another environment) by name
+    const byIdOrName = (items, id, name) => items.find(i => i?.systemId === id) ??
+        (typeof name === 'string' ? items.find(i => i?.displayName?.trim() === name.trim()) : undefined);
+
+    // A JSON file, with a save dialog where the browser has one (it has to
+    // open right at the click, so before collecting), and the progress in
+    // a card. Like exportSystem, for the other exports.
+    async function saveJsonExport(title, fileName, steps, collect, notice = () => '') {
+        let handle = null;
+        if (typeof pageWindow.showSaveFilePicker === 'function') {
+            try {
+                handle = await pageWindow.showSaveFilePicker({
+                    suggestedName: fileName,
+                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+                });
+            } catch (e) {
+                if (e?.name === 'AbortError') return false; // cancelled
+                throw e;
+            }
+        }
+        const all = [...steps, { key: 'save', label: 'Save the file' }];
+        const progress = showProgress(title, all.map(step => step.label));
+        const report = (key, state, detail) => progress.set(all.findIndex(step => step.key === key), state, detail);
+        let data;
+        try {
+            data = await collect(report);
+            const json = JSON.stringify(data, null, 2);
+            report('save', 'busy');
+            if (handle) {
+                const writable = await handle.createWritable();
+                await writable.write(json);
+                await writable.close();
+            } else {
+                downloadFile(json, fileName);
+            }
+            report('save', 'done');
+        } catch (e) {
+            console.warn('[HelloID UX] Export failed', e);
+            progress.failBusy();
+            await progress.finish(error(`Export failed: ${e?.message ?? e}`));
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        const text = notice(data);
+        if (text) await progress.finish(`Export finished.\n\n${text}`);
+        else progress.close();
+        return true;
+    }
+
+    // A small button that runs a job: a spinner while it runs, then a
+    // check or a cross; an error is shown in a dialog
+    function createActionButton(iconClass, title, run, className = 'btn btn-default btn-xs') {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = className;
+        btn.title = title;
+        const icon = document.createElement('i');
+        icon.className = iconClass;
+        btn.appendChild(icon);
+        ['mousedown', 'dblclick'].forEach(type => btn.addEventListener(type, (e) => e.stopPropagation()));
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            icon.className = 'fa-solid fa-spinner fa-spin';
+            let result = iconClass;
+            try {
+                if (await run()) result = 'fa-solid fa-check';
+            } catch (err) {
+                result = 'fa-solid fa-xmark';
+                if (!err?.shown) {
+                    console.warn(`[HelloID UX] ${title} failed`, err);
+                    await showDialog(`${title}: failed`, error(String(err?.message ?? err)));
+                }
+            }
+            icon.className = result;
+            btn.disabled = false;
+            setTimeout(() => { icon.className = iconClass; }, SETTINGS.copyFeedbackMs);
+        });
+        return btn;
+    }
+
+    // --- Notification configurations: export ---
+    // identifiers: the notifications to export; null for all of them
+    async function collectNotificationsExport(identifiers, report = () => {}) {
+        report('lists', 'busy');
+        const [senders, targets, ids] = await Promise.all([
+            fetchFromGateway(NOTIFICATION_SYSTEMS_PATH),
+            fetchSystems(),
+            identifiers ?? fetchFromGateway(ALL_NOTIFICATIONS_PATH).then(list => (list.pageData ?? []).map(n => n.identifier)),
+        ]);
+        report('lists', 'done');
+
+        report('notifications', 'busy', `0/${ids.length}`);
+        const read = [];
+        for (let i = 0; i < ids.length; i += USED_BY_BATCH) {
+            read.push(...await Promise.all(ids.slice(i, i + USED_BY_BATCH).map(id => fetchFromGateway(NOTIFICATION_PATH(id)))));
+            report('notifications', 'busy', `${read.length}/${ids.length}`);
+        }
+        // The templates of the notification systems they use: for the
+        // names of the templates, and their password fields
+        const details = new Map(await Promise.all([...new Set(read.map(n => n.notificationSystemId).filter(Boolean))]
+            .map(async id => [id, await fetchFromGateway(NOTIFICATION_SYSTEM_PATH(id)).catch(() => null)])));
+        report('notifications', 'done');
+
+        const notifications = read.map(n => {
+            const sender = senders.find(s => s.systemId === n.notificationSystemId);
+            const template = (details.get(n.notificationSystemId)?.notificationTemplates ?? [])
+                .find(t => t.templateId === n.notificationTemplateId);
+            return {
+                ...n,
+                notificationTemplateData: maskValues(n.notificationTemplateData, template?.fields),
+                dataReferences: (n.dataReferences ?? []).map(r => ({
+                    ...r, displayName: targets.find(s => s.systemId === r.systemId)?.displayName ?? null,
+                })),
+                systemName: targets.find(s => s.systemId === n.systemId)?.displayName ?? null,
+                notificationSystemName: sender?.displayName ?? null,
+                notificationSystemBuiltin: sender?.isBuiltin === true,
+                notificationTemplateName: template?.displayName ?? null,
+            };
+        }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        return {
+            exportedAt: new Date().toISOString(),
+            exportedFrom: location.origin,
+            exportedBy: exportedBy(),
+            contents: 'notifications',
+            secretsIncluded: SETTINGS.exportSecrets,
+            notifications,
+        };
+    }
+
+    const NOTIFICATION_EXPORT_STEPS = [
+        { key: 'lists', label: 'Notification systems and target systems' },
+        { key: 'notifications', label: 'Notifications' },
+    ];
+
+    const notificationsNotice = (data) =>
+        warn(data.secretsIncluded ? 'The file has the SECRETS of the notifications in it.' : '');
+
+    // One notification (identifiers of one, with its name), or all (null)
+    function exportNotifications(identifiers, name) {
+        const fileName = identifiers?.length === 1 && name
+            ? `${fileSafe(name)} - ${identifiers[0]} - ${isoDate()}.json`
+            : `Notification configurations - ${isoDate()}.json`;
+        return saveJsonExport(`Export: ${name ?? 'all notification configurations'}`, fileName,
+            NOTIFICATION_EXPORT_STEPS, (report) => collectNotificationsExport(identifiers, report), notificationsNotice);
+    }
+
+    // --- Notification configurations: import ---
+    // Each notification of the file goes to the one it was exported from
+    // (same ID), or else to the one with the same event and name, or else
+    // it is made: disabled, with an ID of its own (as HelloID does).
+    async function importNotifications() {
+        const text = await pickImportFile();
+        if (text === null) return false;
+        let data;
+        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        if (data?.contents !== 'notifications' || !Array.isArray(data.notifications)) {
+            throw new Error('The file is not an export of notification configurations.');
+        }
+        const header = `File: export of ${data.notifications.length} notification(s) from ${data.exportedFrom ?? '?'}, ` +
+                       `${data.exportedAt ?? '?'}`;
+
+        const [senders, targets, list] = await Promise.all([
+            fetchFromGateway(NOTIFICATION_SYSTEMS_PATH), fetchSystems(), fetchFromGateway(ALL_NOTIFICATIONS_PATH)]);
+        const here = list.pageData ?? [];
+        const details = new Map();
+        const detailOf = async (id) => {
+            if (!details.has(id)) details.set(id, await fetchFromGateway(NOTIFICATION_SYSTEM_PATH(id)));
+            return details.get(id);
+        };
+
+        const work = [];    // { label, body, isNew }
+        const same = [];
+        const skipped = []; // texts
+        const notes = [];
+        const taken = new Set();
+        const fileIds = new Set(data.notifications.map(n => n?.identifier).filter(Boolean));
+        for (const notification of data.notifications.filter(isPlainObject)) {
+            const label = `"${notification.name}" (${notification.event ?? notification.action ?? '?'})`;
+            const problems = [];
+            // What sends it: by ID or name, or else the built-in one
+            const sender = byIdOrName(senders, notification.notificationSystemId, notification.notificationSystemName) ??
+                (notification.notificationSystemBuiltin ? senders.find(s => s.isBuiltin) : undefined);
+            if (!sender) problems.push(`its notification system "${notification.notificationSystemName ?? notification.notificationSystemId}" is not in this HelloID environment`);
+            let templateId = null;
+            if (sender && notification.notificationTemplateId) {
+                const templates = (await detailOf(sender.systemId)).notificationTemplates ?? [];
+                const template = templates.find(t => t.templateId === notification.notificationTemplateId) ??
+                    templates.find(t => t.displayName === notification.notificationTemplateName);
+                if (template) templateId = template.templateId;
+                else problems.push(`its template "${notification.notificationTemplateName ?? notification.notificationTemplateId}" is not in notification system "${sender.displayName}"`);
+            }
+            // The target system of its event, if any
+            let systemId = null;
+            if (notification.systemId) {
+                const system = byIdOrName(targets, notification.systemId, notification.systemName);
+                if (system) systemId = system.systemId;
+                else problems.push(`its target system "${notification.systemName ?? notification.systemId}" is not in this HelloID environment`);
+            }
+            if (problems.length) {
+                skipped.push(`${label}: ${problems.join('; ')}`);
+                continue;
+            }
+            // The data of target systems it uses: those that are here
+            const references = (notification.dataReferences ?? []).map(reference => {
+                const system = byIdOrName(targets, reference.systemId, reference.displayName);
+                if (!system) return null;
+                return {
+                    key: system.systemId === reference.systemId ? reference.key : dataReferenceKey(system.displayName),
+                    type: reference.type,
+                    systemId: system.systemId,
+                };
+            });
+            const missing = (notification.dataReferences ?? []).filter((r, i) => !references[i]);
+            if (missing.length) {
+                notes.push(`${label}: left out the data of target systems that are not here: ` +
+                           missing.map(r => r.displayName ?? r.key).join(', '));
+            }
+
+            // By name: not one that another notification of the file has the
+            // ID of, and the one of the same target system first (two can
+            // have the same event and name)
+            const byName = here.filter(n => !taken.has(n) && !fileIds.has(n.identifier) &&
+                n.event === notification.event && n.name === notification.name);
+            const match = here.find(n => !taken.has(n) && n.identifier === notification.identifier) ??
+                byName.find(n => (n.systemId ?? null) === systemId) ?? byName[0];
+            if (match) taken.add(match);
+            const current = match ? await fetchFromGateway(NOTIFICATION_PATH(match.identifier)) : null;
+            const rest = Object.fromEntries(Object.entries(notification)
+                .filter(([key]) => !NOTIFICATION_NAMES.includes(key) && key !== 'lastChange' && key !== 'couldNotRead'));
+            const body = {
+                ...rest,
+                identifier: match?.identifier ?? crypto.randomUUID(),
+                systemId,
+                notificationSystemId: sender.systemId,
+                notificationTemplateId: templateId,
+                notificationTemplateData: restoreValues(rest.notificationTemplateData, current?.notificationTemplateData),
+                dataReferences: references.filter(Boolean),
+                tenantUrl: location.origin,
+                // A new one does nothing until it has been checked
+                enabled: match ? rest.enabled === true : false,
+            };
+            if (current && sameNotification(body, current)) {
+                same.push(label);
+                continue;
+            }
+            work.push({ label, body, isNew: !match, identifier: match?.identifier });
+        }
+
+        const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
+        const added = work.filter(w => w.isNew);
+        const changed = work.filter(w => !w.isNew);
+        const summary = [
+            header,
+            added.length ? `New (made DISABLED: enable them yourself once checked):\n${list2(added.map(w => w.label))}` : '',
+            changed.length ? `Overwritten:\n${list2(changed.map(w => w.label))}` : '',
+            same.length ? `Already as in the file:\n${list2(same)}` : '',
+            skipped.length ? warn(`Not imported:\n${list2(skipped)}`) : '',
+            notes.length ? warn(`Note:\n${list2(notes)}`) : '',
+        ].filter(Boolean).join('\n\n');
+        if (!work.length) {
+            await showDialog('Import notifications', `${summary}\n\nNothing to import.`);
+            return true;
+        }
+        if (!await showDialog('Import notifications', `${summary}\n\n` +
+            (changed.length ? 'A backup of the notifications that are overwritten is downloaded first.' : ''),
+            { confirm: true })) return false;
+
+        if (changed.length) {
+            const backup = await collectNotificationsExport(changed.map(w => w.identifier));
+            downloadFile(JSON.stringify(backup, null, 2), `Notification configurations - backup before import - ${isoDate()}.json`);
+        }
+        const progress = showProgress('Import notifications', work.map(w => `${w.label} (${w.isNew ? 'new' : 'overwrite'})`));
+        let index = 0;
+        try {
+            for (const w of work) {
+                progress.set(index, 'busy');
+                await sendToGateway(NOTIFICATIONS_PATH, 'POST', w.body);
+                progress.set(index++, 'done');
+            }
+        } catch (e) {
+            progress.set(index, 'failed');
+            await progress.finish(error(`Import failed: ${e?.message ?? e}`) +
+                '\n\nThe notifications before it were imported; the ones after it were not.');
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish('Import finished.' + (added.length
+            ? '\n\nThe new notifications are DISABLED. Check them, and enable them yourself.' : '') +
+            '\n\nThe page reloads when you close this message.');
+        location.reload();
+        return true;
+    }
+
+    // --- Notification systems: export ---
+    async function collectNotificationSystemExport(systemId, report = () => {}) {
+        report('system', 'busy');
+        const read = await fetchFromGateway(NOTIFICATION_SYSTEM_PATH(systemId));
+        report('system', 'done');
+        report('agents', 'busy');
+        const id = encodeURIComponent(systemId);
+        let agents;
+        try {
+            const [selected, summary] = await Promise.all([
+                fetchFromGateway(AGENT_SELECTION_PATH(id)),
+                fetchFromGateway(`/service/agent-repository/api/agents/selections/summary/${id}`),
+            ]);
+            agents = { selected, summary };
+            report('agents', 'done');
+        } catch (e) {
+            console.warn('[HelloID UX] Export: could not read the agents', e);
+            agents = { couldNotRead: true };
+            report('agents', 'skipped');
+        }
+        return {
+            exportedAt: new Date().toISOString(),
+            exportedFrom: location.origin,
+            exportedBy: exportedBy(),
+            contents: 'notificationSystem',
+            secretsIncluded: SETTINGS.exportSecrets,
+            systemId: read.systemId,
+            displayName: read.displayName,
+            system: maskNotificationSystem(read),
+            agents,
+        };
+    }
+
+    function exportNotificationSystem(name) {
+        const id = notificationSystemIds.get(name);
+        if (!id) throw new Error(`The ID of "${name}" is not known yet. Reload the page and try again.`);
+        return saveJsonExport(`Export: ${name}`, `${fileSafe(name)} - ${id} - ${isoDate()}.json`,
+            [{ key: 'system', label: 'Notification system' }, { key: 'agents', label: 'Agents' }],
+            (report) => collectNotificationSystemExport(id, report),
+            (data) => warn(data.secretsIncluded ? 'The file has the SECRETS of the notification system in it.' : ''));
+    }
+
+    // --- Notification systems: import ---
+    // Into the system it was exported from (same ID), or else the one
+    // with the same name (the built-in one: the built-in one here), or
+    // else a new one (HelloID only makes PowerShell systems).
+    const NOTIFICATION_GENERAL_FIELDS = ['description', 'displayName', 'icon', 'executeOnPremise'];
+
+    async function importNotificationSystem() {
+        const text = await pickImportFile();
+        if (text === null) return false;
+        let data;
+        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        const file = data?.system;
+        if (data?.contents !== 'notificationSystem' || !isPlainObject(file)) {
+            throw new Error('The file is not an export of a notification system.');
+        }
+        const header = `File: export of "${file.displayName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
+        const senders = await fetchFromGateway(NOTIFICATION_SYSTEMS_PATH);
+        const found = senders.find(s => s.systemId === file.systemId) ??
+            (file.isBuiltin ? senders.find(s => s.isBuiltin)
+                : senders.find(s => !s.isBuiltin && s.displayName?.trim() === file.displayName?.trim()));
+        const created = !found;
+        const nameTaken = async () => fetchFromGateway(
+            `${NOTIFICATION_SYSTEMS_PATH}/exists?name=${encodeURIComponent(file.displayName)}`) === true;
+        if ((created || found.displayName !== file.displayName) && await nameTaken()) {
+            throw new Error(`Another notification system is already named "${file.displayName}". Nothing was imported.`);
+        }
+
+        const readCurrent = async (id) => ({
+            ...(await fetchFromGateway(NOTIFICATION_SYSTEM_PATH(id))),
+            agentSelection: await fetchFromGateway(AGENT_SELECTION_PATH(encodeURIComponent(id))).catch(() => []),
+        });
+        const current = created ? null : await readCurrent(found.systemId);
+        const fileAgents = Array.isArray(data.agents?.selected) ? data.agents.selected : null;
+
+        // The scripts: those of the file, matched by ID or else by name;
+        // one the system doesn't have keeps the file's ID (HelloID gives
+        // every system the same ID for its "Default script"). The system's
+        // other scripts stay. All in one request, as HelloID saves them.
+        const scriptFields = ({ scriptId, displayName, script }) => ({ scriptId, displayName, script });
+        const scriptsFor = (system) => {
+            const theirs = system?.notificationScripts ?? [];
+            const match = (s) => theirs.find(o => o.scriptId === s.scriptId) ?? theirs.find(o => o.displayName === s.displayName);
+            const mine = (file.notificationScripts ?? []).map(s => ({
+                ...scriptFields(s), scriptId: match(s)?.scriptId ?? s.scriptId ?? crypto.randomUUID(),
+            }));
+            return [...theirs.filter(t => !mine.some(m => m.scriptId === t.scriptId)).map(scriptFields), ...mine];
+        };
+        // The system as it is once the scripts are written
+        const withScripts = (system) => ({ ...system, notificationScripts: scriptsFor(system) });
+
+        // The templates point at scripts: those of the file, by ID or
+        // else by name, among the scripts the system has
+        const templatesFor = (system) => {
+            const scripts = system?.notificationScripts ?? [];
+            const fileScripts = file.notificationScripts ?? [];
+            const problems = [];
+            const templates = (file.notificationTemplates ?? []).map(template => {
+                const fileScript = fileScripts.find(s => s.scriptId === template.scriptId);
+                const script = scripts.find(s => s.scriptId === template.scriptId) ??
+                    scripts.find(s => s.displayName === fileScript?.displayName);
+                if (!script) problems.push(`template "${template.displayName}": its script "${fileScript?.displayName ?? template.scriptId}" is not in the system`);
+                return { ...template, scriptId: script?.scriptId ?? template.scriptId };
+            });
+            // The system's own templates that the file doesn't have stay
+            const match = (t, list) => list.find(o => o.templateId === t.templateId) ?? list.find(o => o.displayName === t.displayName);
+            const kept = (system?.notificationTemplates ?? []).filter(t => !match(t, templates));
+            const merged = [...kept, ...templates.map(t => ({ ...t, templateId: match(t, system?.notificationTemplates ?? [])?.templateId ?? t.templateId }))];
+            return { merged, problems };
+        };
+
+        const general = Object.fromEntries(NOTIFICATION_GENERAL_FIELDS.map(f => [f, file[f]]));
+        const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+        const changes = [];
+        const generalDiffers = created || NOTIFICATION_GENERAL_FIELDS.some(f => !sameJson(file[f], current[f]));
+        if (generalDiffers) changes.push('General settings (name, description, icon, execute on-premises)');
+        if (fileAgents && !sameAgentSelection(fileAgents, current?.agentSelection)) changes.push('Agents for on-premises execution');
+        const fileScripts = (file.notificationScripts ?? []).length > 0;
+        const scriptsDiffer = fileScripts &&
+            (created || !sameJson(scriptsFor(current), (current.notificationScripts ?? []).map(scriptFields)));
+        if (scriptsDiffer) changes.push(`Scripts: ${(file.notificationScripts ?? []).map(s => `"${s.displayName}"`).join(', ')} (the system's other scripts stay)`);
+        const templateWork = current ? templatesFor(withScripts(current)) : null;
+        const templatesDiffer = (file.notificationTemplates ?? []).length &&
+            (created || !sameJson(templateWork.merged, current.notificationTemplates));
+        if (templatesDiffer) changes.push(`Templates: ${(file.notificationTemplates ?? []).map(t => `"${t.displayName}"`).join(', ')} (the system's other templates stay)`);
+        // The configuration: its form, then its values. Secrets left out of
+        // the file ("***") keep the value they have here.
+        const fileConfig = isPlainObject(file.systemConfiguration) ? file.systemConfiguration : null;
+        const currentConfig = current?.systemConfiguration;
+        const formDiffers = Boolean(fileConfig) && Array.isArray(fileConfig.fields) &&
+            (created || !sameJson(fileConfig.fields, currentConfig?.fields));
+        const configValues = (config) => restoreValues(fileConfig?.data, config?.data) ?? {};
+        const dataDiffers = Boolean(fileConfig) && isPlainObject(fileConfig.data) &&
+            (created || !sameJson(configValues(currentConfig), currentConfig?.data));
+        if (formDiffers) changes.push('Configuration form');
+        if (dataDiffers) changes.push('Configuration values');
+
+        const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
+        const problemsNow = templateWork?.problems ?? [];
+        if (!changes.length) {
+            await showDialog('Import notification system', `${header}\n\n"${found.displayName}" already has what the file has.`);
+            return true;
+        }
+        if (!await showDialog('Import notification system', `${header}\n\n` +
+            (created ? `A NEW notification system "${file.displayName}" (PowerShell) will be made, with:\n`
+                : `This will overwrite in "${found.displayName}":\n`) + list2(changes) +
+            (problemsNow.length ? warn(`\n\nTemplates that point at a script the system doesn't have keep pointing at it:\n${list2(problemsNow)}`) : '') +
+            (created ? '' : '\n\nA backup of the current notification system is downloaded first.'),
+        { confirm: true })) return false;
+
+        if (!created) {
+            const backup = await collectNotificationSystemExport(found.systemId);
+            downloadFile(JSON.stringify(backup, null, 2),
+                `${fileSafe(found.displayName)} - backup before import - ${found.systemId} - ${isoDate()}.json`);
+        }
+        const steps = [
+            ...(created ? ['Create new notification system'] : []),
+            ...(generalDiffers ? ['General settings'] : []),
+            ...(changes.some(c => c.startsWith('Agents')) ? ['Agents for on-premises execution'] : []),
+            ...(formDiffers ? ['Configuration form'] : []),
+            ...(dataDiffers ? ['Configuration values'] : []),
+            ...(scriptsDiffer ? ['Scripts'] : []),
+            ...(templatesDiffer ? ['Templates'] : []),
+        ];
+        const progress = showProgress(`Import: ${file.displayName}`, steps);
+        let index = 0;
+        const step = async (work) => {
+            progress.set(index, 'busy');
+            await work();
+            progress.set(index++, 'done');
+        };
+        let id = found?.systemId;
+        try {
+            if (created) {
+                await step(async () => {
+                    // (a PUT without a body, unlike the other requests)
+                    id = await sendToGateway(`${NOTIFICATION_SYSTEMS_PATH}/add`, 'PUT');
+                    if (typeof id !== 'string' || !id) throw new Error('HelloID did not return the ID of the new notification system.');
+                });
+            }
+            if (generalDiffers) await step(() => sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/general`, 'POST', general));
+            if (steps.includes('Agents for on-premises execution')) {
+                await step(() => sendToGateway(AGENT_SELECTION_PATH(encodeURIComponent(id)), 'POST', fileAgents));
+            }
+            if (formDiffers) {
+                await step(() => sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/configuration/form`, 'POST', fileConfig.fields));
+            }
+            if (dataDiffers) {
+                await step(() => sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/configuration/data`, 'POST',
+                    configValues(currentConfig)));
+            }
+            // A new system: as it was made (its default script and template)
+            const target = created ? await readCurrent(id) : current;
+            if (scriptsDiffer) {
+                await step(() => sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/scripts`, 'POST',
+                    { scripts: scriptsFor(target) }));
+            }
+            if (templatesDiffer) {
+                await step(async () => {
+                    const { merged } = templatesFor(withScripts(target));
+                    await sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/templates`, 'POST', { templates: merged });
+                });
+            }
+        } catch (e) {
+            progress.set(index, 'failed');
+            await progress.finish(error(`Import failed: ${e?.message ?? e}`) +
+                '\n\nThe steps before it were done; the ones after it were not.');
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish('Import finished.\n\nThe page reloads when you close this message.');
+        location.reload();
+        return true;
+    }
+
+    // --- The buttons ---
+    function addNotificationButtons() {
+        // Notification Configurations: Export all and Import next to the +
+        const addNotification = document.querySelector('a[data-cy="add-notification"]');
+        if (addNotification && !addNotification.parentElement.querySelector(`.${NOTIFICATION_HEADER_CLASS}`)) {
+            const exportAll = createActionButton('fa-solid fa-download', 'Export all notification configurations to a JSON file',
+                () => exportNotifications(null), `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
+            const importButton = createActionButton('fa-solid fa-upload', 'Import notification configurations from an exported JSON file',
+                importNotifications, `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
+            addNotification.before(exportAll, importButton);
+        }
+
+        // Its grid: an Export button in each row, with the copy button
+        if (location.hash.includes(NOTIFICATIONS_ROUTE)) {
+            document.querySelectorAll(AG_GRIDS).forEach(grid => {
+                if (!hasHeader(grid, 'Notification System')) return;
+                const nameId = [...grid.querySelectorAll('.ag-header-cell')]
+                    .find(h => h.textContent.trim().toLowerCase() === 'name')?.getAttribute('col-id');
+                if (!nameId) return;
+                grid.querySelectorAll(`div.ag-body-viewport div[role="row"] div[col-id="${CSS.escape(nameId)}"]`).forEach(cell => {
+                    const group = cell.querySelector(`.${PINNED_CLASS}`);
+                    if (!group || group.querySelector(`.${NOTIFICATION_ROW_EXPORT_CLASS}`)) return; // (after the copy button)
+                    // The row at click time: the grid reuses its cells
+                    const btn = createActionButton('fa-solid fa-download', 'Export this notification configuration to a JSON file', () => {
+                        const index = parseInt(cell.closest('[role="row"]')?.getAttribute('row-index'), 10);
+                        const row = findGridApi(grid)?.getDisplayedRowAtIndex?.(index)?.data;
+                        if (!row?.identifier) throw new Error('The notification of this row could not be found.');
+                        return exportNotifications([row.identifier], row.name);
+                    });
+                    btn.classList.add(NOTIFICATION_ROW_EXPORT_CLASS);
+                    group.prepend(btn);
+                    cell.style.paddingRight = `${8 + 28 * group.children.length}px`;
+                });
+            });
+        }
+
+        // Notification Systems: Import next to the +, Export on each tile
+        if (location.hash.includes(NOTIFICATION_SYSTEMS_ROUTE)) {
+            const addSystem = document.querySelector('helloid-notification-systems-overview h4 + button.btn-complete');
+            if (addSystem && !addSystem.parentElement.querySelector(`.${NOTIFICATION_HEADER_CLASS}`)) {
+                const importButton = createActionButton('fa-solid fa-upload', 'Import a notification system from an exported JSON file',
+                    importNotificationSystem, `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
+                // The header spreads its items out: keep this one with the +
+                importButton.style.marginLeft = 'auto';
+                addSystem.before(importButton);
+            }
+            document.querySelectorAll('helloid-notification-system-tile').forEach(tile => {
+                const configure = tile.querySelector('button[title="configure" i]');
+                if (!configure || tile.querySelector(`.${NOTIFICATION_ROW_EXPORT_CLASS}`)) return;
+                const name = () => {
+                    const heading = tile.querySelector('h5.card-title');
+                    return (heading?.title || heading?.textContent || '').trim();
+                };
+                const btn = createActionButton('fa-solid fa-download', 'Export this notification system to a JSON file',
+                    () => exportNotificationSystem(name()), configure.className);
+                btn.classList.add(NOTIFICATION_ROW_EXPORT_CLASS);
+                configure.before(btn);
+            });
+        }
+    }
+
+    // =====================================================================
     // Extensions
     // =====================================================================
     // Other userscripts can build on this one (e.g. "HelloID Entra ID
@@ -7956,6 +8601,7 @@
                 setupSystemList();
                 addImportButton();
                 addGithubButton();
+                addNotificationButtons();
                 addGridFlagButtons();
                 addUsedEntitlementsFilter();
                 hideLimitWarnings();

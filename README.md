@@ -83,6 +83,18 @@ Besides the configuration, the import sets the agent selection, creates or updat
 
 Secrets that were left out of the file keep the value the system already has; in a new system they are empty.
 
+### Export and import notifications
+
+**Notification Configurations** has an export button in each row (next to the copy button), and **Export all** and **Import** next to HelloID's **+**. **Notification Systems** has an export button on each tile, and **Import** next to the **+**.
+
+The files work like those of target systems. A notification is saved with the names of the target systems, the notification system and the template it uses, so the import finds them again in another environment, by ID or else by name (the built-in Email system: the built-in one there). The import:
+
+- goes to the notification it was exported from, or else the one with the same event and name; otherwise it makes a new one, which starts **disabled**;
+- leaves out the data of target systems the environment doesn't have, and says so;
+- shows what will be new and what will be overwritten, downloads a backup of what it overwrites, and writes after you confirm.
+
+A notification system goes to the one it was exported from, or the one with the same name, or else a new (PowerShell) one is made. Its name, description, icon, on-premises setting, agents, configuration form and values, scripts and templates are imported. Scripts and templates are matched by ID or else by name; the system's own scripts and templates that the file doesn't have stay. Passwords in the configuration and in template values are written as `***` (see the setting **Target system export: include secrets**), and keep the value they have when imported.
+
 ### Create a target system from GitHub
 
 The GitHub button (next to the import button) lists Tools4ever's target connectors on GitHub (repositories `HelloID-Conn-Prov-Target-*`, without archived ones), like HelloID's own **Create System** for source systems. Pick one to see its README, its latest release and which files it has. **Create** then shows what will be made, where you choose:
