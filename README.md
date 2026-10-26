@@ -95,6 +95,10 @@ The files work like those of target systems. A notification is saved with the na
 
 A notification system goes to the one it was exported from, or the one with the same name, or else a new (PowerShell) one is made. Its name, description, icon, on-premises setting, agents, configuration form and values, scripts and templates are imported. Scripts and templates are matched by ID or else by name; the system's own scripts and templates that the file doesn't have stay. Passwords in the configuration and in template values are written as `***` (see the setting **Target system export: include secrets**), and keep the value they have when imported.
 
+### Show what is typed in password fields
+
+Every password field gets an eye button on its right edge. Click it to see what you typed, and click it again to hide it.
+
 ### Create a target system from GitHub
 
 The GitHub button (next to the import button) lists Tools4ever's target connectors on GitHub (repositories `HelloID-Conn-Prov-Target-*`, without archived ones), like HelloID's own **Create System** for source systems. Pick one to see its README, its latest release and which files it has. **Create** then shows what will be made, where you choose:

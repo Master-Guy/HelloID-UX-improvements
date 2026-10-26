@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-26.1
+// @version      2026-10-26.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -7756,6 +7756,21 @@
         .tm-dialog-copy { opacity: .55; }
         .tm-dialog-copy:hover, .tm-dialog-copy:focus { opacity: .8; }
 
+        /* Password fields: the eye button (see addRevealButtons) */
+        .tm-reveal-password {
+            position: absolute;
+            z-index: 2;
+            width: 24px;
+            height: 24px;
+            padding: 0;
+            border: none;
+            background: none;
+            color: #888;
+            line-height: 24px;
+            cursor: pointer;
+        }
+        .tm-reveal-password:hover { color: #333; }
+
         /* Filter panels show all items now (see the slice patch), so the
            "Maximum of 50 entries shown" warning no longer applies. */
         helloid-filter-panels i.fa-warning[title^="Maximum of ${FILTER_PANEL_LIMIT} entries"] {
@@ -8436,6 +8451,70 @@
     }
 
     // =====================================================================
+    // Password fields: show what is typed
+    // =====================================================================
+    // Every password field gets an eye button on its right edge: a click
+    // shows what is typed, the next one hides it again. The button is put
+    // next to the field rather than around it (Angular owns the field),
+    // and placed over the field's right edge (see positionRevealButtons).
+
+    const REVEAL_CLASS = 'tm-reveal-password';
+    const revealFields = new WeakMap(); // button -> its field
+
+    function addRevealButtons() {
+        document.querySelectorAll('input[type="password"]:not([data-tm-reveal])').forEach(input => {
+            input.dataset.tmReveal = '1'; // also once it shows its text
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = REVEAL_CLASS;
+            btn.tabIndex = -1; // Tab still goes from field to field
+            const icon = document.createElement('i');
+            btn.appendChild(icon);
+            const render = () => {
+                const shown = input.type === 'text';
+                icon.className = shown ? 'fa-solid fa-eye-slash' : 'fa-solid fa-eye';
+                btn.title = shown ? 'Hide what is typed' : 'Show what is typed';
+            };
+            render();
+            // Keep the focus (and the cursor) in the field
+            btn.addEventListener('mousedown', (e) => e.preventDefault());
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                input.type = input.type === 'password' ? 'text' : 'password';
+                render();
+            });
+            revealFields.set(btn, input);
+            input.after(btn);
+            // Room for the button, so the text doesn't run under it
+            input.style.paddingRight = '32px';
+        });
+        positionRevealButtons();
+    }
+
+    // Over the right edge of the field, in the middle; hidden while the
+    // field is. Again when the window is resized.
+    function positionRevealButtons() {
+        document.querySelectorAll(`.${REVEAL_CLASS}`).forEach(btn => {
+            const input = revealFields.get(btn);
+            if (!input?.isConnected) {
+                btn.remove();
+                return;
+            }
+            const parent = btn.parentElement;
+            if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+            const display = input.offsetParent ? '' : 'none';
+            if (btn.style.display !== display) btn.style.display = display;
+            if (display) return;
+            const top = `${input.offsetTop + (input.offsetHeight - btn.offsetHeight) / 2}px`;
+            const left = `${input.offsetLeft + input.offsetWidth - btn.offsetWidth - 6}px`;
+            if (btn.style.top !== top) btn.style.top = top;
+            if (btn.style.left !== left) btn.style.left = left;
+        });
+    }
+    window.addEventListener('resize', positionRevealButtons);
+
+    // =====================================================================
     // Extensions
     // =====================================================================
     // Other userscripts can build on this one (e.g. "HelloID Entra ID
@@ -8602,6 +8681,7 @@
                 addImportButton();
                 addGithubButton();
                 addNotificationButtons();
+                addRevealButtons();
                 addGridFlagButtons();
                 addUsedEntitlementsFilter();
                 hideLimitWarnings();
