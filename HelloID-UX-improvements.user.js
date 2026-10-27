@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-26.2
+// @version      2026-10-27.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -1168,13 +1168,16 @@
     // getUrl is called when the link is about to be used: HelloID may
     // reuse a tile or a row for another item, and the IDs may come in
     // later. Without an address (yet), the link only does what the button did.
-    function createPageLink(getUrl, className, openHere, title = 'Configure') {
+    function createPageLink(getUrl, className, openHere, title = 'Configure', iconClass = 'fa-solid fa-wrench') {
         const link = document.createElement('a');
         link.className = `${className} ${PAGE_LINK_CLASS}`;
         link.title = title;
         link.setAttribute('role', 'button');
         link.style.cursor = 'pointer';
-        link.innerHTML = '<i aria-hidden="true" class="fa-solid fa-wrench"></i>';
+        const icon = document.createElement('i');
+        icon.setAttribute('aria-hidden', 'true');
+        icon.className = iconClass;
+        link.appendChild(icon);
 
         const setHref = () => {
             const url = getUrl();
@@ -1196,9 +1199,52 @@
     }
 
     // Hides one of HelloID's buttons, and puts our link in its place
-    function replaceWithPageLink(button, getUrl, title) {
+    function replaceWithPageLink(button, getUrl, title, iconClass) {
         button.style.display = 'none';
-        button.after(createPageLink(getUrl, button.className, () => button.click(), title));
+        button.after(createPageLink(getUrl, button.className, () => button.click(), title, iconClass));
+    }
+
+    // --- Business rules: Clone as a link ---
+    // HelloID's Clone copies the rule (a request), then opens the copy.
+    // Our link's address is that of the rules page with the rule to copy
+    // in it (tm-clone); a page that opens with that address (e.g. in a new
+    // tab) makes the copy and goes to it. A normal click is HelloID's own.
+    const CLONE_PARAM = 'tm-clone';
+    const COPY_RULE_PATH = (id) => `/service/rules/api/rules/copy/${encodeURIComponent(id)}`;
+
+    function addCloneLinks() {
+        document.querySelectorAll(`${AG_GRIDS} button[title="Clone rule"]`).forEach(button => {
+            if (button.parentElement.querySelector(`.${PAGE_LINK_CLASS}[data-tm-clone]`)) return;
+            replaceWithPageLink(button, () => {
+                // The rule of the row, from its Edit link (rows are reused)
+                const id = button.parentElement.querySelector('a[data-cy="edit-rule"]')
+                    ?.getAttribute('href')?.match(/\/edit\/([^/?#]+)/)?.[1];
+                return id ? `#/business/rules?${CLONE_PARAM}=${encodeURIComponent(id)}` : null;
+            }, 'Clone rule', 'fa-regular fa-clone');
+            button.nextElementSibling.dataset.tmClone = '1';
+        });
+    }
+
+    // A page opened with a rule to copy: once HelloID's own requests are
+    // seen (for the login), copy it and open the copy
+    let cloning = false;
+    async function openPendingClone() {
+        const [route, query = ''] = location.hash.split('?');
+        const ruleId = new URLSearchParams(query).get(CLONE_PARAM);
+        if (!ruleId || !gateway || cloning) return;
+        cloning = true;
+        history.replaceState(null, '', route); // not again on a reload
+        try {
+            const answer = await sendToGateway(COPY_RULE_PATH(ruleId), 'PUT', {});
+            const newId = typeof answer === 'string' ? answer : answer?.ruleId ?? answer?.id;
+            if (!newId) throw new Error('HelloID made the copy, but did not say which rule it is. Find it in the list of rules.');
+            location.hash = `#/business/rules/edit/${encodeURIComponent(newId)}`;
+        } catch (e) {
+            console.warn('[HelloID UX] Clone failed', e);
+            await showDialog('Clone rule: failed', error(String(e?.message ?? e)));
+        } finally {
+            cloning = false;
+        }
     }
 
     // Source and notification systems: Configure on the tiles
@@ -3944,6 +3990,124 @@
         };
     }
 
+    // --- Import: what to import ---
+    // Before an import writes anything, the user chooses what it does:
+    // overwrite what matches or make something new (with a name of its
+    // own), which parts of the file to import, and which links to other
+    // things to make.
+    //   intro:  text above the choices (marks as in showDialog)
+    //   modes:  [{ value, label, parts }]; the first one is chosen. With fewer
+    //           than two there is nothing to choose. With two or more, the
+    //           groups are on a page of their own, after Next; a mode with
+    //           parts: false has no such page (it is chosen with none).
+    //   name:   { label, value, when: (mode) -> is it asked? }
+    //   groups: [{ title, items: [{ key, label, detail, checked, fixed }] }];
+    //           a fixed item is always imported (its box can't be cleared)
+    // Resolves to { mode, name, chosen: Set of keys }, or null (cancelled).
+    function chooseImport(title, { intro = '', modes = [], name = null, groups = [] } = {}) {
+        return new Promise(resolve => {
+            addStyles();
+            const dialog = make('dialog', { className: `${DIALOG_CLASS} tm-choose` });
+            const body = make('div', { className: 'tm-dialog-content' });
+            if (intro) {
+                const text = make('pre');
+                renderMessage(text, intro);
+                body.appendChild(text);
+            }
+            // With modes to choose from, two pages: first what to do (and
+            // the name), then, for a mode with parts, what to import
+            const first = [];  // the elements of the first page
+            const second = []; // and of the second
+            let mode = modes[0]?.value;
+            const modeOf = () => modes.find(option => option.value === mode);
+            const nameInput = name ? make('input', { type: 'text', className: 'form-control', value: name.value ?? '' }) : null;
+            const nameRow = name ? make('label', { className: 'tm-choose-name' }, name.label, nameInput) : null;
+            const showName = () => { if (nameRow) nameRow.hidden = name.when ? !name.when(mode) : false; };
+            if (modes.length > 1) {
+                const box = make('div', { className: 'tm-choose-group' }, make('strong', {}, 'What to do'));
+                const radioName = `tm-mode-${Math.random().toString(36).slice(2)}`;
+                modes.forEach((option, i) => {
+                    const radio = make('input', { type: 'radio', name: radioName, checked: i === 0 });
+                    radio.addEventListener('change', () => { mode = option.value; showName(); });
+                    box.appendChild(make('label', { className: 'tm-choose-item' }, radio, ` ${option.label}`));
+                });
+                body.appendChild(box);
+                first.push(box);
+            }
+            if (nameRow) {
+                body.appendChild(nameRow);
+                first.push(nameRow);
+            }
+            showName();
+            const boxes = [];
+            groups.filter(group => group.items.length).forEach(group => {
+                const box = make('div', { className: 'tm-choose-group' }, make('strong', {}, group.title));
+                group.items.forEach(item => {
+                    const check = make('input', { type: 'checkbox', checked: item.fixed || item.checked !== false,
+                        disabled: Boolean(item.fixed) });
+                    boxes.push([item.key, check]);
+                    box.appendChild(make('label', { className: 'tm-choose-item' }, check, ` ${item.label}`,
+                        item.detail ? make('small', { className: 'text-muted' }, ` (${item.detail})`) : null));
+                });
+                body.appendChild(box);
+                second.push(box);
+            });
+
+            const problem = make('small', { className: 'text-danger tm-choose-problem' });
+            const cancel = make('button', { type: 'button', className: 'btn btn-sm btn-default' }, 'Cancel');
+            const back = make('button', { type: 'button', className: 'btn btn-sm btn-default', hidden: true }, 'Back');
+            const next = make('button', { type: 'button', className: 'btn btn-sm btn-primary' }, 'Next');
+            const paged = modes.length > 1;
+            let page = paged ? 1 : 2; // (without modes: everything on one page)
+            const showPage = (number) => {
+                page = number;
+                problem.textContent = '';
+                if (paged) {
+                    first.forEach(el => { el.hidden = page !== 1; });
+                    if (page === 1) showName();
+                    second.forEach(el => { el.hidden = page !== 2; });
+                    back.hidden = page !== 2;
+                }
+                body.focus();
+            };
+            showPage(page);
+            let answer = null;
+            cancel.addEventListener('click', () => dialog.close());
+            back.addEventListener('click', () => showPage(1));
+            next.addEventListener('click', () => {
+                const asked = nameRow && (paged ? name.when?.(mode) ?? true : !nameRow.hidden);
+                if ((page === 1 || !paged) && asked && !nameInput.value.trim()) {
+                    problem.textContent = 'Give it a name.';
+                    nameInput.focus();
+                    return;
+                }
+                // A mode without parts (e.g. a new system, which asks for
+                // them itself) goes on without the second page
+                const withParts = boxes.length && modeOf()?.parts !== false;
+                if (page === 1 && withParts) {
+                    showPage(2);
+                    return;
+                }
+                const chosen = new Set(withParts ? boxes.filter(([, check]) => check.checked).map(([key]) => key) : []);
+                if (withParts && !chosen.size) {
+                    problem.textContent = 'Choose at least one thing to import.';
+                    return;
+                }
+                answer = { mode, name: asked ? nameInput.value.trim() : null, chosen };
+                dialog.close();
+            });
+            dialog.addEventListener('close', () => {
+                dialog.remove();
+                resolve(answer);
+            });
+            dialog.addEventListener('keydown', (e) => e.stopPropagation());
+            dialog.append(make('h5', {}, title), body, make('div', { className: 'tm-dialog-footer' }, problem, cancel, back, next));
+            document.body.appendChild(dialog);
+            dialog.showModal();
+            body.focus();
+        });
+    }
+
     // --- Import of a system's configuration ---
     // The Import button (next to HelloID's "Add new system" button) reads
     // a file made by the Export button and compares it with the system it
@@ -3972,6 +4136,79 @@
     //   applies: (configuration) -> can the step be sent for this file?
     //           A step that can't is left out; what it would have changed
     //           is shown as not importable.
+    //   keys:   the parts of the configuration it writes ("a.b": b within
+    //           a). A step that is not chosen keeps what the system has
+    //           of these, also in the requests of the other steps (see
+    //           withUnchosen).
+    // Parts of a configuration that more steps point at
+    const CORRELATION = 'correlationConfiguration';
+    const UNIQUENESS = 'mappingConfiguration.uniquenessConfiguration';
+    const MAPPING_FIELDS = 'mappingConfiguration.fields';
+
+    // The default values of a configuration form (its fields, or an
+    // object with them), by their keys: fields may be in groups, and a
+    // key may be dotted ("text.required")
+    function formDefaults(form) {
+        const values = {};
+        const walk = (fields) => (Array.isArray(fields) ? fields : []).forEach(field => {
+            if (!isPlainObject(field)) return;
+            if (field.key && field.defaultValue !== undefined) setPath(values, String(field.key), structuredClone(field.defaultValue));
+            walk(field.fieldGroup);
+        });
+        walk(Array.isArray(form) ? form : form?.fields);
+        return values;
+    }
+
+    // Values for a form that are not imported: what the system has, and
+    // the form's default where it has nothing
+    const valuesOrDefaults = (form, values) => mergeSettings(formDefaults(form), isPlainObject(values) ? values : {});
+
+    // The configuration to write when steps were left out (unchosen): what
+    // they would write is what the system has (a new one: what HelloID
+    // gave it), so the other steps don't send it along either. Values that
+    // are left out get the defaults of the form. Correlation and the
+    // unique fields point at mapping fields by ID: when they come from
+    // another side than the mapping, they are pointed at the field with
+    // the same name.
+    function withUnchosen(configuration, current, unchosen) {
+        const keys = new Set(unchosen.flatMap(step => step.keys ?? []));
+        if (!keys.size) return configuration;
+        const result = { ...configuration, mappingConfiguration: { ...configuration.mappingConfiguration } };
+        keys.forEach(key => {
+            const [outer, inner] = key.split('.');
+            if (key === 'scriptConfiguration') return; // (below, once the form is known)
+            if (inner) result[outer] = { ...result[outer], [inner]: structuredClone(current[outer]?.[inner]) };
+            else result[key] = structuredClone(current[key]);
+        });
+        if (keys.has('scriptConfiguration')) {
+            result.scriptConfiguration = valuesOrDefaults(result.scriptConfigurationForm, current.scriptConfiguration);
+        }
+
+        const fieldsOf = (c) => c?.mappingConfiguration?.fields ?? [];
+        const sideOf = (key) => (keys.has(key) ? current : configuration);
+        const fields = sideOf(MAPPING_FIELDS);
+        const nameIn = (side, id) => fieldsOf(side).find(f => f.identifier === id)?.name;
+        const idOf = (name) => fieldsOf(result).find(f => f.name === name)?.identifier ?? null;
+        if (sideOf(CORRELATION) !== fields && isPlainObject(result[CORRELATION])) {
+            const name = nameIn(sideOf(CORRELATION), result[CORRELATION].accountFieldId);
+            if (result[CORRELATION].enabled === true && !idOf(name)) {
+                throw new Error(`Correlation is on mapping field "${name ?? result[CORRELATION].accountFieldId}", which the ` +
+                                'mapping that the system will have does not have. Import Correlation and the mapping ' +
+                                'together, or neither.');
+            }
+            result[CORRELATION] = { ...result[CORRELATION], accountFieldId: idOf(name) };
+        }
+        const unique = result.mappingConfiguration.uniquenessConfiguration;
+        if (sideOf(UNIQUENESS) !== fields && Array.isArray(unique?.selectedUniqueFields)) {
+            // (a field that the mapping won't have can't be checked)
+            result.mappingConfiguration.uniquenessConfiguration = {
+                ...unique,
+                selectedUniqueFields: unique.selectedUniqueFields
+                    .map(id => idOf(nameIn(sideOf(UNIQUENESS), id))).filter(Boolean),
+            };
+        }
+        return result;
+    }
     const GENERAL_FIELDS = ['displayName', 'description', 'icon', 'isDisabled', 'executeOnPremises',
         'limitConcurrentActionsConfiguration'];
     // For every type: these are stored apart from the type's configuration
@@ -3982,6 +4219,7 @@
         // (see findDependency).
         {
             name: 'Depends on systems',
+            keys: ['dependOnSystems'],
             path: (id) => `/service/provisioning-api/api/target-systems/${id}/depend-on-systems`,
             method: 'POST',
             body: (configuration, current, systems) => ({
@@ -4003,6 +4241,7 @@
         // (see agentSelection in the import)
         {
             name: 'Agents for on-premises execution',
+            keys: ['agentSelection'],
             path: AGENT_SELECTION_PATH,
             method: 'POST',
             body: (configuration) => configuration.agentSelection ?? [],
@@ -4060,6 +4299,7 @@
     const POWERSHELL_IMPORT_STEPS = [
         {
             name: 'General settings',
+            keys: GENERAL_FIELDS,
             path: (id) => `/connector/powershell-target/api/configuration/${id}/general`,
             method: 'POST',
             body: (configuration) => Object.fromEntries(GENERAL_FIELDS.map(f => [f, configuration[f]])),
@@ -4067,12 +4307,14 @@
         ...SHARED_IMPORT_STEPS,
         {
             name: 'Configuration values',
+            keys: ['scriptConfiguration'],
             path: (id) => `/connector/powershell-target/api/configuration/${id}/script-configuration`,
             method: 'POST',
             body: (configuration) => ({ scriptConfiguration: configuration.scriptConfiguration }),
         },
         {
             name: 'Account scripts and configuration form',
+            keys: ['scripts', 'scriptConfigurationForm'],
             path: (id) => `/connector/powershell-target/api/configuration/${id}/account`,
             method: 'POST',
             body: (configuration) => ({
@@ -4085,6 +4327,7 @@
         // All thresholds in one request
         {
             name: 'Thresholds',
+            keys: ['thresholds'],
             path: (id) => `/connector/powershell-target/api/configuration/${id}/thresholds`,
             method: 'POST',
             body: (configuration) => configuration.thresholds ?? [],
@@ -4096,6 +4339,7 @@
         // (same name) keeps the ID it has there.
         {
             name: 'Resources',
+            keys: ['resources'],
             path: POWERSHELL_RESOURCES_PATH,
             method: 'POST',
             body: (configuration, current) => (configuration.resources ?? []).map(resource => ({
@@ -4114,6 +4358,7 @@
         // permissionRequests)
         {
             name: 'Permissions',
+            keys: ['permissions'],
             note: 'set by set: adds the new ones, deletes the ones that are not in the file, then changes the others',
             requests: permissionRequests,
             path: PERMISSIONS_PATH,
@@ -4129,6 +4374,7 @@
         // IDs: correlation (next step) always has to be set again after this.
         {
             name: 'Mapping (all fields)',
+            keys: [MAPPING_FIELDS],
             resetsFieldIds: true,
             note: 'replaces the whole mapping: turns correlation off, deletes all fields, then adds those of the file',
             before: [
@@ -4172,6 +4418,7 @@
         // then, like the correlation field below
         {
             name: 'Uniqueness check',
+            keys: [UNIQUENESS],
             usesFieldIds: true,
             path: (id) => `/connector/powershell-target/api/mapping/${id}/uniqueness`,
             method: 'POST',
@@ -4201,6 +4448,7 @@
         // that themselves) has nothing to send here.
         {
             name: 'Correlation',
+            keys: [CORRELATION],
             usesFieldIds: true,
             applies: (configuration) => configuration.correlationConfiguration?.enabled === true ||
                 (configuration.mappingConfiguration?.fields ?? [])
@@ -4226,9 +4474,6 @@
                 .filter(c => c === CORRELATION),
         },
     ];
-
-    const CORRELATION = 'correlationConfiguration';
-    const UNIQUENESS = 'mappingConfiguration.uniquenessConfiguration';
 
     // Name of the mapping field with this ID (IDs differ per system and
     // change when the mapping is imported; names don't)
@@ -4377,6 +4622,7 @@
     const ACTIVE_DIRECTORY_IMPORT_STEPS = [
         {
             name: 'General settings',
+            keys: AD_GENERAL_FIELDS,
             path: (id) => `/connector/active-directory/api/configuration/${id}/general`,
             method: 'POST',
             body: (configuration) => Object.fromEntries(AD_GENERAL_FIELDS.map(f => [f, configuration[f]])),
@@ -4384,6 +4630,7 @@
         ...SHARED_IMPORT_STEPS,
         {
             name: 'Exchange',
+            keys: ['exchangeConfiguration'],
             path: (id) => `/connector/active-directory/api/configuration/${id}/exchange`,
             method: 'POST',
             body: (configuration) => configuration.exchangeConfiguration,
@@ -4394,6 +4641,7 @@
         // Home, profile and terminal services directories, in one request
         {
             name: 'Directories',
+            keys: ['directories'],
             path: (id) => `/connector/active-directory/api/configuration/${id}/directories`,
             method: 'POST',
             body: (configuration) => configuration.directories,
@@ -4405,6 +4653,7 @@
         // fields are sent again afterwards: a new field has its ID only then.
         {
             name: 'Field mapping',
+            keys: [MAPPING_FIELDS],
             note: 'field by field: changes them, adds the new ones, deletes the ones that are not in the file',
             resetsFieldIds: true,
             requests: adFieldRequests,
@@ -4417,6 +4666,7 @@
         // container what the configuration has side by side.
         {
             name: 'Administration (delete accounts, manager, containers)',
+            keys: AD_ADMINISTRATION_FIELDS,
             path: (id) => `/connector/active-directory/api/configuration/${id}/administration`,
             method: 'POST',
             body: (configuration) => {
@@ -4443,6 +4693,7 @@
         // All thresholds in one request
         {
             name: 'Thresholds',
+            keys: ['thresholds'],
             path: (id) => `/connector/active-directory/api/configuration/${id}/thresholds`,
             method: 'POST',
             body: (configuration) => configuration.thresholds,
@@ -4453,6 +4704,7 @@
         // fields to check
         {
             name: 'Uniqueness check',
+            keys: [UNIQUENESS],
             usesFieldIds: true,
             path: (id) => `/connector/active-directory/api/mapping/${id}/uniqueness`,
             method: 'POST',
@@ -4477,6 +4729,7 @@
         // name. The request also wants the dependencies again.
         {
             name: 'Account settings (sync unique fields, configuration form, post-action scripts)',
+            keys: ['syncUniqueFields', 'scriptConfigurationForm', 'postActionPowerShellConfiguration'],
             usesFieldIds: true,
             path: (id) => `/connector/active-directory/api/configuration/${id}/account`,
             method: 'POST',
@@ -4763,13 +5016,14 @@
         plans.filter(plan => plan.add.length || (removing && plan.remove.length)).forEach(plan => {
             const remove = removing ? plan.remove : [];
             const body = withEntitlements(plan.rule, plan.add, remove);
-            drafts.add(plan.rule.ruleId);
             requests.push({
                 name: `Business rule "${plan.rule.name}" (draft)`,
                 changes: [...describe(plan.rule.name, '+', plan.add), ...describe(plan.rule.name, '-', remove)],
-                path: () => RULES_PATH,
-                method: 'POST',
-                body: () => body,
+                // (counted once it is saved: the user may choose not to import the rules)
+                run: async () => {
+                    await sendToGateway(RULES_PATH, 'POST', body);
+                    drafts.add(plan.rule.ruleId);
+                },
             });
         });
 
@@ -5082,6 +5336,7 @@
 
     // The tasks of a checklist, each with:
     //   label:   for the user
+    //   step:    the import step that writes it
     //   path:    where it is in the checklist
     //   scripts: its scripts in the configuration (of the file)
     //   differs: (changed parts, see changedParts) -> is that part of
@@ -5093,24 +5348,28 @@
         return [
             {
                 label: 'Field configuration',
+                step: 'Mapping (all fields)',
                 path: ['isMappingConfigConverted'],
                 scripts: [],
                 differs: (changes) => changes.some(c => c.startsWith(MAPPING_FIELD)),
             },
             ...Object.entries(CHECKLIST_ACCOUNT_SCRIPTS).filter(([key]) => key in checklist).map(([key, script]) => ({
                 label: `Account script ${script}`,
+                step: 'Account scripts and configuration form',
                 path: [key],
                 scripts: [configuration.scripts?.[script]].filter(value => typeof value === 'string'),
                 differs: (changes) => changes.includes(`scripts.${script}`),
             })),
             ...Object.keys(checklist.convertedPermissionDefinitions ?? {}).map(name => ({
                 label: `Permission set "${name}"`,
+                step: 'Permissions',
                 path: ['convertedPermissionDefinitions', name],
                 scripts: scriptsOf(named(configuration.permissions, name)),
                 differs: (changes) => changes.some(c => c.startsWith(`${PERMISSION_SET}"${name}"`)),
             })),
             ...Object.keys(checklist.convertedResourceScripts ?? {}).map(name => ({
                 label: `Resource "${name}"`,
+                step: 'Resources',
                 path: ['convertedResourceScripts', name],
                 scripts: scriptsOf(named(configuration.resources, name)),
                 differs: (changes) => changes.some(c => c.startsWith(`${RESOURCE}"${name}"`)),
@@ -5120,6 +5379,36 @@
 
     // Is the task at this path ticked off in a checklist?
     const isTicked = (checklist, path) => path.reduce((value, key) => value?.[key], checklist) === true;
+
+    // The choices of a target system import (see chooseImport): the
+    // steps, and the links to other things it makes. work: [{ step,
+    // changes }], changes null for a new system (everything).
+    // notifications, rules: how many of each it would write
+    const TARGET_LINK_STEPS = ['Depends on systems', 'Agents for on-premises execution'];
+    const NOTIFICATIONS_CHOICE = 'tm:notifications';
+    const RULES_CHOICE = 'tm:rules';
+
+    // fixed: the steps that are always imported
+    function targetImportGroups(work, data, { notifications, rules, fixed = [] } = {}) {
+        const count = (n, what) => `${n} ${what}${n === 1 ? '' : 's'}`;
+        const item = ({ step, changes }) => ({ key: step.name, label: step.name, fixed: fixed.includes(step.name),
+            detail: changes ? count(changes.length, 'change') : null });
+        notifications ??= (Array.isArray(data.notifications) ? data.notifications : []).filter(n => !n?.couldNotRead).length;
+        rules ??= (Array.isArray(data.rules) ? data.rules : []).filter(r => r?.entitlements?.length).length;
+        return [
+            { title: 'Parts of the configuration', items: work.filter(w => !TARGET_LINK_STEPS.includes(w.step.name)).map(item) },
+            {
+                title: 'Links to other things',
+                items: [
+                    ...work.filter(w => TARGET_LINK_STEPS.includes(w.step.name)).map(item),
+                    ...(notifications ? [{ key: NOTIFICATIONS_CHOICE, label: 'Notifications of the system',
+                        detail: count(notifications, 'notification') }] : []),
+                    ...(rules ? [{ key: RULES_CHOICE, label: 'Entitlements in business rules (saved as drafts)',
+                        detail: count(rules, 'rule') }] : []),
+                ],
+            },
+        ];
+    }
 
     // false: cancelled
     async function importSystem() {
@@ -5138,7 +5427,9 @@
     //            system has (a file made from a GitHub repository)
     //   confirmedNew: a new system was confirmed already: no question
     //   finishNote: added to the closing message
-    async function importData(data, { partial = false, confirmedNew = false, finishNote = '' } = {}) {
+    //   forceNew: make a new system, also when the file's system is here
+    //            (the user chose so, see chooseImport)
+    async function importData(data, { partial = false, confirmedNew = false, finishNote = '', forceNew = false } = {}) {
         if (!isPlainObject(data?.configuration) || typeof data.templateIdentifier !== 'string') {
             throw new Error('The file is not an export of a target system.');
         }
@@ -5198,7 +5489,7 @@
         }
         // All that are left out, for the messages
         const missing = missingDependencies(data.configuration, systems);
-        let system = systems.find(s => s?.systemId === systemId);
+        let system = forceNew ? undefined : systems.find(s => s?.systemId === systemId);
         const created = !system;
         // A file for a migration is for the system it was made from, and
         // never makes a new one
@@ -5208,7 +5499,28 @@
                             'environment has no target system with that ID. Nothing was imported, and no new ' +
                             'system was made: the system ID in the file has to be that of the system to migrate.');
         }
-        if (created) system = await createSystemFor(data, fileName, systemId, steps, systems, confirmedNew);
+        // What to import (see chooseImport); for a new system asked here,
+        // before it is made, for an existing one once the differences are known
+        let chosen = null;
+        if (created && !confirmedNew) {
+            const answer = await chooseImport('Import: new target system', {
+                intro: `${header}\n\n` + (forceNew ? '' : `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n`) +
+                    `A NEW target system (type ${data.templateIdentifier}) will be created, DISABLED, so it does nothing ` +
+                    'before you have checked it.' +
+                    (data.secretsIncluded === false ? '\n\nThe file has no secrets: those will be empty in the new system.' : '') +
+                    missingDependencies(data.configuration, systems),
+                name: { label: 'Name of the new system', value: data.configuration.displayName ?? fileName },
+                groups: targetImportGroups(steps.filter(step => step.applies?.(data.configuration) ?? true)
+                    // (it gives the new system its name, and keeps it disabled)
+                    .map(step => ({ step, changes: null })), data, { fixed: ['General settings'] }),
+            });
+            if (!answer) return false;
+            chosen = answer.chosen;
+            if (answer.name !== data.configuration.displayName) {
+                data = { ...data, displayName: answer.name, configuration: { ...data.configuration, displayName: answer.name } };
+            }
+        }
+        if (created) system = await createSystemFor(data, data.configuration.displayName ?? fileName, systemId, steps, systems);
         if (!system) return false; // cancelled
         // A v2 file for a v1 system: its migration is started first, when
         // the user confirms that (see startMigration)
@@ -5249,7 +5561,7 @@
         });
         const current = await loadCurrent();
         const fileConfiguration = restoreSecrets(data.configuration, current);
-        const configuration = {
+        let configuration = {
             // A partial file: what it doesn't have stays as it is, also
             // within the scripts and the mapping
             ...(partial ? current : {}),
@@ -5272,11 +5584,14 @@
             // whose migration is open: HelloID keeps it disabled.
             ...(created || isPlainObject(current.migrationStatus) ? { isDisabled: true } : {}),
         };
-        const { requests: newNotifications, skipped: notificationsSkipped } =
-            await notificationRequests(data, systemId, system);
-        const ruleWork = await ruleRequests(data, system, created, header);
+        // (with what is chosen not to be imported, these are emptied below)
+        // (a new system: chosen already; what is not chosen isn't read)
+        let { requests: newNotifications, skipped: notificationsSkipped } = chosen && !chosen.has(NOTIFICATIONS_CHOICE)
+            ? { requests: [], skipped: '' } : await notificationRequests(data, systemId, system);
+        const ruleWork = chosen && !chosen.has(RULES_CHOICE) ? { requests: [], drafts: () => 0, skipped: '' }
+            : await ruleRequests(data, system, created, header);
         if (!ruleWork) return false; // cancelled
-        const ruleDrafts = ruleWork.requests;
+        let ruleDrafts = ruleWork.requests;
         const notCompared = !hasResources ? null : !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
             : !resourcesRead ? 'HelloID did not return the resources of the system'
             : null;
@@ -5284,8 +5599,8 @@
         // Everything that differs, and which of it a known request can write
         // (a part that several requests send is listed with the first one)
         const importable = new Set();
-        const applicable = steps.filter(step => step.applies?.(configuration) ?? true);
-        const work = applicable.map(step => {
+        let applicable = steps.filter(step => step.applies?.(configuration) ?? true);
+        let work = applicable.map(step => {
             const changes = (step.changes?.(configuration, current) ??
                              changedParts(step.body(configuration, current, systems), step.body(current, current, systems)))
                 .filter(c => !importable.has(c));
@@ -5304,35 +5619,108 @@
         const claimed = !openChecklist ? [] : migrationTasks(openChecklist, configuration)
             .filter(task => isTicked(fileChecklist, task.path) && !isTicked(openChecklist, task.path));
         const stillV1 = claimed.filter(task => task.scripts.some(script => V1_VARIABLE.test(script)));
-        const tickable = claimed.filter(task => !stillV1.includes(task));
-        const leftOpen = !stillV1.length ? ''
+        let tickable = claimed.filter(task => !stillV1.includes(task));
+        let leftOpen = !stillV1.length ? ''
             : warn('\n\nNot ticked off in the migration checklist, as the file says they are converted but their ' +
                    'scripts still use PowerShell v1 variables ($person, $dryRun, ...):\n' +
                    stillV1.map(task => `  - ${task.label}`).join('\n'));
         // The migration can be completed when that leaves no task open
-        const mayComplete = Boolean(openChecklist) && migrationTasks(openChecklist, configuration)
+        let mayComplete = Boolean(openChecklist) && migrationTasks(openChecklist, configuration)
             .every(task => isTicked(openChecklist, task.path) || tickable.some(t => t.label === task.label));
-
-        // A new name must not be in use by another system: stop right here
-        if (!created && importable.has('displayName') && typeof configuration.displayName === 'string' &&
-            await fetchFromGateway(NAME_EXISTS_PATH(configuration.displayName)) === true) {
-            throw new Error(`Another target system is already named "${configuration.displayName}". ` +
-                            'Nothing was imported.');
-        }
 
         const from = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ` +
                      `${data.exportedAt ?? '?'}`;
-        const skipped = warn(notCompared ? `\n\nResources were not compared: ${notCompared}.` : '') + missing +
-                        notificationsSkipped + ruleWork.skipped;
+        // What could not be imported, of what is imported (emptied below for what is not chosen)
+        let dependsMissing = missing;
+        let rulesSkipped = () => ruleWork.skipped;
+        const skipped = () => warn(notCompared ? `\n\nResources were not compared: ${notCompared}.` : '') + dependsMissing +
+                        notificationsSkipped + rulesSkipped();
         const describe = (title, changes) => `${title}:\n` + changes.map(c => `  - ${c}`).join('\n');
         const unsupported = warn(others.length ? `\n\n${describe('Not importable, left as is', others)}` : '');
-        if (!work.length && !newNotifications.length && !ruleDrafts.length && !tickable.length && !mayComplete) {
-            await showDialog('Import', `${from}\n\n` + (created ? `Created "${system.displayName}". ` : '') +
-                (others.length
-                    ? `Nothing to import into "${system.displayName}".${unsupported}`
-                    : `"${system.displayName}" already has the configuration of the file.`) + skipped + leftOpen +
-                startedNote);
+        // Nothing differs: said so, unless the file can still be imported
+        // as a new system (see below)
+        const nothing = () => !work.length && !newNotifications.length && !ruleDrafts.length && !tickable.length && !mayComplete;
+        const nothingNote = () => `${from}\n\n` + (created ? `Created "${system.displayName}". ` : '') +
+            (others.length
+                ? `Nothing to import into "${system.displayName}".${unsupported}`
+                : `"${system.displayName}" already has the configuration of the file.`) + skipped() + leftOpen + startedNote;
+        // (a file for a migration is only for its own system)
+        const asNew = !created && !confirmedNew && !fileChecklist && !migrationStarted;
+        if (nothing() && !asNew) {
+            await showDialog('Import', nothingNote());
             return true;
+        }
+
+        // An existing system: what to do with it (overwrite, or import the
+        // file as a new system) and what to import
+        if (!created && !confirmedNew) {
+            const answer = await chooseImport('Import: what to import', {
+                intro: `${from}\n\nThe file is of "${system.displayName}", which is in this HelloID environment. ` +
+                       (nothing() ? strong('It already has the configuration of the file' +
+                                           `${others.length ? ', as far as that can be imported' : ''}.`) +
+                                    ' You can still import the file as a new system.'
+                           : 'Choose what to import; the next step shows the differences in detail.'),
+                modes: asNew ? [
+                    { value: 'overwrite', label: `Overwrite "${system.displayName}" where it differs from the file` },
+                    { value: 'new', label: 'Import the file as a NEW target system', parts: false },
+                ] : [],
+                name: asNew ? { label: 'Name of the new system', value: `${fileName} (copy)`, when: (mode) => mode === 'new' } : null,
+                groups: targetImportGroups(work, data,
+                    { notifications: newNotifications.length, rules: ruleDrafts.length }),
+            });
+            if (!answer) return false;
+            if (answer.mode === 'new') {
+                // (the file's system ID stays: what in the file points at
+                // that system then points at the new one)
+                return importData({
+                    ...data,
+                    displayName: answer.name,
+                    configuration: { ...data.configuration, displayName: answer.name },
+                }, { partial, finishNote, forceNew: true });
+            }
+            chosen = answer.chosen;
+        }
+        // The steps that could be imported, and were not chosen
+        const unchosen = !chosen ? [] : work.filter(w => !chosen.has(w.step.name)).map(w => w.step);
+        if (chosen) {
+            work = work.filter(w => chosen.has(w.step.name));
+            // Tasks of the migration checklist whose part is not imported stay open
+            const notImported = tickable.filter(task => unchosen.some(step => step.name === task.step));
+            if (notImported.length) {
+                tickable = tickable.filter(task => !notImported.includes(task));
+                mayComplete = false;
+                leftOpen += warn('\n\nNot ticked off in the migration checklist, as they are not imported:\n' +
+                                 notImported.map(task => `  - ${task.label}`).join('\n'));
+            }
+            if (!chosen.has(NOTIFICATIONS_CHOICE)) {
+                newNotifications = [];
+                notificationsSkipped = '';
+            }
+            if (!chosen.has(RULES_CHOICE)) {
+                ruleDrafts = [];
+                rulesSkipped = () => '';
+            }
+            if (unchosen.some(step => step.keys?.includes('dependOnSystems'))) dependsMissing = '';
+            if (nothing()) {
+                // (nothing differed: there was nothing to choose)
+                if (!chosen.size && !created) {
+                    await showDialog('Import', nothingNote());
+                    return true;
+                }
+                await showDialog('Import', `${from}\n\nNothing was chosen that differs, so nothing was imported.` +
+                                 (created ? ` "${system.displayName}" was created, and is empty.` : '') + startedNote);
+                return true;
+            }
+            // What the steps write: what is not chosen stays as the system has it
+            configuration = withUnchosen(configuration, current, unchosen);
+            applicable = steps.filter(step => step.applies?.(configuration) ?? true);
+        }
+
+        // A new name must not be in use by another system: stop right here
+        if (!created && configuration.displayName !== current.displayName && typeof configuration.displayName === 'string' &&
+            await fetchFromGateway(NAME_EXISTS_PATH(configuration.displayName)) === true) {
+            throw new Error(`Another target system is already named "${configuration.displayName}". ` +
+                            'Nothing was imported.');
         }
 
         // What to send: the steps with changes, plus, when the mapping is
@@ -5383,7 +5771,7 @@
         if (!created) {
             if (!await showDialog('Import', `${from}${startedNote}\n\n` +
                                   `This will overwrite in, or add to, "${system.displayName}":\n\n` +
-                                  `${parts.join('\n\n')}${unsupported}${skipped}${leftOpen}\n\n` +
+                                  `${parts.join('\n\n')}${unsupported}${skipped()}${leftOpen}\n\n` +
                                   (migrationStarted ? 'The backup was downloaded before the migration was started.'
                                       : 'A backup of the current configuration is downloaded first.'),
                                   { confirm: true })) {
@@ -5497,7 +5885,8 @@
         // A file without secrets: those kept the values the system had
         const masked = Object.entries(data.configuration.scriptConfiguration ?? {})
             .filter(([, value]) => value === EXPORT_MASK).map(([key]) => key);
-        const secrets = data.secretsIncluded !== false ? ''
+        const valuesSkipped = unchosen.some(step => step.keys?.includes('scriptConfiguration'));
+        const secrets = data.secretsIncluded !== false || valuesSkipped ? ''
             : '\n\nThe file was exported without secrets. ' +
               (created ? 'They are empty in the new system' : 'They kept the values the system already had') +
               (masked.length ? ` (${masked.join(', ')})` : '') +
@@ -5515,18 +5904,18 @@
                 : error('\n\nThe migration to PowerShell v2 is NOT completed, as tasks of its checklist are still ' +
                        'open. Do those in HelloID and complete the migration there. The system stays disabled ' +
                        'until then.');
-        await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${missing}${notificationsSkipped}${ruleWork.skipped}${draftsNote}${finishNote}\n\n` +
+        await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${dependsMissing}${notificationsSkipped}${rulesSkipped()}${draftsNote}${finishNote}\n\n` +
                               'The page reloads when you close this message.');
         location.reload(); // show the changes
         return true;
     }
 
-    // The file's system isn't in this environment: make a new, empty one
-    // for it, after a confirmation. Returns the new system as in the list
-    // of systems, or null when cancelled. Everything that can be checked
-    // is checked first, so no empty system is left behind for a file that
-    // can't be imported.
-    async function createSystemFor(data, fileName, systemId, steps, systems, confirmed = false) {
+    // The file's system isn't in this environment (or the user chose to
+    // import it as a new one): make a new, empty one for it, as confirmed
+    // (see chooseImport). Returns the new system as in the list of
+    // systems. Everything that can be checked is checked first, so no
+    // empty system is left behind for a file that can't be imported.
+    async function createSystemFor(data, fileName, systemId, steps, systems) {
         const createPath = CREATE_PATHS[data.templateIdentifier];
         if (!createPath) {
             throw new Error(`The system of the file ("${fileName}", ID ${systemId}) was not found in this ` +
@@ -5544,19 +5933,6 @@
         const empty = { systemId: '', isNew: true, resources: [], mappingConfiguration: configuration.mappingConfiguration };
         steps.forEach(step => step.body(configuration, empty, systems));
 
-        if (!confirmed && !await showDialog('Import: new system',
-            `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}\n\n` +
-            `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n` +
-            `A NEW target system "${name}" (type ${data.templateIdentifier}) will be created, and the ` +
-            'configuration of the file is then imported into it.\n\n' +
-            'The new system will be DISABLED, also when the system of the file is enabled, so it does ' +
-            'nothing before you have checked it. Enable it yourself when it is ready.' +
-            (data.secretsIncluded === false
-                ? '\n\nThe file has no secrets: those will be empty in the new system.' : '') +
-            missingDependencies(data.configuration, systems),
-            { confirm: true })) {
-            return null;
-        }
         const newId = await sendToGateway(createPath, 'POST', {});
         if (typeof newId !== 'string' || !newId) {
             throw new Error('HelloID did not return the ID of the new system. Check the list of target systems.');
@@ -7756,6 +8132,12 @@
         .tm-dialog-copy { opacity: .55; }
         .tm-dialog-copy:hover, .tm-dialog-copy:focus { opacity: .8; }
 
+        /* Import: what to import (see chooseImport) */
+        .tm-choose-group { display: flex; flex-direction: column; gap: 2px; margin: 10px 0; }
+        .tm-choose-item { display: block; margin: 0; font-weight: normal; }
+        .tm-choose-name { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+        .tm-choose-problem { margin-right: auto; align-self: center; }
+
         /* Password fields: the eye button (see addRevealButtons) */
         .tm-reveal-password {
             position: absolute;
@@ -8052,6 +8434,7 @@
             return details.get(id);
         };
 
+        const entries = []; // the notifications that can be imported (see below)
         const work = [];    // { label, body, isNew }
         const same = [];
         const skipped = []; // texts
@@ -8123,11 +8506,52 @@
                 // A new one does nothing until it has been checked
                 enabled: match ? rest.enabled === true : false,
             };
-            if (current && sameNotification(body, current)) {
-                same.push(label);
-                continue;
-            }
-            work.push({ label, body, isNew: !match, identifier: match?.identifier });
+            entries.push({ label, body, isNew: !match, identifier: match?.identifier,
+                same: Boolean(current && sameNotification(body, current)), overwrites: match?.name });
+        }
+
+        // What to import (see chooseImport): overwrite what matches or make
+        // everything new, which notifications, and whether to keep their
+        // links to the data of target systems
+        if (entries.length) {
+            const answer = await chooseImport('Import notifications: what to import', {
+                intro: header + (skipped.length ? warn(`\n\nNot importable:\n${skipped.map(s => `  - ${s}`).join('\n')}`) : ''),
+                modes: entries.some(e => !e.isNew) ? [
+                    { value: 'overwrite', label: 'Overwrite the notifications that match (same ID, or same event and name)' },
+                    { value: 'new', label: 'Import all as NEW notifications (disabled)' },
+                ] : [],
+                groups: [
+                    {
+                        title: 'Notifications',
+                        items: entries.map((e, i) => ({
+                            key: String(i),
+                            label: e.label,
+                            detail: e.isNew ? 'new' : e.same ? 'already as in the file' : `overwrites "${e.overwrites}"`,
+                            checked: !e.same,
+                        })),
+                    },
+                    {
+                        title: 'Links to other things',
+                        items: entries.some(e => e.body.dataReferences.length)
+                            ? [{ key: 'dataReferences', label: 'Use the data of target systems (data references)' }] : [],
+                    },
+                ],
+            });
+            if (!answer) return false;
+            entries.forEach((e, i) => {
+                if (!answer.chosen.has(String(i))) {
+                    if (e.same) same.push(e.label);
+                    return;
+                }
+                const body = answer.chosen.has('dataReferences') ? e.body : { ...e.body, dataReferences: [] };
+                if (answer.mode === 'new') {
+                    work.push({ label: e.label, isNew: true, body: { ...body, identifier: crypto.randomUUID(), enabled: false } });
+                } else if (e.same && body === e.body) {
+                    same.push(e.label);
+                } else {
+                    work.push({ ...e, body });
+                }
+            });
         }
 
         const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
@@ -8227,20 +8651,24 @@
         if (text === null) return false;
         let data;
         try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
-        const file = data?.system;
-        if (data?.contents !== 'notificationSystem' || !isPlainObject(file)) {
+        if (data?.contents !== 'notificationSystem' || !isPlainObject(data.system)) {
             throw new Error('The file is not an export of a notification system.');
         }
+        return importNotificationSystemData(data);
+    }
+
+    // forceNew: make a new system, also when the file's system is here
+    // (the user chose so, see chooseImport)
+    async function importNotificationSystemData(data, { forceNew = false } = {}) {
+        const file = data.system;
         const header = `File: export of "${file.displayName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
         const senders = await fetchFromGateway(NOTIFICATION_SYSTEMS_PATH);
-        const found = senders.find(s => s.systemId === file.systemId) ??
+        const found = forceNew ? undefined : senders.find(s => s.systemId === file.systemId) ??
             (file.isBuiltin ? senders.find(s => s.isBuiltin)
                 : senders.find(s => !s.isBuiltin && s.displayName?.trim() === file.displayName?.trim()));
         const created = !found;
-        const nameTaken = async () => fetchFromGateway(
-            `${NOTIFICATION_SYSTEMS_PATH}/exists?name=${encodeURIComponent(file.displayName)}`) === true;
-        if ((created || found.displayName !== file.displayName) && await nameTaken()) {
-            throw new Error(`Another notification system is already named "${file.displayName}". Nothing was imported.`);
+        if (created && file.isBuiltin) {
+            throw new Error('The file is of the built-in notification system, and this HelloID environment has none to import it into.');
         }
 
         const readCurrent = async (id) => ({
@@ -8286,41 +8714,87 @@
             return { merged, problems };
         };
 
-        const general = Object.fromEntries(NOTIFICATION_GENERAL_FIELDS.map(f => [f, file[f]]));
+        // What differs, as the parts to choose from
         const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-        const changes = [];
-        const generalDiffers = created || NOTIFICATION_GENERAL_FIELDS.some(f => !sameJson(file[f], current[f]));
-        if (generalDiffers) changes.push('General settings (name, description, icon, execute on-premises)');
-        if (fileAgents && !sameAgentSelection(fileAgents, current?.agentSelection)) changes.push('Agents for on-premises execution');
-        const fileScripts = (file.notificationScripts ?? []).length > 0;
-        const scriptsDiffer = fileScripts &&
-            (created || !sameJson(scriptsFor(current), (current.notificationScripts ?? []).map(scriptFields)));
-        if (scriptsDiffer) changes.push(`Scripts: ${(file.notificationScripts ?? []).map(s => `"${s.displayName}"`).join(', ')} (the system's other scripts stay)`);
-        const templateWork = current ? templatesFor(withScripts(current)) : null;
-        const templatesDiffer = (file.notificationTemplates ?? []).length &&
-            (created || !sameJson(templateWork.merged, current.notificationTemplates));
-        if (templatesDiffer) changes.push(`Templates: ${(file.notificationTemplates ?? []).map(t => `"${t.displayName}"`).join(', ')} (the system's other templates stay)`);
-        // The configuration: its form, then its values. Secrets left out of
-        // the file ("***") keep the value they have here.
         const fileConfig = isPlainObject(file.systemConfiguration) ? file.systemConfiguration : null;
         const currentConfig = current?.systemConfiguration;
-        const formDiffers = Boolean(fileConfig) && Array.isArray(fileConfig.fields) &&
-            (created || !sameJson(fileConfig.fields, currentConfig?.fields));
         const configValues = (config) => restoreValues(fileConfig?.data, config?.data) ?? {};
-        const dataDiffers = Boolean(fileConfig) && isPlainObject(fileConfig.data) &&
-            (created || !sameJson(configValues(currentConfig), currentConfig?.data));
-        if (formDiffers) changes.push('Configuration form');
-        if (dataDiffers) changes.push('Configuration values');
-
-        const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
-        const problemsNow = templateWork?.problems ?? [];
-        if (!changes.length) {
-            await showDialog('Import notification system', `${header}\n\n"${found.displayName}" already has what the file has.`);
+        const templateWork = current ? templatesFor(withScripts(current)) : null;
+        const names = (items) => items.map(item => `"${item.displayName}"`).join(', ');
+        const differs = {
+            general: created || NOTIFICATION_GENERAL_FIELDS.some(f => !sameJson(file[f], current[f])),
+            agents: Boolean(fileAgents) && !sameAgentSelection(fileAgents, current?.agentSelection),
+            form: Boolean(fileConfig) && Array.isArray(fileConfig.fields) &&
+                (created || !sameJson(fileConfig.fields, currentConfig?.fields)),
+            values: Boolean(fileConfig) && isPlainObject(fileConfig.data) &&
+                (created || !sameJson(configValues(currentConfig), currentConfig?.data)),
+            scripts: (file.notificationScripts ?? []).length > 0 &&
+                (created || !sameJson(scriptsFor(current), (current.notificationScripts ?? []).map(scriptFields))),
+            templates: (file.notificationTemplates ?? []).length > 0 &&
+                (created || !sameJson(templateWork.merged, current.notificationTemplates)),
+        };
+        const PARTS = [
+            { key: 'general', label: 'General settings', detail: 'name, description, icon, execute on-premises' },
+            { key: 'form', label: 'Configuration form' },
+            { key: 'values', label: 'Configuration values' },
+            { key: 'scripts', label: 'Scripts', detail: `${names(file.notificationScripts ?? [])}; the system's other scripts stay` },
+            { key: 'templates', label: 'Templates', detail: `${names(file.notificationTemplates ?? [])}; the system's other templates stay` },
+        ];
+        // Nothing differs: said so, unless the file can still be imported
+        // as a new system (not the built-in one: there is one of it)
+        const alreadyHas = `${header}\n\n"${found?.displayName}" already has what the file has.`;
+        const anyDiffers = Object.values(differs).some(Boolean);
+        if (!anyDiffers && file.isBuiltin) {
+            await showDialog('Import notification system', alreadyHas);
             return true;
         }
+
+        // What to do (overwrite, or a new system), and what to import
+        const answer = await chooseImport('Import notification system: what to import', {
+            intro: `${header}\n\n` + (created
+                ? `A NEW notification system (PowerShell) will be made${forceNew ? '' : ': this HelloID environment has none that matches the file'}.`
+                : `The file matches "${found.displayName}" in this HelloID environment.` +
+                  (anyDiffers ? '' : ` ${strong('It already has what the file has.')} You can still import the file as a new system.`)),
+            modes: created || file.isBuiltin ? [] : [
+                { value: 'overwrite', label: `Overwrite "${found.displayName}" where it differs from the file` },
+                { value: 'new', label: 'Import the file as a NEW notification system', parts: false },
+            ],
+            name: {
+                label: 'Name of the new notification system',
+                value: created ? file.displayName : `${file.displayName} (copy)`,
+                when: (mode) => created || mode === 'new',
+            },
+            groups: [
+                { title: 'Parts', items: PARTS.filter(part => differs[part.key]).map(part => ({ ...part, fixed: created && part.key === 'general' })) },
+                { title: 'Links to other things', items: differs.agents ? [{ key: 'agents', label: 'Agents for on-premises execution' }] : [] },
+            ],
+        });
+        if (!answer) return false;
+        if (answer.mode === 'new') {
+            return importNotificationSystemData({ ...data, system: { ...file, systemId: null, displayName: answer.name } }, { forceNew: true });
+        }
+        const name = answer.name ?? file.displayName;
+        Object.keys(differs).forEach(key => { differs[key] = differs[key] && answer.chosen.has(key); });
+        const general = { ...Object.fromEntries(NOTIFICATION_GENERAL_FIELDS.map(f => [f, file[f]])), displayName: name };
+        if (!Object.values(differs).some(Boolean)) {
+            await showDialog('Import notification system',
+                anyDiffers ? `${header}\n\nNothing was chosen, so nothing was imported.` : alreadyHas);
+            return true;
+        }
+        if ((created || (differs.general && found.displayName !== name)) && await fetchFromGateway(
+            `${NOTIFICATION_SYSTEMS_PATH}/exists?name=${encodeURIComponent(name)}`) === true) {
+            throw new Error(`Another notification system is already named "${name}". Nothing was imported.`);
+        }
+
+        const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
+        // (templates point at the scripts the system will have: those of the file only when they are imported)
+        const problemsNow = differs.templates && !created
+            ? templatesFor(differs.scripts ? withScripts(current) : current).problems : [];
+        const chosenParts = [...PARTS, { key: 'agents', label: 'Agents for on-premises execution' }]
+            .filter(part => differs[part.key]).map(part => part.label + (part.detail ? ` (${part.detail})` : ''));
         if (!await showDialog('Import notification system', `${header}\n\n` +
-            (created ? `A NEW notification system "${file.displayName}" (PowerShell) will be made, with:\n`
-                : `This will overwrite in "${found.displayName}":\n`) + list2(changes) +
+            (created ? `A NEW notification system "${name}" (PowerShell) will be made, with:\n`
+                : `This will overwrite in "${found.displayName}":\n`) + list2(chosenParts) +
             (problemsNow.length ? warn(`\n\nTemplates that point at a script the system doesn't have keep pointing at it:\n${list2(problemsNow)}`) : '') +
             (created ? '' : '\n\nA backup of the current notification system is downloaded first.'),
         { confirm: true })) return false;
@@ -8330,12 +8804,19 @@
             downloadFile(JSON.stringify(backup, null, 2),
                 `${fileSafe(found.displayName)} - backup before import - ${found.systemId} - ${isoDate()}.json`);
         }
+        const generalDiffers = differs.general;
+        const formDiffers = differs.form;
+        const dataDiffers = differs.values;
+        const scriptsDiffer = differs.scripts;
+        const templatesDiffer = differs.templates;
         const steps = [
             ...(created ? ['Create new notification system'] : []),
             ...(generalDiffers ? ['General settings'] : []),
-            ...(changes.some(c => c.startsWith('Agents')) ? ['Agents for on-premises execution'] : []),
+            ...(differs.agents ? ['Agents for on-premises execution'] : []),
             ...(formDiffers ? ['Configuration form'] : []),
             ...(dataDiffers ? ['Configuration values'] : []),
+            // The form without its values: its defaults where the system has no value
+            ...(formDiffers && !dataDiffers ? ['Configuration values (defaults of the form)'] : []),
             ...(scriptsDiffer ? ['Scripts'] : []),
             ...(templatesDiffer ? ['Templates'] : []),
         ];
@@ -8368,13 +8849,21 @@
             }
             // A new system: as it was made (its default script and template)
             const target = created ? await readCurrent(id) : current;
+            if (formDiffers && !dataDiffers) {
+                await step(async () => {
+                    const values = valuesOrDefaults(fileConfig.fields, target.systemConfiguration?.data);
+                    if (!sameJson(values, target.systemConfiguration?.data ?? {})) {
+                        await sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/configuration/data`, 'POST', values);
+                    }
+                });
+            }
             if (scriptsDiffer) {
                 await step(() => sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/scripts`, 'POST',
                     { scripts: scriptsFor(target) }));
             }
             if (templatesDiffer) {
                 await step(async () => {
-                    const { merged } = templatesFor(withScripts(target));
+                    const { merged } = templatesFor(scriptsDiffer ? withScripts(target) : target);
                     await sendToGateway(`${NOTIFICATION_SYSTEM_PATH(id)}/templates`, 'POST', { templates: merged });
                 });
             }
@@ -8448,6 +8937,383 @@
                 configure.before(btn);
             });
         }
+    }
+
+    // =====================================================================
+    // Source systems: export, import, template
+    // =====================================================================
+    // Each source system tile gets an Export button and a Template button
+    // (which catalog template the system was made from, and its latest
+    // release); the page gets an Import button next to HelloID's +.
+    // The file has the system as HelloID returns it (scripts, configuration
+    // form and values, mappings, thresholds, template), and its agents.
+    // The import goes to the system it was exported from (same ID, or
+    // else the same name), or makes a new one. HelloID makes a source
+    // system only from a catalog template; the template of the file is
+    // looked for by name (its latest release), then by the catalog ID in
+    // the file, and else "Source Template" is used. Which template a
+    // system was made from (repositoryMetaData) can't be changed after.
+
+    const SOURCE_SYSTEMS_PATH = '/service/provisioning-api/api/source-systems';
+    const SOURCE_SYSTEM_PATH = (id) => `${SOURCE_SYSTEMS_PATH}/${encodeURIComponent(id)}`;
+    const SOURCE_CATALOG_PATH = `/service/provisioning-api/api/systems-catalog/source?take=${SETTINGS.fetchAllTake}`;
+    const CATALOG_ENTRY_PATH = (id) => `/service/provisioning-api/api/systems-catalog/${encodeURIComponent(id)}`;
+    const SOURCE_TEMPLATE = { name: 'HelloID-Conn-Prov-Source-Template', id: 670931336 };
+    const SOURCE_TILE_CLASS = 'tm-source-tile-button';
+    const SOURCE_HEADER_CLASS = 'tm-source-header';
+
+    // The configuration form and values are JSON in a text
+    const parseJsonText = (text, fallback) => {
+        try { return typeof text === 'string' && text ? JSON.parse(text) : fallback; } catch { return fallback; }
+    };
+    const formFields = (system) => {
+        const form = parseJsonText(system?.scriptConfigurationForm, []);
+        return Array.isArray(form) ? form : [];
+    };
+
+    // A source system with the secrets of its configuration as "***"
+    function maskSourceSystem(system) {
+        if (SETTINGS.exportSecrets) return system;
+        const values = parseJsonText(system.scriptConfiguration, null);
+        return !isPlainObject(values) ? system
+            : { ...system, scriptConfiguration: JSON.stringify(maskValues(values, formFields(system))) };
+    }
+
+    async function sourceCatalog() {
+        const list = await fetchFromGateway(SOURCE_CATALOG_PATH);
+        return Array.isArray(list?.pageData) ? list.pageData : Array.isArray(list) ? list : [];
+    }
+
+    // --- Export ---
+    async function collectSourceSystemExport(systemId, report = () => {}) {
+        report('system', 'busy');
+        const { repositoryMetaData, ...read } = await fetchFromGateway(SOURCE_SYSTEM_PATH(systemId));
+        report('system', 'done');
+        // The template: without its README (long, and in the catalog), with
+        // its catalog ID (HelloID only gives its name)
+        report('template', 'busy');
+        let template = null;
+        if (isPlainObject(repositoryMetaData)) {
+            const { readmeHtml, ...rest } = repositoryMetaData;
+            const entry = (await sourceCatalog().catch(() => [])).find(c => c?.name === rest.name);
+            template = { ...rest, repositoryId: entry?.id ?? null };
+        }
+        report('template', 'done');
+        report('agents', 'busy');
+        const id = encodeURIComponent(systemId);
+        let agents;
+        try {
+            const [selected, summary] = await Promise.all([
+                fetchFromGateway(AGENT_SELECTION_PATH(id)),
+                fetchFromGateway(`/service/agent-repository/api/agents/selections/summary/${id}`),
+            ]);
+            agents = { selected, summary };
+            report('agents', 'done');
+        } catch (e) {
+            console.warn('[HelloID UX] Export: could not read the agents', e);
+            agents = { couldNotRead: true };
+            report('agents', 'skipped');
+        }
+        return {
+            exportedAt: new Date().toISOString(),
+            exportedFrom: location.origin,
+            exportedBy: exportedBy(),
+            contents: 'sourceSystem',
+            secretsIncluded: SETTINGS.exportSecrets,
+            systemId: read.systemId,
+            displayName: read.displayName,
+            system: maskSourceSystem({ ...read, repositoryMetaData: template }),
+            agents,
+        };
+    }
+
+    function exportSourceSystem(name) {
+        const id = sourceSystemIds.get(name);
+        if (!id) throw new Error(`The ID of "${name}" is not known yet. Reload the page and try again.`);
+        return saveJsonExport(`Export: ${name}`, `${fileSafe(name)} - ${id} - ${isoDate()}.json`,
+            [{ key: 'system', label: 'Source system' }, { key: 'template', label: 'Template' }, { key: 'agents', label: 'Agents' }],
+            (report) => collectSourceSystemExport(id, report),
+            (data) => warn(data.secretsIncluded ? 'The file has the SECRETS of the source system in it.' : ''));
+    }
+
+    // --- Template ---
+    async function showSourceTemplate(name) {
+        const id = sourceSystemIds.get(name);
+        if (!id) throw new Error(`The ID of "${name}" is not known yet. Reload the page and try again.`);
+        const meta = (await fetchFromGateway(SOURCE_SYSTEM_PATH(id))).repositoryMetaData;
+        if (!isPlainObject(meta) || !meta.name) {
+            await showDialog(`Template: ${name}`, `"${name}" has no template information: HelloID did not make it from ` +
+                             'a catalog template, or does not say which one.');
+            return true;
+        }
+        const entry = (await sourceCatalog()).find(c => c?.name === meta.name);
+        const latest = entry ? await fetchFromGateway(CATALOG_ENTRY_PATH(entry.id)).catch(() => null) : null;
+        const status = !entry ? warn('This template is not in the catalog of this HelloID environment (any more).')
+            : !latest?.latestReleaseName ? 'The latest release could not be read from the catalog.'
+            : latest.latestReleaseName === meta.release ? 'This is the latest release.'
+            : strong(`A newer release is available: ${latest.latestReleaseName}` +
+                     (latest.latestReleaseDate ? ` (${latest.latestReleaseDate.slice(0, 10)})` : '') + '.');
+        await showDialog(`Template: ${name}`, [
+            `Template: ${meta.displayName ?? meta.name} (${meta.name})`,
+            `Release: ${meta.release ?? '?'}${meta.releaseSha ? ` (${meta.releaseSha})` : ''}`,
+            `Repository: ${meta.url ?? '?'}`,
+            ...(entry ? [`Catalog ID: ${entry.id}`] : []),
+            '',
+            status,
+            '',
+            'HelloID sets this when a source system is made from the catalog, and it cannot be changed afterwards.',
+        ].join('\n'));
+        return true;
+    }
+
+    // --- Import ---
+    async function importSourceSystem() {
+        const text = await pickImportFile();
+        if (text === null) return false;
+        let data;
+        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        if (data?.contents !== 'sourceSystem' || !isPlainObject(data.system)) {
+            throw new Error('The file is not an export of a source system.');
+        }
+        return importSourceSystemData(data);
+    }
+
+    // The parts of a source system, each as written: key, label, what
+    // HelloID has of it in a system (current), and the request
+    const SOURCE_PARTS = [
+        {
+            key: 'general', label: 'General settings', detail: 'name, icon, description',
+            of: (s) => ({ friendlyName: s.displayName, icon: s.icon, description: s.description }),
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/general`,
+        },
+        {
+            key: 'form', label: 'Configuration form',
+            of: (s) => ({ form: s.scriptConfigurationForm }),
+            same: (a, b) => JSON.stringify(parseJsonText(a.form, null)) === JSON.stringify(parseJsonText(b.form, null)),
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/custom-configuration-form`,
+        },
+        {
+            key: 'values', label: 'Configuration values',
+            of: (s) => ({ config: s.scriptConfiguration }),
+            same: (a, b) => JSON.stringify(parseJsonText(a.config, null)) === JSON.stringify(parseJsonText(b.config, null)),
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/custom-configuration`,
+        },
+        {
+            key: 'scripts', label: 'Scripts', detail: 'persons, departments, execute on-premises',
+            of: (s) => ({ executeOnPremises: s.executeOnPremises, personsScript: s.personsScript, departmentsScript: s.departmentsScript }),
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/powershell`,
+        },
+        {
+            key: 'persons', label: 'Person mapping', mapping: true,
+            of: (s) => s.mappingConfiguration?.personMappings ?? [],
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/mapping/persons`,
+        },
+        {
+            key: 'contracts', label: 'Contract mapping', mapping: true,
+            of: (s) => s.mappingConfiguration?.contractMappings ?? [],
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/mapping/contracts`,
+        },
+        {
+            key: 'thresholds', label: 'Thresholds',
+            of: (s) => s.thresholds ?? null,
+            path: (id) => `${SOURCE_SYSTEM_PATH(id)}/thresholds`,
+        },
+    ];
+
+    // The catalog template for a new system: the file's template by name
+    // (HelloID makes it from its latest release), else its catalog ID,
+    // else "Source Template". Answers the candidates, in that order, each
+    // with why it is used; making the system tries them one by one.
+    function sourceTemplateCandidates(meta, catalog) {
+        const byName = (name) => catalog.find(c => c?.name === name);
+        const candidates = [];
+        const own = meta?.name && byName(meta.name);
+        if (own) candidates.push({ id: own.id, label: `${own.displayName ?? own.name} (the template of the file, latest release)` });
+        if (meta?.repositoryId && meta.repositoryId !== own?.id) {
+            candidates.push({ id: meta.repositoryId, label: `catalog ID ${meta.repositoryId} (from the file)` });
+        }
+        const fallback = byName(SOURCE_TEMPLATE.name);
+        candidates.push({ id: fallback?.id ?? SOURCE_TEMPLATE.id, label: 'Source Template (latest release)' });
+        return uniqueBy(candidates, c => String(c.id));
+    }
+
+    // forceNew: make a new system, also when the file's system is here
+    async function importSourceSystemData(data, { forceNew = false } = {}) {
+        const file = data.system;
+        const header = `File: export of "${file.displayName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
+        const systems = await fetchFromGateway(SOURCE_SYSTEMS_PATH);
+        const list = Array.isArray(systems) ? systems : [];
+        const found = forceNew ? undefined : byIdOrName(list, file.systemId, file.displayName);
+        const created = !found;
+        const current = created ? null : await fetchFromGateway(SOURCE_SYSTEM_PATH(found.systemId));
+        const fileAgents = Array.isArray(data.agents?.selected) ? data.agents.selected : null;
+        const currentAgents = created ? []
+            : await fetchFromGateway(AGENT_SELECTION_PATH(encodeURIComponent(found.systemId))).catch(() => []);
+
+        // The file's parts as they would be written (secrets left out of
+        // the file keep the value they have here)
+        const fileValues = parseJsonText(file.scriptConfiguration, null);
+        const restored = isPlainObject(fileValues)
+            ? { ...file, scriptConfiguration: JSON.stringify(restoreValues(fileValues, parseJsonText(current?.scriptConfiguration, {}))) }
+            : file;
+        const sameBody = (part, a, b) => (part.same ? part.same(a, b) : JSON.stringify(a ?? null) === JSON.stringify(b ?? null));
+        const differs = Object.fromEntries(SOURCE_PARTS.map(part =>
+            [part.key, created || !sameBody(part, part.of(restored), part.of(current))]));
+        differs.agents = Boolean(fileAgents) && !sameAgentSelection(fileAgents, currentAgents);
+        // (nothing differing: the file can still be imported as a new system)
+        const anyDiffers = Object.values(differs).some(Boolean);
+        const alreadyHas = `${header}\n\n"${found?.displayName}" already has what the file has.`;
+
+        const catalog = created ? await sourceCatalog().catch(() => []) : [];
+        const candidates = created ? sourceTemplateCandidates(file.repositoryMetaData, catalog) : [];
+        const answer = await chooseImport('Import source system: what to import', {
+            intro: `${header}\n\n` + (created
+                ? `A NEW source system will be made${forceNew ? '' : ': this HelloID environment has none that matches the file'}, ` +
+                  `from the catalog template ${candidates[0].label}.` +
+                  (candidates.length > 1 ? ` If HelloID refuses that, then from ${candidates.slice(1).map(c => c.label).join(', then from ')}.` : '') +
+                  '\nThe parts you choose replace what the template brings.'
+                : `The file matches "${found.displayName}" in this HelloID environment.` +
+                  (anyDiffers ? '' : ` ${strong('It already has what the file has.')} You can still import the file as a new system.`)),
+            modes: created ? [] : [
+                { value: 'overwrite', label: `Overwrite "${found.displayName}" where it differs from the file` },
+                { value: 'new', label: 'Import the file as a NEW source system', parts: false },
+            ],
+            name: {
+                label: 'Name of the new source system',
+                value: created ? file.displayName : `${file.displayName} (copy)`,
+                when: (mode) => created || mode === 'new',
+            },
+            groups: [
+                {
+                    title: 'Parts',
+                    items: SOURCE_PARTS.filter(part => differs[part.key])
+                        // (a new system gets its mappings when it is made)
+                        .map(part => ({ key: part.key, label: part.label, detail: part.detail,
+                            fixed: created && (part.mapping || part.key === 'general') })),
+                },
+                { title: 'Links to other things', items: differs.agents ? [{ key: 'agents', label: 'Agents for on-premises execution' }] : [] },
+            ],
+        });
+        if (!answer) return false;
+        if (answer.mode === 'new') {
+            return importSourceSystemData({ ...data, system: { ...file, systemId: null, displayName: answer.name } }, { forceNew: true });
+        }
+        Object.keys(differs).forEach(key => { differs[key] = differs[key] && answer.chosen.has(key); });
+        const name = answer.name ?? file.displayName;
+        const source = { ...restored, displayName: differs.general || created ? name : current.displayName };
+        if ((created || (differs.general && name !== found.displayName)) &&
+            list.some(s => s?.displayName?.trim() === name.trim() && s.systemId !== found?.systemId)) {
+            throw new Error(`Another source system is already named "${name}". Nothing was imported.`);
+        }
+        const parts = SOURCE_PARTS.filter(part => differs[part.key] && !(created && part.mapping));
+        if (!parts.length && !differs.agents && !created) {
+            await showDialog('Import source system',
+                anyDiffers ? `${header}\n\nNothing was chosen, so nothing was imported.` : alreadyHas);
+            return true;
+        }
+
+        const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
+        const chosenLabels = [...SOURCE_PARTS, { key: 'agents', label: 'Agents for on-premises execution' }]
+            .filter(part => differs[part.key]).map(part => part.label + (part.detail ? ` (${part.detail})` : ''));
+        if (!await showDialog('Import source system', `${header}\n\n` +
+            (created ? `A NEW source system "${name}" will be made, with:\n` : `This will overwrite in "${found.displayName}":\n`) +
+            list2(chosenLabels) +
+            (created ? '' : '\n\nA backup of the current source system is downloaded first.'),
+        { confirm: true })) return false;
+
+        if (!created) {
+            const backup = await collectSourceSystemExport(found.systemId);
+            downloadFile(JSON.stringify(backup, null, 2),
+                `${fileSafe(found.displayName)} - backup before import - ${found.systemId} - ${isoDate()}.json`);
+        }
+        const progress = showProgress(`Import: ${name}`, [
+            ...(created ? ['Create new source system'] : []),
+            ...parts.map(part => part.label),
+            // The form without its values: its defaults where the system has no value
+            ...(differs.form && !differs.values ? ['Configuration values (defaults of the form)'] : []),
+            ...(differs.agents ? ['Agents for on-premises execution'] : []),
+        ]);
+        let index = 0;
+        const step = async (work) => {
+            progress.set(index, 'busy');
+            await work();
+            progress.set(index++, 'done');
+        };
+        let id = found?.systemId;
+        const notes = [];
+        try {
+            if (created) {
+                await step(async () => {
+                    // The template candidates in turn, until HelloID makes it
+                    for (const [i, candidate] of candidates.entries()) {
+                        try {
+                            id = await sendToGateway(`${SOURCE_SYSTEMS_PATH}/new`, 'POST', {
+                                repositoryId: candidate.id,
+                                personMapping: SOURCE_PARTS.find(p => p.key === 'persons').of(source),
+                                contractMapping: SOURCE_PARTS.find(p => p.key === 'contracts').of(source),
+                            });
+                            if (typeof id !== 'string' || !id) throw new Error('HelloID did not return the ID of the new source system.');
+                            if (i > 0) notes.push(`made from ${candidate.label}, as HelloID refused ${candidates.slice(0, i).map(c => c.label).join(' and ')}`);
+                            break;
+                        } catch (e) {
+                            if (i === candidates.length - 1) throw e;
+                            console.warn(`[HelloID UX] Import: HelloID did not make the source system from ${candidate.label}`, e);
+                        }
+                    }
+                });
+            }
+            for (const part of parts) {
+                await step(() => sendToGateway(part.path(id), 'POST', part.of(source)));
+            }
+            if (differs.form && !differs.values) {
+                await step(async () => {
+                    // (a new system has the values of its template)
+                    const had = parseJsonText((created ? await fetchFromGateway(SOURCE_SYSTEM_PATH(id)) : current).scriptConfiguration, {});
+                    const values = valuesOrDefaults(formFields(source), had);
+                    if (JSON.stringify(values) !== JSON.stringify(isPlainObject(had) ? had : {})) {
+                        await sendToGateway(`${SOURCE_SYSTEM_PATH(id)}/custom-configuration`, 'POST', { config: JSON.stringify(values) });
+                    }
+                });
+            }
+            if (differs.agents) await step(() => sendToGateway(AGENT_SELECTION_PATH(encodeURIComponent(id)), 'POST', fileAgents));
+        } catch (e) {
+            progress.set(index, 'failed');
+            await progress.finish(error(`Import failed: ${e?.message ?? e}`) +
+                '\n\nThe steps before it were done; the ones after it were not.');
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish('Import finished.' + (notes.length ? warn(`\n\nNote: ${notes.join('; ')}.`) : '') +
+            (created && data.secretsIncluded === false ? '\n\nThe file has no secrets: fill them in yourself.' : '') +
+            '\n\nThe page reloads when you close this message.');
+        location.reload();
+        return true;
+    }
+
+    // --- The buttons ---
+    function addSourceSystemButtons() {
+        const addSystem = document.querySelector('helloid-source-overview h4 + button.btn-complete');
+        if (addSystem && !addSystem.parentElement.querySelector(`.${SOURCE_HEADER_CLASS}`)) {
+            const importButton = createActionButton('fa-solid fa-upload', 'Import a source system from an exported JSON file',
+                importSourceSystem, `btn btn-xs btn-default ${SOURCE_HEADER_CLASS}`);
+            // The header spreads its items out: keep this one with the +
+            importButton.style.marginLeft = 'auto';
+            addSystem.before(importButton);
+        }
+        document.querySelectorAll('helloid-source-system-tile').forEach(tile => {
+            const configure = tile.querySelector('button[title="configure" i]');
+            if (!configure || tile.querySelector(`.${SOURCE_TILE_CLASS}`)) return;
+            const name = () => {
+                const heading = tile.querySelector('h5.card-title');
+                return (heading?.title || heading?.textContent || '').trim();
+            };
+            const exportButton = createActionButton('fa-solid fa-download', 'Export this source system to a JSON file',
+                () => exportSourceSystem(name()), configure.className);
+            const templateButton = createActionButton('fa-solid fa-circle-info',
+                'Template: which catalog template this system was made from, and its latest release',
+                () => showSourceTemplate(name()), configure.className);
+            [exportButton, templateButton].forEach(btn => btn.classList.add(SOURCE_TILE_CLASS));
+            configure.before(exportButton, templateButton);
+        });
     }
 
     // =====================================================================
@@ -8681,6 +9547,9 @@
                 addImportButton();
                 addGithubButton();
                 addNotificationButtons();
+                addSourceSystemButtons();
+                addCloneLinks();
+                openPendingClone();
                 addRevealButtons();
                 addGridFlagButtons();
                 addUsedEntitlementsFilter();

@@ -72,8 +72,12 @@ The button is only shown for PowerShell v1 systems (type `powershell-onpremise`)
 
 The import button (upload icon, next to **Add new system**) reads an exported file. It works for PowerShell and Active Directory systems.
 
-- **The system of the file exists:** the differences are listed, and written after you confirm. A backup of the current configuration is downloaded first.
-- **The system of the file doesn't exist:** a new system is created (after you confirm) and the file is imported into it. A new system always starts **disabled**. This is also how you copy a system: change the `systemId` and the name in the file.
+- **The system of the file exists:** you choose whether to overwrite it or to import the file as a new system (with a name of its own), and which parts and links to import. The differences are then listed, and written after you confirm. A backup of the current configuration is downloaded first.
+- **The system of the file doesn't exist:** you choose the name of the new system and what to import, and a new system is created with it. A new system always starts **disabled**.
+
+Every import (target systems, notifications, notification systems, source systems) starts with this step: new or overwrite, which parts of the file, and which links to other things (depends-on systems, agents, notifications, business rules, the data of target systems in notifications). When there is a choice between overwrite and new, that comes first; **Next** then shows the parts and links to overwrite. Importing as a new system skips that page and asks for the parts of the new system instead.
+
+A part you leave out keeps what the system has: a new system keeps what HelloID gave it, and an existing one keeps its own. This also holds when another part's request carries it along (the account scripts of a PowerShell system are saved together with the configuration values, for example). When the configuration form is imported without its values, a field that has no value gets the form's default. Correlation and the uniqueness check that you leave out are set again on the fields of the same name when the mapping is replaced. A new system always gets its general settings, which hold its name and keep it disabled.
 
 Besides the configuration, the import sets the agent selection, creates or updates the notifications, and links the business rules:
 
@@ -94,6 +98,18 @@ The files work like those of target systems. A notification is saved with the na
 - shows what will be new and what will be overwritten, downloads a backup of what it overwrites, and writes after you confirm.
 
 A notification system goes to the one it was exported from, or the one with the same name, or else a new (PowerShell) one is made. Its name, description, icon, on-premises setting, agents, configuration form and values, scripts and templates are imported. Scripts and templates are matched by ID or else by name; the system's own scripts and templates that the file doesn't have stay. Passwords in the configuration and in template values are written as `***` (see the setting **Target system export: include secrets**), and keep the value they have when imported.
+
+### Export and import source systems
+
+On **Source systems**, each tile has an export button and a template button (info icon), and **Import** is next to HelloID's **+**.
+
+- **Export:** the system's general settings, configuration form and values, scripts, person and contract mappings, thresholds, agents, and the catalog template it was made from. Secrets are written as `***` unless the setting **Target system export: include secrets** is on.
+- **Template:** shows which catalog template the system was made from, its release, and whether the catalog has a newer one. HelloID sets this when the system is made, and it can't be changed afterwards.
+- **Import:** goes to the system it was exported from, or the one with the same name; you can also import the file as a new system. HelloID only makes a source system from a catalog template. The import uses the latest release of the file's template, found by name; if that fails, the catalog ID in the file; and otherwise the latest **Source Template**. The parts of the file then replace what the template brought.
+
+### Clone business rules in a new tab
+
+The Clone button of a business rule is a link: Ctrl+click or the middle mouse button makes the copy in a new tab, and opens it there.
 
 ### Show what is typed in password fields
 
