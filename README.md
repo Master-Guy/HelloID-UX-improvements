@@ -57,8 +57,10 @@ The second export button (checklist icon) saves what the persons currently have 
 PowerShell v1 systems have a third export button (magic wand icon). HelloID's own migration to PowerShell v2 leaves the scripts and the mapping to be converted by hand; this button prepares that work for a Claude agent. It saves three files:
 
 - the export of the system, the same as the normal export;
-- `HelloID PowerShell v2 migration - handoff for Claude.md`, which tells the agent how to convert the scripts and the mapping, and what to answer with. It has the agent write the scripts like the supplier's own PowerShell v2 scripts (Tools4ever's connectors on GitHub; for Microsoft Entra ID it names them), with their naming and functions, while the system keeps doing what it did and keeps its own settings. It is the same for every system, so one copy is enough for any number of exports;
-- `HelloID-Migration-Tool.ps1`, which the agent uses to take the scripts out of an export, put the converted ones into an import file, and check that file. It needs PowerShell 7.2 or later, and is also the same for every system.
+- `HelloID PowerShell v2 migration - handoff for Claude - <version>.md`, which tells the agent how to convert the scripts and the mapping, and what to answer with. It has the agent write the scripts like the supplier's own PowerShell v2 scripts (Tools4ever's connectors on GitHub; for Microsoft Entra ID it names them), with their naming and functions, while the system keeps doing what it did and keeps its own settings. It is the same for every system, so one copy is enough for any number of exports;
+- `HelloID-Migration-Tool-<version>.ps1`, which the agent uses to take the scripts out of an export, put the converted ones into an import file, and check that file. It needs PowerShell 7.2 or later, and is also the same for every system.
+
+<version> is the version of this script, which is also at the top of both files, so you can tell whether you have the newest ones. They are downloaded once per visit of the Target Systems page: exporting more systems in a row saves only their exports. Go to another page and back to get them again.
 
 Give the exports, the handoff and the tool to a Claude agent. It answers with one file per system for the import button, and with what it wasn't sure of.
 

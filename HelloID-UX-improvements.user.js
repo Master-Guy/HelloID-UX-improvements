@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-27.1
+// @version      2026-10-28.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -2568,12 +2568,18 @@
         setTimeout(() => URL.revokeObjectURL(link.href), 10000);
     }
 
+    // The files that go with an export (extraFiles) that were saved during
+    // this visit of the page, by name; emptied on another page (see
+    // syncFiltersWithPage)
+    const extraFilesSaved = new Set();
+
     // The save dialog has to open right at the click, so first ask where
     // to save, then collect, then write. Browsers without that dialog get
     // a normal download.
     // kind: which export (see EXPORT_KINDS)
     async function exportSystem(name, kind) {
         const fileName = () => exportFileName(`${name}${kind.suffix}`, name);
+        const extrasNow = []; // the extra files this export saved
         let handle = null;
         if (typeof pageWindow.showSaveFilePicker === 'function') {
             try {
@@ -2605,8 +2611,13 @@
                 downloadFile(json, fileName());
             }
             // The files that go with it (no save dialog: that needs a
-            // click of its own)
-            (kind.extraFiles ?? []).forEach(file => downloadFile(file.text, file.name, file.type));
+            // click of its own). Once per visit of the page: they are the
+            // same for every system.
+            (kind.extraFiles ?? []).filter(file => !extraFilesSaved.has(file.name)).forEach(file => {
+                downloadFile(file.text, file.name, file.type);
+                extraFilesSaved.add(file.name);
+                extrasNow.push(file.name);
+            });
             report('save', 'done');
         } catch (e) {
             console.warn('[HelloID UX] Export failed', e);
@@ -2617,7 +2628,7 @@
         }
 
         // The card stays only when there is something to tell
-        const notice = kind.notice(data);
+        const notice = kind.notice(data, { extrasNow });
         if (notice) await progress.finish(`Export finished.\n\n${notice}`);
         else progress.close();
         return true;
@@ -2712,8 +2723,13 @@
     // of them.
     const POWERSHELL_V1 = 'powershell-onpremise';
     const POWERSHELL_V2 = 'powershell-target';
-    const HANDOFF_FILE_NAME = 'HelloID PowerShell v2 migration - handoff for Claude.md';
+    // The version of this script is in the names of the handoff and the
+    // tool, and at the top of each, so a download shows which one it is
+    const SCRIPT_VERSION = typeof GM_info !== 'undefined' ? GM_info.script.version : 'unknown';
+    const HANDOFF_FILE_NAME = `HelloID PowerShell v2 migration - handoff for Claude - ${SCRIPT_VERSION}.md`;
+    const MIGRATION_TOOL_FILE_NAME = `HelloID-Migration-Tool-${SCRIPT_VERSION}.ps1`;
     const HANDOFF = [
+        `<!-- Made by HelloID UX improvements ${SCRIPT_VERSION} -->`,
         '# HelloID: migrate PowerShell v1 target systems to PowerShell v2',
         '',
         'You are given this file together with `HelloID-Migration-Tool.ps1` and one or more JSON files.',
@@ -3320,18 +3336,18 @@
         '   migration there.',
         '4. Test each script in HelloID with its preview, which runs it as a dry run, and only then',
         '   enable the system.',
-    ].join('\n') + '\n';
+    ].join('\n').replaceAll('HelloID-Migration-Tool.ps1', MIGRATION_TOOL_FILE_NAME) + '\n';
 
     // What the handoff has the agent work with: writes the scripts of an
     // export to files, puts them back into an import file, and checks
     // that file. PowerShell, as the agents run on Windows.
-    const MIGRATION_TOOL_FILE_NAME = 'HelloID-Migration-Tool.ps1';
     const MIGRATION_TOOL = [
         '#Requires -Version 7.2',
+        `# Made by HelloID UX improvements ${SCRIPT_VERSION}`,
         '<#',
         '.SYNOPSIS',
         '    Helper for migrating HelloID PowerShell v1 target systems to PowerShell v2.',
-        '    It goes with "HelloID PowerShell v2 migration - handoff for Claude.md".',
+        `    It goes with "${HANDOFF_FILE_NAME}".`,
         '',
         '.DESCRIPTION',
         '    extract  Writes the scripts of an export to a folder, one file each, and',
@@ -3686,7 +3702,7 @@
         '        Write-Output \'Not checked here: whether each script still does what the v1 script did.\'',
         '    }',
         '}',
-    ].join('\r\n') + '\r\n';
+    ].join('\r\n').replaceAll('HelloID-Migration-Tool.ps1', MIGRATION_TOOL_FILE_NAME) + '\r\n';
 
     // Only PowerShell v1 systems are to be migrated
     const canMigrate = (entry) => entry.templateIdentifier === POWERSHELL_V1;
@@ -3702,12 +3718,18 @@
         return data;
     }
 
-    function migrationNotice(data) {
+    // extrasNow: the handoff and the tool, when this export saved them
+    // (once per visit of the page)
+    function migrationNotice(data, { extrasNow = [] } = {}) {
         const started = data.templateIdentifier === POWERSHELL_V2;
-        return `Three files were saved: the export of "${data.displayName}", and in your downloads folder ` +
-               `"${HANDOFF_FILE_NAME}" and "${MIGRATION_TOOL_FILE_NAME}" (your browser may ask whether this site ` +
-               'may download more than one file, and whether to keep a PowerShell file).\n\n' +
-               'Give all three to a Claude agent, with the exports of the other systems to migrate: the ' +
+        return (extrasNow.length
+            ? `Three files were saved: the export of "${data.displayName}", and in your downloads folder ` +
+              `"${HANDOFF_FILE_NAME}" and "${MIGRATION_TOOL_FILE_NAME}" (your browser may ask whether this site ` +
+              'may download more than one file, and whether to keep a PowerShell file).\n\n'
+            : `The export of "${data.displayName}" was saved. "${HANDOFF_FILE_NAME}" and ` +
+              `"${MIGRATION_TOOL_FILE_NAME}" were saved earlier during this visit of the page, so not again ` +
+              '(they are the same for every system).\n\n') +
+               'Give the handoff, the tool and the exports of the systems to migrate to a Claude agent: the ' +
                'handoff and the tool are the same for all of them. The agent answers with a file per system ' +
                'for the Import button.\n\n' +
                (started
@@ -9488,6 +9510,9 @@
 
         // Cached full responses: fetch fresh data on the new page
         fullResponses.clear();
+
+        // The files that go with an export: saved again on the next visit
+        extraFilesSaved.clear();
 
         // Entitlements filters (the object is shared, so clear it in place)
         if (Object.keys(filterState).length) {

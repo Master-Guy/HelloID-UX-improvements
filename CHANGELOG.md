@@ -2,6 +2,13 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-10-28.1
+
+### Migration export: the handoff and the tool once, with the version
+
+- **Once per visit:** exporting several PowerShell v1 systems for the migration downloads the handoff and the tool only once per visit of the Target Systems page. The next exports save just the system's export. Go to another page and back to get the two files again.
+- **Version in the name and the file:** both file names end in the script version, for example `HelloID-Migration-Tool-2026-10-28.1.ps1`. The version is also in a comment at the top of each file, so you can tell whether you have the newest ones. The handoff refers to the tool by its new name.
+
 ## 2026-10-27.1
 
 ### Source systems: export, import and template
