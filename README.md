@@ -143,6 +143,8 @@ On **Source systems**, each tile has an export button and a template button (inf
 
 These pages also get an **Import** button for their own type of file: next to HelloID's blue Add button where the page has one, otherwise in its header. On Aggregation, it's in the bottom right corner of the window.
 
+Every page Import button (also those of target systems, source systems, notifications and notification systems) takes several files at once. It also takes a backup: a file of **Export everything** or the backup of an import. From a backup it picks the part for its page and leaves out the rest without a warning. When the backup has no part for the page, it says so. Several notification files are imported as one, with one choice and one confirmation.
+
 | Page | Imports |
 |---|---|
 | Business rules > Rules | Business rules: conditions and entitlements as **drafts**, replacing a draft the rule already has; names, descriptions and categories take effect right away |
@@ -178,6 +180,20 @@ With several files, the menu item asks how to import them: **One by one** (each 
 5. **Import:** the overview shows how each item goes. A failure doesn't stop the rest; what needs a failed item (for example a notification of a custom event that could not be made) is not done. The page reloads once, at the end.
 
 Migrations to PowerShell v2 are skipped: import those files one by one. Items that point at something made earlier in the same run, like a custom event on a new target system, are checked again just before they are written.
+
+### Export everything
+
+**Export everything (full backup)…** in the Tampermonkey menu writes a full backup of the environment to one file:
+
+- every target system, source system, notification system, notification, custom event, business rule, toxic policy and schedule;
+- the settings pages: source configuration, aggregation, person lifecycle, excluded persons and reconciliation.
+
+A dialog first says what goes in the file. Its **Choose where to save** button opens the save dialog, named `HelloID backup - <environment> - <date>.json` by default; where the browser has no save dialog, the file is downloaded. A card shows the progress per type, with a count (for example `12/40`). It takes a while on a big environment.
+
+- **Failures:** an item that can't be read doesn't stop the rest. The closing message lists what is missing, and so does the file (`complete: false`, `couldNotRead`).
+- **Personal data:** the excluded persons are in the file, so keep it safe.
+- **Secrets:** written as `***`, unless the setting **Target system export: include secrets** is on.
+- **Restoring:** **Import HelloID export files…** reads the file again. Choose **Overwrite all** to restore everything at once.
 
 ### Clone business rules in a new tab
 
@@ -242,7 +258,7 @@ You name what to export. Types with names take one or more patterns: `*` for all
 | `-ExcludedPersons` | `ExcludedPersons` | The persons excluded from provisioning. This is **personal data**. |
 | `-ReconciliationConfiguration` | `ReconciliationConfiguration` | The schedule, the automatic actions per system, and the exclusions |
 
-Files are named `<name> - <ID> - <date>.json`, or `<name> - <date>.json` for a settings page. IDs that point at systems come with their names, as IDs differ per environment. The files of target systems, source systems, notifications and notification systems are the same as those of the Export buttons, so the Import buttons read them. Importing the other types will come later.
+Files are named `<name> - <ID> - <date>.json`, or `<name> - <date>.json` for a settings page. IDs that point at systems come with their names, as IDs differ per environment. The files of target systems, source systems, notifications and notification systems are the same as those of the Export buttons. The Import buttons and **Import HelloID export files…** read every type.
 
 Secrets are written as `***`, unless you add `-IncludeSecrets`. The script finds HelloID's provisioning API server itself; if that fails, give it with `-GatewayUrl`. It lists each file it wrote, warns about an exact name that matches nothing, and ends with exit code 1 when something could not be exported.
 

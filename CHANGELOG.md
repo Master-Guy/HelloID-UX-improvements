@@ -2,6 +2,35 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-11-12.3
+
+### Export everything
+
+**Export everything (full backup)…** in the Tampermonkey menu writes a full backup of the environment to one file:
+
+- every target system, source system, notification system, notification, custom event, business rule, toxic policy and schedule;
+- the settings pages, including the excluded persons.
+
+While it runs, a card shows the progress per type. An item that can't be read doesn't stop the rest: the closing message and the file say what is missing. **Import HelloID export files…** reads the file again; with **Overwrite all** it restores everything at once.
+
+### Backups on the page Import buttons
+
+- Every page Import button takes a backup: a file of **Export everything** or the backup of an import. It picks the part for its page and leaves out the rest without a warning, or says the backup has no part for the page.
+- The Import buttons of target systems, source systems, notifications and notification systems now work like the other page buttons: several files at once, and backups. Before, they refused a backup ("The file is not an export of notification configurations").
+- Several notification files are imported as one, with one choice and one confirmation. That also applies to the menu item.
+- Incomplete source system and notification system files are skipped with a message, instead of failing in the import.
+
+### Overwrite all: items made in the same run
+
+The overview now takes into account what the same run makes first, as the import itself already did:
+
+- Notifications that use the data of a target system made in the run say it is linked after that system is made, and are listed as overwritten, instead of "left out the data of target systems that are not here".
+- A notification of a notification system made in the run is imported, instead of refused.
+- A business rule, toxic policy or schedule whose only change is a link to a system made in the run is imported, instead of being shown as "already as in the file" and not done.
+- The same for a source system in a rule's condition, the systems of the reconciliation configuration, and "Depends on systems" between target systems. Target systems that others depend on are made first.
+- What needs an item that fails is not done, as for the other links.
+- Titles and departments in a rule's condition without a source system (the empty ID `00000000-0000-0000-0000-000000000000`, as HelloID has them) are no longer reported as "not in this HelloID environment".
+
 ## 2026-11-12.2
 
 ### Import of every export

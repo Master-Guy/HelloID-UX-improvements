@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-11-12.2
+// @version      2026-11-12.3
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -5210,33 +5210,6 @@
         return { ...restored, scriptConfiguration: values };
     }
 
-    // Lets the user pick the file to import; null when cancelled
-    async function pickImportFile() {
-        if (typeof pageWindow.showOpenFilePicker === 'function') {
-            try {
-                const [handle] = await pageWindow.showOpenFilePicker({
-                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
-                });
-                return (await handle.getFile()).text();
-            } catch (e) {
-                if (e?.name === 'AbortError') return null; // cancelled
-                throw e;
-            }
-        }
-        return new Promise((resolve, reject) => {
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.accept = '.json,application/json';
-            input.addEventListener('change', () => {
-                const file = input.files[0];
-                if (file) file.text().then(resolve, reject);
-                else resolve(null);
-            });
-            input.addEventListener('cancel', () => resolve(null));
-            input.click();
-        });
-    }
-
     const MAPPING_FIELD = 'mapping field ';
     const PERMISSION_SET = 'permission set ';
     const RESOURCE = 'resource ';
@@ -5505,15 +5478,6 @@
     }
 
     // false: cancelled
-    async function importSystem() {
-        const text = await pickImportFile();
-        if (text === null) return false;
-
-        let data;
-        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
-        return importData(data);
-    }
-
     // Imports the configuration of an export (data) into its system, or
     // into a new one when this environment doesn't have it.
     // options:
@@ -5602,8 +5566,15 @@
             `${header}${notHere}\n\nContinue the import without them?`, { confirm: true })) {
             return false;
         }
+        // Systems it depends on that are made earlier in this "Overwrite all": linked then
+        const later = (data.configuration.dependOnSystems ?? [])
+            .filter(d => !findDependency(d, systems) && auto?.pending('system', d.displayName));
+        later.forEach(d => auto.need(d.displayName));
+        const laterNote = later.length
+            ? `"Depends on systems": ${later.map(d => `"${d.displayName}"`).join(', ')} is linked after it is made` : '';
         // All that are left out, for the messages
-        const missing = missingDependencies(data.configuration, systems);
+        const missing = missingDependencies({ dependOnSystems: (data.configuration.dependOnSystems ?? [])
+            .filter(d => !later.includes(d)) }, systems);
         let system = forceNew ? undefined : systems.find(s => s?.systemId === systemId);
         const created = !system;
         // A file for a migration is for the system it was made from, and
@@ -5646,7 +5617,7 @@
                 return auto.skip(`a new target system, but another one is already named "${name}"`);
             }
             if (auto.plan) {
-                return auto.planned({ isNew: true, name, notes: [missing].filter(Boolean),
+                return auto.planned({ isNew: true, name, notes: [missing, laterNote].filter(Boolean),
                     lines: ['a new target system, DISABLED, with:', ...steps.filter(step => step.applies?.(data.configuration) ?? true)
                         .map(step => `  - ${step.name}`)] });
             }
@@ -5777,7 +5748,7 @@
                 : `"${system.displayName}" already has the configuration of the file.`) + skipped() + leftOpen + startedNote;
         // (a file for a migration is only for its own system)
         const asNew = !created && !confirmedNew && !fileChecklist && !migrationStarted;
-        if (auto && nothing()) return auto.same();
+        if (auto && nothing() && !later.length) return auto.same();
         if (nothing() && !asNew) {
             await showDialog('Import', nothingNote());
             return true;
@@ -5900,7 +5871,7 @@
 
         if (auto?.plan) {
             return auto.planned({ isNew: created, name: system.displayName, lines: parts,
-                notes: [unsupported, skipped(), leftOpen].filter(Boolean) });
+                notes: [unsupported, skipped(), leftOpen, laterNote].filter(Boolean) });
         }
         // A system that was just made was confirmed already, and has
         // nothing to back up ("Overwrite all" made its backup first)
@@ -6138,7 +6109,7 @@
             icon.className = 'fa-solid fa-spinner fa-spin';
             let result = 'fa-solid fa-upload';
             try {
-                if (await importSystem()) result = 'fa-solid fa-check';
+                if (await importFiles(['targetSystem'])) result = 'fa-solid fa-check';
             } catch (err) {
                 if (!err?.shown) console.warn('[HelloID UX] Import failed', err);
                 result = 'fa-solid fa-xmark';
@@ -8575,14 +8546,6 @@
     // Each notification of the file goes to the one it was exported from
     // (same ID), or else to the one with the same event and name, or else
     // it is made: disabled, with an ID of its own (as HelloID does).
-    async function importNotifications() {
-        const text = await pickImportFile();
-        if (text === null) return false;
-        let data;
-        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
-        return importNotificationsData(data);
-    }
-
     // auto: "Overwrite all" (see makeAuto)
     async function importNotificationsData(data, { auto = null } = {}) {
         if (data?.contents !== 'notifications' || !Array.isArray(data.notifications)) {
@@ -8612,11 +8575,17 @@
             const label = `"${notification.name}" (${notification.event ?? notification.action ?? '?'})`;
             const problems = [];
             // What sends it: by ID or name, or else the built-in one
-            const sender = byIdOrName(senders, notification.notificationSystemId, notification.notificationSystemName) ??
+            let sender = byIdOrName(senders, notification.notificationSystemId, notification.notificationSystemName) ??
                 (notification.notificationSystemBuiltin ? senders.find(s => s.isBuiltin) : undefined);
+            if (!sender && auto?.pending('notificationSystem', notification.notificationSystemName)) {
+                // (made earlier in this "Overwrite all": it and its template are found when this is written)
+                auto.need(notification.notificationSystemName);
+                notes.push(`${label}: after notification system "${notification.notificationSystemName}" is made`);
+                sender = { systemId: `pending:${notification.notificationSystemName}`, pending: true };
+            }
             if (!sender) problems.push(`its notification system "${notification.notificationSystemName ?? notification.notificationSystemId}" is not in this HelloID environment`);
             let templateId = null;
-            if (sender && notification.notificationTemplateId) {
+            if (sender && !sender.pending && notification.notificationTemplateId) {
                 const templates = (await detailOf(sender.systemId)).notificationTemplates ?? [];
                 const template = templates.find(t => t.templateId === notification.notificationTemplateId) ??
                     templates.find(t => t.displayName === notification.notificationTemplateName);
@@ -8651,8 +8620,15 @@
                 continue;
             }
             // The data of target systems it uses: those that are here
+            const later = []; // (systems made earlier in this "Overwrite all")
             const references = (notification.dataReferences ?? []).map(reference => {
                 const system = byIdOrName(targets, reference.systemId, reference.displayName);
+                if (!system && auto?.pending('system', reference.displayName)) {
+                    auto.need(reference.displayName);
+                    later.push(`"${reference.displayName}"`);
+                    // (a stand-in: the notification changes once it is linked)
+                    return { key: dataReferenceKey(reference.displayName), type: reference.type, systemId: `pending:${reference.displayName}` };
+                }
                 if (!system) return null;
                 return {
                     key: system.systemId === reference.systemId ? reference.key : dataReferenceKey(system.displayName),
@@ -8660,6 +8636,7 @@
                     systemId: system.systemId,
                 };
             });
+            if (later.length) notes.push(`${label}: the data of ${later.join(', ')} is linked after it is made`);
             const missing = (notification.dataReferences ?? []).filter((r, i) => !references[i]);
             if (missing.length) {
                 notes.push(`${label}: left out the data of target systems that are not here: ` +
@@ -8836,17 +8813,6 @@
     // with the same name (the built-in one: the built-in one here), or
     // else a new one (HelloID only makes PowerShell systems).
     const NOTIFICATION_GENERAL_FIELDS = ['description', 'displayName', 'icon', 'executeOnPremise'];
-
-    async function importNotificationSystem() {
-        const text = await pickImportFile();
-        if (text === null) return false;
-        let data;
-        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
-        if (data?.contents !== 'notificationSystem' || !isPlainObject(data.system)) {
-            throw new Error('The file is not an export of a notification system.');
-        }
-        return importNotificationSystemData(data);
-    }
 
     // forceNew: make a new system, also when the file's system is here
     // (the user chose so, see chooseImport)
@@ -9087,7 +9053,7 @@
             const exportAll = createActionButton('fa-solid fa-download', 'Export all notification configurations to a JSON file',
                 () => exportNotifications(null), `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
             const importButton = createActionButton('fa-solid fa-upload', 'Import notification configurations from an exported JSON file',
-                importNotifications, `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
+                () => importFiles(['notifications']), `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
             addNotification.before(exportAll, importButton);
         }
 
@@ -9120,7 +9086,7 @@
             const addSystem = document.querySelector('helloid-notification-systems-overview h4 + button.btn-complete');
             if (addSystem && !addSystem.parentElement.querySelector(`.${NOTIFICATION_HEADER_CLASS}`)) {
                 const importButton = createActionButton('fa-solid fa-upload', 'Import a notification system from an exported JSON file',
-                    importNotificationSystem, `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
+                    () => importFiles(['notificationSystem']), `btn btn-xs btn-default ${NOTIFICATION_HEADER_CLASS}`);
                 // The header spreads its items out: keep this one with the +
                 importButton.style.marginLeft = 'auto';
                 addSystem.before(importButton);
@@ -9268,17 +9234,6 @@
     }
 
     // --- Import ---
-    async function importSourceSystem() {
-        const text = await pickImportFile();
-        if (text === null) return false;
-        let data;
-        try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
-        if (data?.contents !== 'sourceSystem' || !isPlainObject(data.system)) {
-            throw new Error('The file is not an export of a source system.');
-        }
-        return importSourceSystemData(data);
-    }
-
     // The parts of a source system, each as written: key, label, what
     // HelloID has of it in a system (current), and the request
     const SOURCE_PARTS = [
@@ -9503,7 +9458,7 @@
         const addSystem = document.querySelector('helloid-source-overview h4 + button.btn-complete');
         if (addSystem && !addSystem.parentElement.querySelector(`.${SOURCE_HEADER_CLASS}`)) {
             const importButton = createActionButton('fa-solid fa-upload', 'Import a source system from an exported JSON file',
-                importSourceSystem, `btn btn-xs btn-default ${SOURCE_HEADER_CLASS}`);
+                () => importFiles(['sourceSystem']), `btn btn-xs btn-default ${SOURCE_HEADER_CLASS}`);
             // The header spreads its items out: keep this one with the +
             importButton.style.marginLeft = 'auto';
             addSystem.before(importButton);
@@ -9779,14 +9734,23 @@
     // Titles and departments in a rule's condition are kept by their
     // external ID, with their source system: that is the one of the same
     // name here (another environment). notes: what can't be found.
-    function conditionHere(condition, systems, notes) {
+    // ctx: "Overwrite all" (pending, need), for a source system it makes
+    const EMPTY_ID = '00000000-0000-0000-0000-000000000000';
+    function conditionHere(condition, systems, notes, ctx = null) {
         if (!isPlainObject(condition)) return condition;
         const copy = structuredClone(condition);
         const here = (entry) => {
             const id = entry?.source?.systemId ?? entry?.sourceSystemId;
-            if (!id) return entry;
+            // (no source system: the empty ID, as HelloID itself has it)
+            if (!id || id === EMPTY_ID) return entry;
             const name = entry.source?.displayName ?? entry.sourceSystemDisplayName;
             const system = systems.find(id, name);
+            if (!system && ctx?.pending?.('system', name)) {
+                ctx.need?.(name);
+                const note = `the condition is linked to source system "${name}" after it is made`;
+                if (!notes.includes(note)) notes.push(note);
+                return entry;
+            }
             if (!system) {
                 notes.push(`"${entry.name ?? entry.displayName ?? entry.externalId}" in the condition is of source system "${name ?? id}", ` +
                            'which is not in this HelloID environment');
@@ -9846,7 +9810,7 @@
                     problems.push(`${entitlementLabel(ruleEntitlement(e, {}))} of "${systemName ?? e.systemIdentifier}": not an entitlement here`);
                 }
             }
-            const condition = conditionHere(rule.condition ?? null, ctx.systems, notes);
+            const condition = conditionHere(rule.condition ?? null, ctx.systems, notes, ctx);
             const wanted = { name: rule.name, description: rule.description ?? '', categories: rule.categories ?? [], condition, entitlements };
             const current = match ? await fetchFromGateway(RULE_PATH(match.ruleId)) : null;
             // Its latest state: the draft, when it has one (a save replaces it)
@@ -10286,15 +10250,20 @@
             const schedule = isPlainObject(data.schedule) ? data.schedule : null;
             const here = rowsOf(current.systemConfiguration);
             const wanted = [];
+            const later = []; // (systems made earlier in this "Overwrite all": added when this is written)
             (Array.isArray(data.systemConfiguration) ? data.systemConfiguration : []).filter(isPlainObject).forEach(entry => {
                 const name = fileSystemName(data, entry.systemId);
                 const system = ctx.systems.find(entry.systemId, name);
-                if (!system) notes.push(`"${name ?? entry.systemId}" is not in this HelloID environment: left out`);
+                if (!system && ctx.pending?.('system', name)) {
+                    ctx.need?.(name);
+                    later.push(`"${name}" (new, after it is made)`);
+                } else if (!system) notes.push(`"${name ?? entry.systemId}" is not in this HelloID environment: left out`);
                 else wanted.push({ ...entry, systemId: system.systemId });
             });
             const nameOf = (id) => `"${ctx.systems.nameOf(id) ?? id}"`;
             const actions = ['automaticAccountCreate', 'automaticAccountEnable', 'automaticPermissionAdd'];
             const systemChanges = [
+                ...later,
                 ...wanted.flatMap(w => {
                     const h = here.find(x => x.systemId === w.systemId);
                     return !h ? [`${nameOf(w.systemId)} (new)`] : keyChanges(w, h, actions).map(c => `${nameOf(w.systemId)}: ${c}`);
@@ -10355,7 +10324,31 @@
         notificationSystem: (data) => importNotificationSystemData(data),
         notifications: (data) => importNotificationsData(data),
     };
+    // Whether a file of those has what its import needs
+    const SINGLE_VALID = {
+        targetSystem: () => true, // (see importKind)
+        sourceSystem: (data) => isPlainObject(data.system) && typeof data.system.displayName === 'string',
+        notificationSystem: (data) => isPlainObject(data.system) && typeof data.system.displayName === 'string',
+        notifications: (data) => Array.isArray(data.notifications),
+    };
+    // Notification files (Export everything has one per notification) as
+    // one import: one choice and one confirmation for all of them
+    function mergeNotificationFiles(files) {
+        const ofKind = files.filter(f => f.kind === 'notifications');
+        if (ofKind.length < 2) return files;
+        const merged = {
+            ...ofKind[0].data,
+            secretsIncluded: ofKind.some(f => f.data.secretsIncluded === true),
+            notifications: ofKind.flatMap(f => f.data.notifications),
+        };
+        const first = files.indexOf(ofKind[0]);
+        const rest = files.filter(f => f.kind !== 'notifications');
+        rest.splice(first, 0, { name: `${ofKind.length} notification files`, data: merged, kind: 'notifications' });
+        return rest;
+    }
 
+    // What a page imports, in words: "business rules", "notifications or ..."
+    const pageKinds = (kinds) => kinds.map(k => (KIND_LABELS[k] ?? k).toLowerCase()).join(' or ');
     const KIND_LABELS = {
         targetSystem: 'Target systems', sourceSystem: 'Source systems', notificationSystem: 'Notification systems',
         customEvent: 'Custom events', notifications: 'Notifications', businessRule: 'Business rules',
@@ -10498,7 +10491,7 @@
             return plans.map(plan => {
                 const how = plan.replaces ? `replaces "${plan.replaces}"` : plan.match ? 'overwrite' : 'new';
                 const result = plan.blocked ? { skip: plan.blocked }
-                    : plan.match && !plan.changes.length && !plan.problems.length ? { same: true }
+                    : plan.match && !plan.changes.length && !plan.problems.length && !plan.needs.length ? { same: true }
                     : { planned: { lines: plan.changes,
                         notes: [...plan.problems.map(text => `left out: ${text}`), ...plan.notes] } };
                 return overviewEntry(result, {
@@ -10530,7 +10523,9 @@
             const entries = [];
             for (const { data } of files) {
                 try {
-                    const ctx = { systems: await systemDirectory() };
+                    const needs = [];
+                    const ctx = { systems: await systemDirectory(), pending: batch.pending,
+                        need: (name) => { if (name && !needs.includes(name)) needs.push(name); } };
                     const current = await type.load(ctx);
                     const plan = await type.plan(data, current, ctx);
                     const chosen = plan.parts.filter(part => part.changes.length).filter(part => !part.optIn ||
@@ -10547,7 +10542,7 @@
                     entries.push(overviewEntry(result, {
                         group: KIND_LABELS[type.contents],
                         label: type.label,
-                        needs: [],
+                        needs,
                         backup: chosen.length ? async () => current : null,
                         run: chosen.length ? async () => {
                             // (as it is now, with the parts chosen in the overview)
@@ -10706,13 +10701,24 @@
 
     async function overwriteAll(files, kinds) {
         // What this run makes, by name: what points at it is found when it is written
-        const pendingNames = { system: new Set(), customEvent: new Set() };
+        const pendingNames = { system: new Set(), customEvent: new Set(), notificationSystem: new Set() };
+        const pendingKind = { targetSystem: 'system', sourceSystem: 'system', notificationSystem: 'notificationSystem', customEvent: 'customEvent' };
         files.forEach(({ kind, data }) => {
             const name = kind === 'targetSystem' ? data.displayName ?? data.configuration?.displayName
-                : ['sourceSystem'].includes(kind) ? data.system?.displayName
+                : ['sourceSystem', 'notificationSystem'].includes(kind) ? data.system?.displayName
                 : kind === 'customEvent' ? data.customEvent?.name : null;
-            if (typeof name === 'string') pendingNames[kind === 'customEvent' ? 'customEvent' : 'system'].add(name.trim());
+            if (typeof name === 'string' && pendingKind[kind]) pendingNames[pendingKind[kind]].add(name.trim());
         });
+        // Target systems that others of the files depend on go first, so those find them
+        const targetName = (data) => String(data.displayName ?? data.configuration?.displayName ?? '').trim();
+        const targets = files.filter(f => f.kind === 'targetSystem');
+        const ordered = [];
+        while (targets.length) {
+            const ready = targets.findIndex(f => !(f.data.configuration?.dependOnSystems ?? []).some(d =>
+                targets.some(o => o !== f && targetName(o.data) === String(d?.displayName ?? '').trim())));
+            ordered.push(...targets.splice(Math.max(ready, 0), 1)); // (a circle: in file order)
+        }
+        files = [...ordered, ...files.filter(f => f.kind !== 'targetSystem')];
         const pending = (kind, name) => typeof name === 'string' && pendingNames[kind]?.has(name.trim());
 
         const planAll = async (answers) => {
@@ -10806,39 +10812,49 @@
         return true;
     }
 
-    // Picks files and imports each; only: the kinds this page imports
+    // Picks files and imports each; only: the kinds this page imports (a
+    // backup file: only its parts of those kinds, the others are left out
+    // without a word)
     async function importFiles(only = null) {
         if (!gateway) throw new Error('No request of HelloID seen yet. Open a page of HelloID Provisioning, wait until it has loaded, and try again.');
         const picked = await pickImportFiles();
         if (!picked) return false;
-        const files = [];
+        let files = [];
         const skipped = [];
+        let others = 0; // (parts of a backup for other pages)
         for (const { name, text } of picked) {
             let data;
             try { data = JSON.parse(text); } catch { skipped.push(`${name}: not a valid JSON file`); continue; }
             // A backup of an import: the files in it
-            const entries = data?.contents === 'backups' && Array.isArray(data.files) ? data.files.map((d, i) => [`${name} (${i + 1})`, d]) : [[name, data]];
+            const backup = data?.contents === 'backups' && Array.isArray(data.files);
+            const entries = backup ? data.files.map((d, i) => [`${name} (${i + 1})`, d]) : [[name, data]];
             for (const [entryName, entry] of entries) {
                 const kind = importKind(entry);
                 const known = kind && (IMPORT_ORDER.includes(kind));
                 const items = ITEM_IMPORTS.find(t => t.contents === kind);
                 const settings = SETTING_IMPORTS.find(t => t.contents === kind);
-                if (!known) skipped.push(`${entryName}: not an export file this script knows`);
-                else if (only && !only.includes(kind)) skipped.push(`${entryName}: not for this page`);
-                else if ((items && !items.valid(entry)) || (settings && !settings.valid(entry))) skipped.push(`${entryName}: the file is incomplete`);
+                const valid = items ? items.valid(entry) : settings ? settings.valid(entry) : SINGLE_VALID[kind]?.(entry);
+                if (backup && known && only && !only.includes(kind)) others++;
+                else if (!known) skipped.push(`${entryName}: not an export file this script knows`);
+                else if (only && !only.includes(kind)) skipped.push(`${entryName}: not ${pageKinds(only)}`);
+                else if (!valid) skipped.push(`${entryName}: the file is incomplete`);
                 else files.push({ name: entryName, data: entry, kind });
             }
         }
+        files = mergeNotificationFiles(files);
         const skippedText = skipped.length ? warn(`\n\nSkipped:\n${skipped.map(s => `  - ${s}`).join('\n')}`) : '';
         if (!files.length) {
-            await showDialog('Import', `Nothing to import.${skippedText}`);
+            await showDialog('Import', (others ? `The file has no ${pageKinds(only)}.` : 'Nothing to import.') + skippedText);
             return false;
         }
         const kinds = IMPORT_ORDER.filter(k => files.some(f => f.kind === k));
-        if (files.length > 1 || skipped.length) {
-            const summary = kinds.map(k => `  - ${KIND_LABELS[k] ?? k}: ${files.filter(f => f.kind === k).length} file(s)`).join('\n');
+        // A page button with only its own kind: straight to its import
+        if (only ? skipped.length || kinds.length > 1 : files.length > 1 || skipped.length) {
+            const summary = kinds.map(k => `  - ${KIND_LABELS[k] ?? k}: ` + (k === 'notifications'
+                ? `${files.find(f => f.kind === k).data.notifications.length} notification(s)` : `${files.filter(f => f.kind === k).length} file(s)`)).join('\n');
+            const othersText = others ? `\n\n${others} other part(s) of the backup are not for this page.` : '';
             // (the page buttons: one by one only)
-            const answer = await showDialog('Import', `In this order:\n${summary}${skippedText}\n\n` +
+            const answer = await showDialog('Import', `In this order:\n${summary}${othersText}${skippedText}\n\n` +
                 (only ? 'Each import has its own choices and confirmation.'
                     : 'One by one: each import has its own choices and confirmation.\n' +
                       strong('Overwrite all: everything that matches is overwritten, and what does not match is made new, ' +
@@ -10887,6 +10903,140 @@
         } catch (e) {
             if (!e?.shown) showDialog('Import failed', error(String(e?.message ?? e)));
         }
+    });
+
+    // --- Export everything (the menu): a full backup in one file ---
+    // Every item of every type, each as the export file of its own export
+    // (the Export buttons, Export-HelloID.ps1), together in one file that
+    // "Import HelloID export files" reads again (contents "backups"). An
+    // item that can't be read doesn't stop the rest: the file then says
+    // which ones are missing. Secrets as the setting says.
+    // The parts, in the order of the import: { label, list() -> items,
+    // nameOf(item), read(item) -> its export file }
+    function everythingParts() {
+        const listed = (path) => async () => rowsOf(await fetchFromGateway(path));
+        const items = ITEM_IMPORTS.map(type => {
+            let ctx = null;
+            return {
+                label: KIND_LABELS[type.contents],
+                list: async () => {
+                    ctx = await type.context();
+                    return type.list(ctx);
+                },
+                nameOf: type.nameOf,
+                read: (item) => type.backup(item, ctx),
+            };
+        });
+        return [
+            { label: KIND_LABELS.targetSystem, list: async () => (await fetchSystems()).filter(s => typeof s?.displayName === 'string'),
+                nameOf: (s) => s.displayName, read: (s) => collectSystemExport(s.displayName.trim()) },
+            { label: KIND_LABELS.sourceSystem, list: listed(SOURCE_SYSTEMS_PATH),
+                nameOf: (s) => s.displayName, read: (s) => collectSourceSystemExport(s.systemId) },
+            { label: KIND_LABELS.notificationSystem, list: listed(NOTIFICATION_SYSTEMS_PATH),
+                nameOf: (s) => s.displayName, read: (s) => collectNotificationSystemExport(s.systemId) },
+            // (one notification per file, as Export-HelloID.ps1 does)
+            { label: KIND_LABELS.notifications, list: listed(ALL_NOTIFICATIONS_PATH),
+                nameOf: (n) => n.name, read: (n) => collectNotificationsExport([n.identifier]) },
+            ...items,
+            // The settings pages: one each
+            ...SETTING_IMPORTS.map(type => ({
+                label: type.label,
+                single: true, // (no count)
+                list: async () => [type],
+                nameOf: () => type.label,
+                read: async () => type.load({ systems: await systemDirectory() }),
+            })),
+        ];
+    }
+
+    async function exportEverything() {
+        if (!gateway) throw new Error('No request of HelloID seen yet. Open a page of HelloID Provisioning, wait until it has loaded, and try again.');
+        if (!await showDialog('Export everything', 'A full backup of this HelloID environment in one file: every target system, ' +
+            'source system, notification system, notification, custom event, business rule, toxic policy and schedule, and ' +
+            'the settings pages (source configuration, aggregation, person lifecycle, excluded persons, reconciliation).\n\n' +
+            'Excluded persons are persons: the file has their personal data. ' +
+            (SETTINGS.exportSecrets ? strong('The file has the SECRETS in it (setting "Target system export: include secrets").')
+                : 'Secrets are written as "***" (setting "Target system export: include secrets").') +
+            '\n\nThis may take a while; a card shows the progress. "Import HelloID export files" reads the file again.',
+        { confirm: true, confirmLabel: 'Choose where to save', confirmIcon: 'fa-solid fa-download' })) return false;
+
+        const fileName = `HelloID backup - ${location.hostname} - ${isoDate()}.json`;
+        let handle = null;
+        if (typeof pageWindow.showSaveFilePicker === 'function') {
+            try {
+                handle = await pageWindow.showSaveFilePicker({
+                    suggestedName: fileName,
+                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+                });
+            } catch (e) {
+                if (e?.name === 'AbortError') return false; // cancelled
+                throw e;
+            }
+        }
+
+        const parts = everythingParts();
+        const progress = showProgress('Export everything', [...parts.map(part => part.label), 'Save the file']);
+        const files = [];
+        const failed = [];
+        for (const [i, part] of parts.entries()) {
+            progress.set(i, 'busy');
+            let list;
+            try {
+                list = await part.list();
+            } catch (e) {
+                failed.push(`${part.label}: the list could not be read (${e?.message ?? e})`);
+                progress.set(i, 'failed', 'the list could not be read');
+                continue;
+            }
+            let done = 0;
+            let missed = 0;
+            for (const item of list) {
+                progress.set(i, 'busy', `${done + missed + 1}/${list.length}`);
+                try {
+                    const file = await part.read(item);
+                    if (file) files.push(file);
+                    done++;
+                } catch (e) {
+                    missed++;
+                    failed.push(`${part.label}: "${part.nameOf(item)}" (${e?.message ?? e})`);
+                }
+            }
+            progress.set(i, missed && !done ? 'failed' : 'done',
+                part.single && !missed ? '' : `${done}/${list.length}${missed ? `, ${missed} failed` : ''}`);
+        }
+
+        const save = parts.length;
+        progress.set(save, 'busy');
+        try {
+            const json = JSON.stringify({
+                ...exportHeader('backups'),
+                secretsIncluded: SETTINGS.exportSecrets,
+                complete: !failed.length,
+                ...(failed.length ? { couldNotRead: failed } : {}),
+                files,
+            }, null, 2);
+            if (handle) {
+                const writable = await handle.createWritable();
+                await writable.write(json);
+                await writable.close();
+            } else {
+                downloadFile(json, fileName);
+            }
+            progress.set(save, 'done', `${files.length} item(s)`);
+        } catch (e) {
+            progress.set(save, 'failed');
+            await progress.finish(error(`Export failed: ${e?.message ?? e}`));
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish(`Export finished: ${files.length} item(s) in "${handle?.name ?? fileName}".` +
+            (failed.length ? error(`\n\nNot in the file, as they could not be read:\n${failed.map(f => `  - ${f}`).join('\n')}`) : '') +
+            (SETTINGS.exportSecrets ? warn('\n\nThe file has the SECRETS in it.') : '') +
+            '\n\nKeep the file safe: it has the personal data of the excluded persons.');
+        return true;
+    }
+
+    GM_registerMenuCommand('Export everything (full backup)…', () => {
+        exportEverything().catch(e => { if (!e?.shown) showDialog('Export failed', error(String(e?.message ?? e))); });
     });
 
     // An Import button on the pages of these types, in the page's header
