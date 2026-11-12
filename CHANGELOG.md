@@ -2,6 +2,33 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-11-12.2
+
+### Import of every export
+
+- **Menu:** **Import HelloID export files…** in the Tampermonkey menu imports any export file of `Export-HelloID.ps1` and of the Export buttons, also several at once, in an order where systems come before what points at them.
+- **Page buttons:** an **Import** button on the pages of business rules, toxic policies, custom events, schedules, aggregation, the source configuration, person lifecycle, exclusions and reconciliation, next to HelloID's blue Add button where the page has one.
+- **New types:** business rules (conditions and entitlements as drafts; names, descriptions and categories right away), toxic policies, custom events, schedules, source configuration, aggregation, person lifecycle, excluded persons and reconciliation (without its exclusions, which HelloID makes from its reports).
+- **Another environment:** systems, entitlements and persons are found by ID, or else by name; titles and departments in a rule's condition by their external ID, on the source system of the same name.
+- **Starts disabled:** new toxic policies and schedules.
+- **Schedules:** HelloID allows at most 3. For a new schedule without room, you choose which schedule it replaces, or to skip it.
+- **Backup:** a file of what is overwritten, which can be imported again.
+- **Settings pages:** deleting the custom fields that the file doesn't have, and including again the persons excluded only here, are ticked by default, so the environment matches the file.
+
+### Overwrite all
+
+With several files, the menu item can import everything at once instead of one by one:
+
+- the special cases are chosen in one dialog, each option with what it does;
+- all changes are shown in one overview, with their status (⏳ ✅ ⚠️ ❌), to confirm before anything is written;
+- a backup of everything that will be touched is downloaded first;
+- a failure doesn't stop the rest, and what needs a failed item is not done;
+- migrations to PowerShell v2 are skipped.
+
+### Custom events in notifications
+
+Notification exports (the Export buttons and `Export-HelloID.ps1` 2026-11-12.2) name the custom event of a notification, and the imports find it by ID, or else by name.
+
 ## 2026-11-12.1
 
 ### Export-HelloID.ps1: the whole environment

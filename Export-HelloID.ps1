@@ -100,7 +100,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-11-12.1'
+$ScriptVersion = '2026-11-12.2'
 $ExportedBy = "Export-HelloID.ps1 $ScriptVersion"
 
 #region Settings
@@ -481,6 +481,25 @@ function Get-NotificationSystems($Notifications) {
     return , $systems
 }
 
+# A notification of a custom event has its ID, which is another one in another environment: the
+# name goes along, so the import can find it by name
+function Get-CustomEventName($Id) {
+    if (-not $Id) { return $null }
+    if ($null -eq $script:CustomEventList) {
+        $script:CustomEventList = @(try { Get-Rows (Invoke-HelloIDApi "/service/notifications/api/custom-events?take=$Take") }
+            catch { Write-Warning "Could not read the custom events: $_" })
+    }
+    return ($script:CustomEventList | Where-Object { (Get-Value $_ 'customEventId') -eq $Id } | Select-Object -First 1 |
+        ForEach-Object { Get-Value $_ 'name' })
+}
+
+function Add-CustomEventName($Notification) {
+    if (-not (Get-Value $Notification 'customEventId')) { return $Notification }
+    $copy = Copy-Json $Notification
+    $copy | Add-Member -NotePropertyName customEventName -NotePropertyValue (Get-CustomEventName $Notification.customEventId) -Force
+    return $copy
+}
+
 # The system's own notifications in full, and those of other systems that use its data (their
 # dataReferences name it). Which ones use it is only in the notification itself, so all of them
 # are read (once, for all systems).
@@ -502,7 +521,7 @@ function Get-Notifications($System) {
             continue
         }
         if ($isOwn) {
-            $own.Add($notification)
+            $own.Add((Add-CustomEventName $notification))
             continue
         }
         $references = @((Get-Value $notification 'dataReferences') |
@@ -893,6 +912,7 @@ function Export-NotificationConfigurations([string[]] $Patterns) {
         $notification.notificationSystemName = Get-Value $notificationSystem 'displayName'
         $notification.notificationSystemBuiltin = (Get-Value $notificationSystem 'isBuiltin') -eq $true
         $notification.notificationTemplateName = Get-Value $template 'displayName'
+        if (Get-Value $read 'customEventId') { $notification.customEventName = Get-CustomEventName $read.customEventId }
         $export = New-ExportHeader 'notifications' -Secrets
         $export.notifications = @($notification)
         $export

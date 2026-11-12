@@ -137,6 +137,48 @@ On **Source systems**, each tile has an export button and a template button (inf
 - **Template:** shows which catalog template the system was made from, its release, and whether the catalog has a newer one. HelloID sets this when the system is made, and it can't be changed afterwards.
 - **Import:** goes to the system it was exported from, or the one with the same name; you can also import the file as a new system. HelloID only makes a source system from a catalog template. The import uses the latest release of the file's template, found by name; if that fails, the catalog ID in the file; and otherwise the latest **Source Template**. The parts of the file then replace what the template brought.
 
+### Import any export file
+
+**Import HelloID export files…** in the Tampermonkey menu takes the files of `Export-HelloID.ps1` and of the Export buttons. It first opens a small dialog: its **Choose files** button opens the file picker, as the browser only does that after a click on the page. You can pick one file or a whole export folder's worth. Each file goes to its own import, in an order where systems come before what points at them. Each import shows its own choices and asks for its own confirmation.
+
+These pages also get an **Import** button for their own type of file: next to HelloID's blue Add button where the page has one, otherwise in its header. On Aggregation, it's in the bottom right corner of the window.
+
+| Page | Imports |
+|---|---|
+| Business rules > Rules | Business rules: conditions and entitlements as **drafts**, replacing a draft the rule already has; names, descriptions and categories take effect right away |
+| Business rules > Toxic policy | Toxic policies; new ones start **disabled** |
+| Custom events | Custom events of the notifications |
+| Source > Schedules | Schedules; new ones start **disabled**. HelloID allows at most 3: for a new schedule without room, you choose which one it replaces, or to skip it |
+| Source > Aggregation > Configuration | The settings of automatic aggregation |
+| Person lifecycle | The days before each lifecycle event |
+| Exclusions | Excluded persons |
+| Reconciliation > Configuration | The schedule, and the systems with their automatic actions |
+| Source > Configuration (display name, primary contract, primary manager, custom fields) | Those settings |
+
+- **Matching:** an item goes to the one with the same ID, or else the same name. Systems, entitlements and persons are found the same way: by ID, or else by name (for persons, by external ID). Titles and departments in a rule's condition keep their external ID, and their source system is found by name. That makes the files work in another environment too.
+- **Choosing:** you tick the items, or the parts of a settings page, to import. You see the changes before anything is written, and a backup of what is overwritten is downloaded first. The backup can be imported again.
+- **Ticked by default, so the environment matches the file:**
+  - **Delete the custom fields that the file does not have**: they are deleted, with their values;
+  - **Include again the persons excluded here that the file does not have**: they are provisioned again.
+
+  Untick them to keep those fields and persons.
+- **Custom events in notifications:** exports name the custom event of a notification, so the import finds it by name in another environment. Import the custom events first; a menu batch does that by itself.
+- **Not importable:** reconciliation exclusions, because HelloID makes those from its reports.
+
+#### Overwrite all
+
+With several files, the menu item asks how to import them: **One by one** (each import with its own choices and confirmation, as above) or **Overwrite all**. The page buttons always import one by one.
+
+**Overwrite all** overwrites everything that matches and makes what doesn't, without asking per item:
+
+1. **Reading:** every file is compared with what is here. Nothing is written yet.
+2. **Special cases, in one dialog:** only the ones that apply, each option with what it does. Dependencies found only by name (default: use the system with that name), business rules with entitlements the file doesn't have (default: keep them), more schedules than HelloID allows (default: add while there is room, otherwise skip; or replace one), custom fields only in this environment (default: delete them). Persons excluded only here are included again without asking, so the exclusions match the file.
+3. **Overview:** every change, grouped by type, with its status: ⏳ will be done, ✅ already as in the file, ⚠️ will be done with a note, ❌ will not be done (with the reason). **Confirm and import** starts it; **Cancel** changes nothing.
+4. **Backup:** one file with everything that will be touched is downloaded before anything is written. The menu item can import it again.
+5. **Import:** the overview shows how each item goes. A failure doesn't stop the rest; what needs a failed item (for example a notification of a custom event that could not be made) is not done. The page reloads once, at the end.
+
+Migrations to PowerShell v2 are skipped: import those files one by one. Items that point at something made earlier in the same run, like a custom event on a new target system, are checked again just before they are written.
+
 ### Clone business rules in a new tab
 
 The Clone button of a business rule is a link: Ctrl+click or the middle mouse button makes the copy in a new tab, and opens it there.
@@ -191,7 +233,7 @@ You name what to export. Types with names take one or more patterns: `*` for all
 | `-BusinessRules` | `BusinessRules` | One rule in full, published or draft, with the names of the systems of its entitlements |
 | `-ToxicPolicies` | `ToxicPolicies` | One toxic policy, with its entitlements |
 | `-CustomEvents` | `CustomEvents` | One custom event of the notifications, with the name of its system |
-| `-NotificationConfigurations` | `NotificationConfigurations` | One notification, as its Export button saves it |
+| `-NotificationConfigurations` | `NotificationConfigurations` | One notification, as its Export button saves it, with the name of its custom event |
 | `-NotificationSystems` | `NotificationSystems` | What the Export button of a notification system saves |
 | `-Schedules` | `Schedules` | One schedule of the snapshots, with its tasks, in the time zone of your computer |
 | `-SourceConfiguration` | `SourceConfiguration` | Primary contract, primary manager, display name and the custom fields |

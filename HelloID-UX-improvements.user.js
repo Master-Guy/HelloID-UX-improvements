@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-11-12.1
+// @version      2026-11-12.2
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -2367,6 +2367,12 @@
         const rows = list.pageData ?? [];
         const notifications = [];
         const notificationsUsingThisSystem = [];
+        let events = null; // the custom events, once one is needed
+        const named = async (notification) => {
+            if (!notification?.customEventId) return notification;
+            events ??= await readCustomEvents();
+            return withCustomEventName(notification, events);
+        };
         let count = 0;
         onCount(count, rows.length);
         for (let i = 0; i < rows.length; i += USED_BY_BATCH) {
@@ -2383,7 +2389,7 @@
                 }
                 onCount(++count, rows.length);
                 if (own) {
-                    notifications.push(notification);
+                    notifications.push(await named(notification));
                     return;
                 }
                 const dataReferences = (notification.dataReferences ?? [])
@@ -4844,7 +4850,7 @@
     // write to, for this system and this environment. Data of the file's
     // system is data of this system here.
     function notificationFor(notification, identifier, fileSystemId, system) {
-        const { couldNotRead, ...rest } = notification;
+        const { couldNotRead, customEventName, ...rest } = notification;
         return {
             ...rest,
             identifier,
@@ -4887,11 +4893,20 @@
             return senders.find(s => typeof name === 'string' && s?.displayName === name)?.systemId;
         };
         const unsendable = all.filter(n => n.notificationSystemId && !senderHere(n.notificationSystemId));
-        const skipped = !unsendable.length ? ''
+        let skipped = !unsendable.length ? ''
             : warn('\n\nThese notifications of the file are not imported: what sends them (their notification ' +
                    'system) is not in this HelloID environment:\n' + unsendable.map(n => `  - ${n.name}`).join('\n'));
-        const inFile = all.filter(n => !unsendable.includes(n))
-            .map(n => ({ ...n, notificationSystemId: senderHere(n.notificationSystemId) }));
+        // Their custom events: by ID, else by name
+        const events = all.some(n => n.customEventId) ? await readCustomEvents() : [];
+        const eventless = all.filter(n => !unsendable.includes(n) && n.customEventId && !customEventHere(n, events));
+        if (eventless.length) {
+            skipped += warn('\n\nThese notifications of the file are not imported: their custom event is not in this ' +
+                            'HelloID environment (import the custom events first):\n' +
+                            eventless.map(n => `  - ${n.name} (${n.customEventName ?? n.customEventId})`).join('\n'));
+        }
+        const inFile = all.filter(n => !unsendable.includes(n) && !eventless.includes(n))
+            .map(n => ({ ...n, notificationSystemId: senderHere(n.notificationSystemId),
+                ...(n.customEventId ? { customEventId: customEventHere(n, events).customEventId } : {}) }));
         const list = await fetchFromGateway(`${NOTIFICATIONS_PATH}?skip=0&take=${SETTINGS.fetchAllTake}` +
                                             '&enabled=false&disabled=false');
         const here = (list.pageData ?? []).filter(n => n?.systemId === system.systemId);
@@ -4970,7 +4985,7 @@
     //   drafts():  the number of rules saved as a draft
     // Nothing when the file has no rules with their entitlements (an
     // older export).
-    async function ruleRequests(data, system, created, header) {
+    async function ruleRequests(data, system, created, header, auto = null) {
         const requests = [];
         const drafts = new Set(); // rule IDs
         let missing = [];  // { ruleId, name, entitlement }: not an entitlement of the system
@@ -5070,7 +5085,17 @@
         const removals = plans.flatMap(plan => describe(plan.rule.name, '-', plan.remove));
         let removing = false;
         if (removals.length) {
-            const answer = await showDialog('Import: business rules', `${header}\n\n` +
+            const answer = auto ? auto.decide(`ruleRemovals:${system.systemId}`, {
+                section: 'Business rules with entitlements that the file does not have',
+                item: `"${system.displayName}"`,
+                detail: removals.map(line => `  ${line}`).join('\n'),
+                options: [
+                    { value: true, label: 'Keep them', description: 'The rules keep these entitlements.' },
+                    { value: 'alternative', label: 'Take them out',
+                        description: 'The rules are saved as drafts without them; nothing changes until you publish those rules.' },
+                ],
+                default: true,
+            }) : await showDialog('Import: business rules', `${header}\n\n` +
                 `Business rules have entitlements for "${system.displayName}" that the file doesn't have:\n` +
                 `${removals.map(line => `  ${line}`).join('\n')}\n\n` +
                 'Continue: these stay as they are.\n' +
@@ -5500,7 +5525,9 @@
     //   finishNote: added to the closing message
     //   forceNew: make a new system, also when the file's system is here
     //            (the user chose so, see chooseImport)
-    async function importData(data, { partial = false, confirmedNew = false, finishNote = '', forceNew = false } = {}) {
+    //   auto:    "Overwrite all" (see makeAuto): no dialogs; with auto.plan
+    //            only what would change, without writing anything
+    async function importData(data, { partial = false, confirmedNew = false, finishNote = '', forceNew = false, auto = null } = {}) {
         if (!isPlainObject(data?.configuration) || typeof data.templateIdentifier !== 'string') {
             throw new Error('The file is not an export of a target system.');
         }
@@ -5543,7 +5570,18 @@
             return `  - "${found.displayName}": ID in the file ${d.systemId}, ID here ${found.systemId} (${type})`;
         });
         if (byName.length) {
-            const answer = await showDialog('Import: dependency matched by name', `${header}\n\n` +
+            const answer = auto ? auto.decide(`dependsByName:${systemId}`, {
+                section: 'Dependencies found only by name',
+                item: `"${fileName}"`,
+                detail: byName.join('\n'),
+                options: [
+                    { value: true, label: 'Use the system with that name',
+                        description: '"Depends on systems" points at the system of the same name here.' },
+                    { value: 'alternative', label: 'Leave it out',
+                        description: 'Left out of "Depends on systems"; add it by hand later when needed.' },
+                ],
+                default: true,
+            }) : await showDialog('Import: dependency matched by name', `${header}\n\n` +
                 'The system depends on systems whose ID is not in this HelloID environment, but a target system ' +
                 `with the same name is:\n${byName.join('\n')}\n\n` +
                 'Continue: "Depends on systems" will point at these systems.\n' +
@@ -5560,7 +5598,7 @@
             }
         }
         // Then those that aren't here at all
-        if (notHere && !await showDialog('Import: dependency not found',
+        if (notHere && !auto && !await showDialog('Import: dependency not found',
             `${header}${notHere}\n\nContinue the import without them?`, { confirm: true })) {
             return false;
         }
@@ -5571,6 +5609,11 @@
         // A file for a migration is for the system it was made from, and
         // never makes a new one
         const fileChecklist = isPlainObject(data.migration?.checklist) ? data.migration.checklist : null;
+        // "Overwrite all" leaves migrations to PowerShell v2 alone
+        if (auto && fileChecklist) return auto.skip('a file for a migration to PowerShell v2: skipped');
+        if (auto && !created && system.templateIdentifier === POWERSHELL_V1 && data.templateIdentifier === POWERSHELL_V2) {
+            return auto.skip('a PowerShell v2 file for a PowerShell v1 system: starting its migration is skipped');
+        }
         if (created && fileChecklist) {
             throw new Error(`The file is for the migration of "${fileName}" (ID ${systemId}), but this HelloID ` +
                             'environment has no target system with that ID. Nothing was imported, and no new ' +
@@ -5579,7 +5622,7 @@
         // What to import (see chooseImport); for a new system asked here,
         // before it is made, for an existing one once the differences are known
         let chosen = null;
-        if (created && !confirmedNew) {
+        if (created && !confirmedNew && !auto) {
             const answer = await chooseImport('Import: new target system', {
                 intro: `${header}\n\n` + (forceNew ? '' : `This HelloID environment has no target system with the ID of the file (${systemId}).\n\n`) +
                     `A NEW target system (type ${data.templateIdentifier}) will be created, DISABLED, so it does nothing ` +
@@ -5595,6 +5638,17 @@
             chosen = answer.chosen;
             if (answer.name !== data.configuration.displayName) {
                 data = { ...data, displayName: answer.name, configuration: { ...data.configuration, displayName: answer.name } };
+            }
+        }
+        if (created && auto) {
+            const name = data.configuration.displayName ?? fileName;
+            if (typeof name === 'string' && await fetchFromGateway(NAME_EXISTS_PATH(name)) === true) {
+                return auto.skip(`a new target system, but another one is already named "${name}"`);
+            }
+            if (auto.plan) {
+                return auto.planned({ isNew: true, name, notes: [missing].filter(Boolean),
+                    lines: ['a new target system, DISABLED, with:', ...steps.filter(step => step.applies?.(data.configuration) ?? true)
+                        .map(step => `  - ${step.name}`)] });
             }
         }
         if (created) system = await createSystemFor(data, data.configuration.displayName ?? fileName, systemId, steps, systems);
@@ -5667,7 +5721,7 @@
         let { requests: newNotifications, skipped: notificationsSkipped } = chosen && !chosen.has(NOTIFICATIONS_CHOICE)
             ? { requests: [], skipped: '' } : await notificationRequests(data, systemId, system);
         const ruleWork = chosen && !chosen.has(RULES_CHOICE) ? { requests: [], drafts: () => 0, skipped: '' }
-            : await ruleRequests(data, system, created, header);
+            : await ruleRequests(data, system, created, header, auto);
         if (!ruleWork) return false; // cancelled
         let ruleDrafts = ruleWork.requests;
         const notCompared = !hasResources ? null : !Array.isArray(data.resources) ? 'the file has no resources (export the system again)'
@@ -5723,6 +5777,7 @@
                 : `"${system.displayName}" already has the configuration of the file.`) + skipped() + leftOpen + startedNote;
         // (a file for a migration is only for its own system)
         const asNew = !created && !confirmedNew && !fileChecklist && !migrationStarted;
+        if (auto && nothing()) return auto.same();
         if (nothing() && !asNew) {
             await showDialog('Import', nothingNote());
             return true;
@@ -5730,7 +5785,7 @@
 
         // An existing system: what to do with it (overwrite, or import the
         // file as a new system) and what to import
-        if (!created && !confirmedNew) {
+        if (!created && !confirmedNew && !auto) {
             const answer = await chooseImport('Import: what to import', {
                 intro: `${from}\n\nThe file is of "${system.displayName}", which is in this HelloID environment. ` +
                        (nothing() ? strong('It already has the configuration of the file' +
@@ -5843,9 +5898,13 @@
             ? { ...current, mappingConfiguration: configuration.mappingConfiguration } : current;
         plan.forEach(step => step.body(configuration, step.usesFieldIds ? afterMapping : current, systems));
 
+        if (auto?.plan) {
+            return auto.planned({ isNew: created, name: system.displayName, lines: parts,
+                notes: [unsupported, skipped(), leftOpen].filter(Boolean) });
+        }
         // A system that was just made was confirmed already, and has
-        // nothing to back up
-        if (!created) {
+        // nothing to back up ("Overwrite all" made its backup first)
+        if (!created && !auto) {
             if (!await showDialog('Import', `${from}${startedNote}\n\n` +
                                   `This will overwrite in, or add to, "${system.displayName}":\n\n` +
                                   `${parts.join('\n\n')}${unsupported}${skipped()}${leftOpen}\n\n` +
@@ -5927,7 +5986,7 @@
             ]),
         ];
         const first = created ? 1 : 0; // a new system: it was made before this
-        const progress = showProgress(
+        const progress = auto ? quietProgress() : showProgress(
             `${created ? 'Creating' : 'Importing into'} "${system.displayName}"`,
             [...(created ? ['Create new system'] : []), ...requests.map(r => r.name)]);
         if (created) progress.set(0, 'done');
@@ -5983,7 +6042,7 @@
                        'until then.');
         await progress.finish(`Import finished.${checklistNote}${leftOpen}${migrationNote}${disabled}${secrets}${dependsMissing}${notificationsSkipped}${rulesSkipped()}${draftsNote}${finishNote}\n\n` +
                               'The page reloads when you close this message.');
-        location.reload(); // show the changes
+        reloadAfterImport(); // show the changes
         return true;
     }
 
@@ -8214,6 +8273,9 @@
         .tm-choose-item { display: block; margin: 0; font-weight: normal; }
         .tm-choose-name { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
         .tm-choose-problem { margin-right: auto; align-self: center; }
+        .tm-decision { margin: 4px 0 8px 12px; }
+        .tm-decision > div { white-space: pre-line; }
+        .tm-decision pre { margin: 2px 0 4px; font-size: 90%; }
 
         /* Password fields: the eye button (see addRevealButtons) */
         .tm-reveal-password {
@@ -8283,7 +8345,28 @@
     const NOTIFICATION_HEADER_CLASS = 'tm-notification-header';
     // What the export adds to a notification, for another environment;
     // left out again on import
-    const NOTIFICATION_NAMES = ['systemName', 'notificationSystemName', 'notificationSystemBuiltin', 'notificationTemplateName'];
+    const NOTIFICATION_NAMES = ['systemName', 'notificationSystemName', 'notificationSystemBuiltin', 'notificationTemplateName',
+        'customEventName'];
+
+    // The custom events (of the notifications): a notification of a custom
+    // event has its ID, which is another one in another environment. The
+    // export adds its name, and the import finds it by ID, or else by name.
+    const CUSTOM_EVENT_LIST_PATH = `/service/notifications/api/custom-events?take=${SETTINGS.fetchAllTake}`;
+    async function readCustomEvents() {
+        const answer = await fetchFromGateway(CUSTOM_EVENT_LIST_PATH).catch(e => {
+            console.warn('[HelloID UX] Could not read the custom events', e);
+            return null;
+        });
+        return Array.isArray(answer) ? answer : answer?.pageData ?? [];
+    }
+    const withCustomEventName = (notification, events) => (!notification?.customEventId ? notification : {
+        ...notification,
+        customEventName: events.find(e => e?.customEventId === notification.customEventId)?.name ?? null,
+    });
+    // The custom event here for a notification of a file, or undefined
+    const customEventHere = (notification, events) => events.find(e => e?.customEventId === notification.customEventId) ??
+        (typeof notification.customEventName === 'string'
+            ? events.find(e => typeof e?.name === 'string' && e.name.trim() === notification.customEventName.trim()) : undefined);
 
     const fileSafe = (name) => String(name).replace(/[\\/:*?"<>|]+/g, '_').trim();
     const isoDate = () => new Date().toISOString().slice(0, 10);
@@ -8438,6 +8521,7 @@
             read.push(...await Promise.all(ids.slice(i, i + USED_BY_BATCH).map(id => fetchFromGateway(NOTIFICATION_PATH(id)))));
             report('notifications', 'busy', `${read.length}/${ids.length}`);
         }
+        const events = read.some(n => n?.customEventId) ? await readCustomEvents() : [];
         // The templates of the notification systems they use: for the
         // names of the templates, and their password fields
         const details = new Map(await Promise.all([...new Set(read.map(n => n.notificationSystemId).filter(Boolean))]
@@ -8449,7 +8533,7 @@
             const template = (details.get(n.notificationSystemId)?.notificationTemplates ?? [])
                 .find(t => t.templateId === n.notificationTemplateId);
             return {
-                ...n,
+                ...withCustomEventName(n, events),
                 notificationTemplateData: maskValues(n.notificationTemplateData, template?.fields),
                 dataReferences: (n.dataReferences ?? []).map(r => ({
                     ...r, displayName: targets.find(s => s.systemId === r.systemId)?.displayName ?? null,
@@ -8496,6 +8580,11 @@
         if (text === null) return false;
         let data;
         try { data = JSON.parse(text); } catch { throw new Error('The file is not a valid JSON file.'); }
+        return importNotificationsData(data);
+    }
+
+    // auto: "Overwrite all" (see makeAuto)
+    async function importNotificationsData(data, { auto = null } = {}) {
         if (data?.contents !== 'notifications' || !Array.isArray(data.notifications)) {
             throw new Error('The file is not an export of notification configurations.');
         }
@@ -8518,6 +8607,7 @@
         const notes = [];
         const taken = new Set();
         const fileIds = new Set(data.notifications.map(n => n?.identifier).filter(Boolean));
+        let events = null; // the custom events, once one is needed
         for (const notification of data.notifications.filter(isPlainObject)) {
             const label = `"${notification.name}" (${notification.event ?? notification.action ?? '?'})`;
             const problems = [];
@@ -8538,7 +8628,23 @@
             if (notification.systemId) {
                 const system = byIdOrName(targets, notification.systemId, notification.systemName);
                 if (system) systemId = system.systemId;
-                else problems.push(`its target system "${notification.systemName ?? notification.systemId}" is not in this HelloID environment`);
+                else if (auto?.pending('system', notification.systemName)) {
+                    // (made earlier in this "Overwrite all": found when it is written)
+                    auto.need(notification.systemName);
+                    notes.push(`${label}: after target system "${notification.systemName}" is made`);
+                } else problems.push(`its target system "${notification.systemName ?? notification.systemId}" is not in this HelloID environment`);
+            }
+            // Its custom event, if any: by ID, else by name
+            let customEventId = notification.customEventId ?? null;
+            if (customEventId) {
+                events ??= await readCustomEvents();
+                const event = customEventHere(notification, events);
+                if (event) customEventId = event.customEventId;
+                else if (auto?.pending('customEvent', notification.customEventName)) {
+                    auto.need(notification.customEventName);
+                    notes.push(`${label}: after custom event "${notification.customEventName}" is made`);
+                } else problems.push(`its custom event "${notification.customEventName ?? notification.customEventId}" is not in ` +
+                                   'this HelloID environment (import the custom events first)');
             }
             if (problems.length) {
                 skipped.push(`${label}: ${problems.join('; ')}`);
@@ -8575,6 +8681,7 @@
                 ...rest,
                 identifier: match?.identifier ?? crypto.randomUUID(),
                 systemId,
+                customEventId,
                 notificationSystemId: sender.systemId,
                 notificationTemplateId: templateId,
                 notificationTemplateData: restoreValues(rest.notificationTemplateData, current?.notificationTemplateData),
@@ -8591,7 +8698,8 @@
         // everything new, which notifications, and whether to keep their
         // links to the data of target systems
         if (entries.length) {
-            const answer = await chooseImport('Import notifications: what to import', {
+            const answer = auto ? { mode: 'overwrite', chosen: new Set([...entries.map((e, i) => String(i)), 'dataReferences']) }
+                : await chooseImport('Import notifications: what to import', {
                 intro: header + (skipped.length ? warn(`\n\nNot importable:\n${skipped.map(s => `  - ${s}`).join('\n')}`) : ''),
                 modes: entries.some(e => !e.isNew) ? [
                     { value: 'overwrite', label: 'Overwrite the notifications that match (same ID, or same event and name)' },
@@ -8642,19 +8750,25 @@
             skipped.length ? warn(`Not imported:\n${list2(skipped)}`) : '',
             notes.length ? warn(`Note:\n${list2(notes)}`) : '',
         ].filter(Boolean).join('\n\n');
+        if (auto && !work.length) return skipped.length ? auto.skip(skipped.join('; ')) : auto.same();
         if (!work.length) {
             await showDialog('Import notifications', `${summary}\n\nNothing to import.`);
             return true;
         }
-        if (!await showDialog('Import notifications', `${summary}\n\n` +
+        if (auto?.plan) {
+            return auto.planned({ ids: changed.map(w => w.identifier),
+                lines: [...added.map(w => `${w.label}: new, DISABLED`), ...changed.map(w => `${w.label}: overwrite`)],
+                notes: [...skipped.map(text => `not imported: ${text}`), ...notes] });
+        }
+        if (!auto && !await showDialog('Import notifications', `${summary}\n\n` +
             (changed.length ? 'A backup of the notifications that are overwritten is downloaded first.' : ''),
             { confirm: true })) return false;
 
-        if (changed.length) {
+        if (changed.length && !auto) {
             const backup = await collectNotificationsExport(changed.map(w => w.identifier));
             downloadFile(JSON.stringify(backup, null, 2), `Notification configurations - backup before import - ${isoDate()}.json`);
         }
-        const progress = showProgress('Import notifications', work.map(w => `${w.label} (${w.isNew ? 'new' : 'overwrite'})`));
+        const progress = auto ? quietProgress() : showProgress('Import notifications', work.map(w => `${w.label} (${w.isNew ? 'new' : 'overwrite'})`));
         let index = 0;
         try {
             for (const w of work) {
@@ -8671,7 +8785,7 @@
         await progress.finish('Import finished.' + (added.length
             ? '\n\nThe new notifications are DISABLED. Check them, and enable them yourself.' : '') +
             '\n\nThe page reloads when you close this message.');
-        location.reload();
+        reloadAfterImport();
         return true;
     }
 
@@ -8736,7 +8850,8 @@
 
     // forceNew: make a new system, also when the file's system is here
     // (the user chose so, see chooseImport)
-    async function importNotificationSystemData(data, { forceNew = false } = {}) {
+    // auto: "Overwrite all" (see makeAuto)
+    async function importNotificationSystemData(data, { forceNew = false, auto = null } = {}) {
         const file = data.system;
         const header = `File: export of "${file.displayName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
         const senders = await fetchFromGateway(NOTIFICATION_SYSTEMS_PATH);
@@ -8822,12 +8937,15 @@
         const alreadyHas = `${header}\n\n"${found?.displayName}" already has what the file has.`;
         const anyDiffers = Object.values(differs).some(Boolean);
         if (!anyDiffers && file.isBuiltin) {
+            if (auto) return auto.same();
             await showDialog('Import notification system', alreadyHas);
             return true;
         }
 
+        if (auto && !created && !anyDiffers) return auto.same();
         // What to do (overwrite, or a new system), and what to import
-        const answer = await chooseImport('Import notification system: what to import', {
+        const answer = auto ? { mode: 'overwrite', name: created ? file.displayName : null,
+            chosen: new Set([...PARTS.map(part => part.key), 'agents']) } : await chooseImport('Import notification system: what to import', {
             intro: `${header}\n\n` + (created
                 ? `A NEW notification system (PowerShell) will be made${forceNew ? '' : ': this HelloID environment has none that matches the file'}.`
                 : `The file matches "${found.displayName}" in this HelloID environment.` +
@@ -8853,6 +8971,7 @@
         const name = answer.name ?? file.displayName;
         Object.keys(differs).forEach(key => { differs[key] = differs[key] && answer.chosen.has(key); });
         const general = { ...Object.fromEntries(NOTIFICATION_GENERAL_FIELDS.map(f => [f, file[f]])), displayName: name };
+        if (auto && !Object.values(differs).some(Boolean)) return auto.same();
         if (!Object.values(differs).some(Boolean)) {
             await showDialog('Import notification system',
                 anyDiffers ? `${header}\n\nNothing was chosen, so nothing was imported.` : alreadyHas);
@@ -8869,14 +8988,19 @@
             ? templatesFor(differs.scripts ? withScripts(current) : current).problems : [];
         const chosenParts = [...PARTS, { key: 'agents', label: 'Agents for on-premises execution' }]
             .filter(part => differs[part.key]).map(part => part.label + (part.detail ? ` (${part.detail})` : ''));
-        if (!await showDialog('Import notification system', `${header}\n\n` +
+        if (auto?.plan) {
+            return auto.planned({ isNew: created, id: found?.systemId, name: found?.displayName ?? name,
+                lines: [created ? 'a new notification system, with:' : 'overwrites:', ...chosenParts.map(label => `  - ${label}`)],
+                notes: problemsNow });
+        }
+        if (!auto && !await showDialog('Import notification system', `${header}\n\n` +
             (created ? `A NEW notification system "${name}" (PowerShell) will be made, with:\n`
                 : `This will overwrite in "${found.displayName}":\n`) + list2(chosenParts) +
             (problemsNow.length ? warn(`\n\nTemplates that point at a script the system doesn't have keep pointing at it:\n${list2(problemsNow)}`) : '') +
             (created ? '' : '\n\nA backup of the current notification system is downloaded first.'),
         { confirm: true })) return false;
 
-        if (!created) {
+        if (!created && !auto) {
             const backup = await collectNotificationSystemExport(found.systemId);
             downloadFile(JSON.stringify(backup, null, 2),
                 `${fileSafe(found.displayName)} - backup before import - ${found.systemId} - ${isoDate()}.json`);
@@ -8897,7 +9021,7 @@
             ...(scriptsDiffer ? ['Scripts'] : []),
             ...(templatesDiffer ? ['Templates'] : []),
         ];
-        const progress = showProgress(`Import: ${file.displayName}`, steps);
+        const progress = auto ? quietProgress() : showProgress(`Import: ${file.displayName}`, steps);
         let index = 0;
         const step = async (work) => {
             progress.set(index, 'busy');
@@ -8951,7 +9075,7 @@
             throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
         }
         await progress.finish('Import finished.\n\nThe page reloads when you close this message.');
-        location.reload();
+        reloadAfterImport();
         return true;
     }
 
@@ -9215,7 +9339,8 @@
     }
 
     // forceNew: make a new system, also when the file's system is here
-    async function importSourceSystemData(data, { forceNew = false } = {}) {
+    // auto: "Overwrite all" (see makeAuto)
+    async function importSourceSystemData(data, { forceNew = false, auto = null } = {}) {
         const file = data.system;
         const header = `File: export of "${file.displayName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
         const systems = await fetchFromGateway(SOURCE_SYSTEMS_PATH);
@@ -9241,9 +9366,11 @@
         const anyDiffers = Object.values(differs).some(Boolean);
         const alreadyHas = `${header}\n\n"${found?.displayName}" already has what the file has.`;
 
+        if (auto && !created && !anyDiffers) return auto.same();
         const catalog = created ? await sourceCatalog().catch(() => []) : [];
         const candidates = created ? sourceTemplateCandidates(file.repositoryMetaData, catalog) : [];
-        const answer = await chooseImport('Import source system: what to import', {
+        const answer = auto ? { mode: 'overwrite', name: created ? file.displayName : null,
+            chosen: new Set([...SOURCE_PARTS.map(part => part.key), 'agents']) } : await chooseImport('Import source system: what to import', {
             intro: `${header}\n\n` + (created
                 ? `A NEW source system will be made${forceNew ? '' : ': this HelloID environment has none that matches the file'}, ` +
                   `from the catalog template ${candidates[0].label}.` +
@@ -9283,6 +9410,7 @@
             throw new Error(`Another source system is already named "${name}". Nothing was imported.`);
         }
         const parts = SOURCE_PARTS.filter(part => differs[part.key] && !(created && part.mapping));
+        if (auto && !parts.length && !differs.agents && !created) return auto.same();
         if (!parts.length && !differs.agents && !created) {
             await showDialog('Import source system',
                 anyDiffers ? `${header}\n\nNothing was chosen, so nothing was imported.` : alreadyHas);
@@ -9292,18 +9420,22 @@
         const list2 = (lines) => lines.map(line => `  - ${line}`).join('\n');
         const chosenLabels = [...SOURCE_PARTS, { key: 'agents', label: 'Agents for on-premises execution' }]
             .filter(part => differs[part.key]).map(part => part.label + (part.detail ? ` (${part.detail})` : ''));
-        if (!await showDialog('Import source system', `${header}\n\n` +
+        if (auto?.plan) {
+            return auto.planned({ isNew: created, id: found?.systemId, name: found?.displayName ?? name,
+                lines: [created ? 'a new source system, with:' : 'overwrites:', ...chosenLabels.map(label => `  - ${label}`)] });
+        }
+        if (!auto && !await showDialog('Import source system', `${header}\n\n` +
             (created ? `A NEW source system "${name}" will be made, with:\n` : `This will overwrite in "${found.displayName}":\n`) +
             list2(chosenLabels) +
             (created ? '' : '\n\nA backup of the current source system is downloaded first.'),
         { confirm: true })) return false;
 
-        if (!created) {
+        if (!created && !auto) {
             const backup = await collectSourceSystemExport(found.systemId);
             downloadFile(JSON.stringify(backup, null, 2),
                 `${fileSafe(found.displayName)} - backup before import - ${found.systemId} - ${isoDate()}.json`);
         }
-        const progress = showProgress(`Import: ${name}`, [
+        const progress = auto ? quietProgress() : showProgress(`Import: ${name}`, [
             ...(created ? ['Create new source system'] : []),
             ...parts.map(part => part.label),
             // The form without its values: its defaults where the system has no value
@@ -9362,7 +9494,7 @@
         await progress.finish('Import finished.' + (notes.length ? warn(`\n\nNote: ${notes.join('; ')}.`) : '') +
             (created && data.secretsIncluded === false ? '\n\nThe file has no secrets: fill them in yourself.' : '') +
             '\n\nThe page reloads when you close this message.');
-        location.reload();
+        reloadAfterImport();
         return true;
     }
 
@@ -9391,6 +9523,1469 @@
             [exportButton, templateButton].forEach(btn => btn.classList.add(SOURCE_TILE_CLASS));
             configure.before(exportButton, templateButton);
         });
+    }
+
+    // =====================================================================
+    // Import of the other exports (Export-HelloID.ps1)
+    // =====================================================================
+    // Business rules, toxic policies, custom events, schedules and the
+    // settings pages get an Import button on their page. "Import HelloID
+    // export files" in the Tampermonkey menu takes any export file (also
+    // several at once, e.g. a whole export folder) and passes each to its
+    // import. What a file points at (systems, entitlements, persons) is
+    // found by ID, or else (another environment) by name. Like the other
+    // imports: the changes are shown, a backup of what is overwritten is
+    // downloaded, and nothing is written before a confirmation. What is
+    // new starts disabled, where it has an on/off switch.
+
+    let importBatch = null; // { reload } while the menu imports several files
+
+    // The imports reload the page when they are done; in a batch only once,
+    // at its end
+    function reloadAfterImport() {
+        if (importBatch) importBatch.reload = true;
+        else location.reload();
+    }
+
+    // Several JSON files: [{ name, text }], or null (cancelled)
+    async function pickImportFiles() {
+        if (typeof pageWindow.showOpenFilePicker === 'function') {
+            try {
+                const handles = await pageWindow.showOpenFilePicker({
+                    multiple: true,
+                    types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }],
+                });
+                return Promise.all(handles.map(async h => {
+                    const file = await h.getFile();
+                    return { name: file.name, text: await file.text() };
+                }));
+            } catch (e) {
+                if (e?.name === 'AbortError') return null;
+                if (e?.name === 'SecurityError') {
+                    throw new Error('The browser did not open the file picker: it only does so right after a click on the page. ' +
+                                    'Click the Import button again.');
+                }
+                throw e;
+            }
+        }
+        return new Promise((resolve, reject) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.multiple = true;
+            input.accept = '.json,application/json';
+            input.addEventListener('change', () => {
+                const files = [...input.files];
+                if (!files.length) resolve(null);
+                else Promise.all(files.map(async f => ({ name: f.name, text: await f.text() }))).then(resolve, reject);
+            });
+            input.addEventListener('cancel', () => resolve(null));
+            input.click();
+        });
+    }
+
+    const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    const sameText = (a, b) => typeof a === 'string' && typeof b === 'string' && a.trim() === b.trim();
+    const rowsOf = (answer) => (Array.isArray(answer) ? answer : Array.isArray(answer?.pageData) ? answer.pageData : []);
+    // An ID in an answer: the text itself, or an object with one of these
+    const idIn = (answer, ...keys) => (typeof answer === 'string' && answer ? answer
+        : keys.map(k => answer?.[k]).find(v => typeof v === 'string' && v) ?? null);
+    const browserZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const exportHeader = (contents) => ({
+        exportedAt: new Date().toISOString(),
+        exportedFrom: location.origin,
+        exportedBy: exportedBy(),
+        contents,
+    });
+    // The keys whose values differ, as lines: 'name: "a" -> "b"', or only
+    // the key for what is not a short value
+    function keyChanges(wanted, current, keys) {
+        const short = (v) => (v === null || ['string', 'number', 'boolean'].includes(typeof v)) && String(v).length <= 60;
+        return keys.filter(k => !sameJson(wanted[k], current?.[k])).map(k =>
+            (short(wanted[k]) && short(current?.[k]) ? `${k}: ${JSON.stringify(current?.[k] ?? null)} -> ${JSON.stringify(wanted[k])}` : k));
+    }
+
+    // Target and source systems here; find(id, name): the one for a system
+    // of the file
+    async function systemDirectory() {
+        const [targets, sources] = await Promise.all([
+            fetchSystems(),
+            fetchFromGateway(SOURCE_SYSTEMS_PATH).catch(() => []),
+        ]);
+        const all = [...targets, ...rowsOf(sources)].filter(s => s?.systemId);
+        return {
+            all,
+            find: (id, name) => all.find(s => s.systemId === id) ??
+                (typeof name === 'string' ? all.find(s => sameText(s.displayName, name)) : undefined),
+            nameOf: (id) => all.find(s => s.systemId === id)?.displayName ?? null,
+        };
+    }
+    // The name a file gives a system ID (its list "systems")
+    const fileSystemName = (data, id) => (Array.isArray(data?.systems) ? data.systems : [])
+        .find(s => s?.systemId === id)?.displayName ?? null;
+
+    // All entitlements that rules and policies can have; the result finds
+    // the one here for an entitlement of a file (by ID, else by its
+    // system, type and name), or null
+    async function entitlementDirectory(systems) {
+        const all = rowsOf(await fetchFromGateway(RULE_ENTITLEMENTS_PATH))
+            .filter(row => row?.inTargetSystem !== false).map(row => ruleEntitlement(row, {}));
+        return (entitlement, systemName) => {
+            const e = ruleEntitlement(entitlement, {});
+            const same = all.find(a => a.entitlementId === e.entitlementId);
+            if (same) return same;
+            const system = systems.find(e.systemIdentifier, systemName);
+            if (!system) return null;
+            const named = all.filter(a => a.systemIdentifier === system.systemId && a.type === e.type && a.displayName === e.displayName);
+            return named.find(a => (a.permissionDefinitionDisplayName ?? null) === (e.permissionDefinitionDisplayName ?? null)) ??
+                (named.length === 1 ? named[0] : null);
+        };
+    }
+    const entitlementKey = (e) => `${e.systemIdentifier}|${e.type}|${e.displayName}|${e.permissionDefinitionDisplayName ?? ''}`;
+    // Entitlements added and removed, as lines
+    function entitlementChanges(wanted, current, systems) {
+        const label = (e) => `${entitlementLabel(e)} of "${systems.nameOf(e.systemIdentifier) ?? e.systemIdentifier}"`;
+        const mine = (wanted ?? []).map(e => ruleEntitlement(e, {}));
+        const theirs = (current ?? []).map(e => ruleEntitlement(e, {}));
+        return [
+            ...mine.filter(e => !theirs.some(t => entitlementKey(t) === entitlementKey(e))).map(e => `+ ${label(e)}`),
+            ...theirs.filter(t => !mine.some(e => entitlementKey(t) === entitlementKey(e))).map(t => `- ${label(t)}`),
+        ];
+    }
+
+    // --- Items of a type (rules, toxic policies, custom events, schedules) ---
+    // A type:
+    //   contents, title, plural: the files and texts
+    //   valid(data): is it a file of this type?
+    //   context(): what all files need (systems, entitlements)
+    //   list(ctx): the items here
+    //   item(data): the item in a file; idOf/nameOf(item)
+    //   prepare(data, match, ctx): { wanted, changes, problems, notes,
+    //           blocked }; match: the item here (by ID, else name) or null;
+    //           blocked: why it can't be imported
+    //   write(plan, ctx): saves it
+    //   backup(match, ctx): the item here as an export file
+    async function importItems(type, files) {
+        const ctx = await type.context();
+        const here = await type.list(ctx);
+        const plans = [];
+        for (const { name, data } of files) {
+            const item = type.item(data);
+            const match = here.find(h => type.idOf(h) && type.idOf(h) === type.idOf(item)) ??
+                here.find(h => sameText(type.nameOf(h), type.nameOf(item))) ?? null;
+            plans.push({ file: name, data, item, match, label: `"${type.nameOf(item)}"`, ...await type.prepare(data, match, ctx) });
+        }
+        const blocked = plans.filter(p => p.blocked);
+        const same = plans.filter(p => !p.blocked && p.match && !p.changes.length);
+        const work = plans.filter(p => !p.blocked && !(p.match && !p.changes.length));
+        const listed = (title, list, line) => (list.length ? `\n\n${title}:\n${list.map(p => `  - ${line(p)}`).join('\n')}` : '');
+        const intro = `${files.length} file(s)` +
+            warn(listed('Can not be imported', blocked, p => `${p.label}: ${p.blocked}`)) +
+            listed('Already the same here', same, p => p.label);
+        if (!work.length) {
+            await showDialog(type.title, `${intro}\n\nNothing to import.`);
+            return false;
+        }
+        const answer = await chooseImport(type.title, {
+            intro,
+            groups: [{
+                title: type.plural,
+                items: work.map((p, i) => ({
+                    key: String(i),
+                    label: `${p.label} (${p.match ? 'overwrite' : 'new'})`,
+                    detail: p.match ? `${p.changes.length} change${p.changes.length === 1 ? '' : 's'}` : null,
+                })),
+            }],
+        });
+        if (!answer) return false;
+        let chosen = work.filter((p, i) => answer.chosen.has(String(i)));
+        if (!chosen.length) return false;
+
+        // A type HelloID allows only so many of: for each new one that has
+        // no room, the user chooses to replace one that is here, or to skip it
+        if (type.limit) {
+            const newOnes = chosen.filter(p => !p.match);
+            let room = type.limit - here.length;
+            if (newOnes.length > room) {
+                const taken = new Set(chosen.filter(p => p.match).map(p => type.idOf(p.match)));
+                for (const plan of newOnes) {
+                    const free = here.filter(h => !taken.has(type.idOf(h)));
+                    const modes = [
+                        ...(room > 0 ? [{ value: 'add', label: `Add it (${room} place${room === 1 ? '' : 's'} left)` }] : []),
+                        ...free.map(h => ({ value: `replace:${type.idOf(h)}`, label: `Replace "${type.nameOf(h)}"` })),
+                        { value: 'skip', label: 'Skip it' },
+                    ];
+                    let mode = 'skip';
+                    if (modes.length > 1) {
+                        const pick = await chooseImport(`${type.title}: ${plan.label}`, {
+                            intro: `HelloID allows at most ${type.limit} ${type.plural.toLowerCase()}, and this HelloID environment has ` +
+                                   `${here.length}: ${here.map(h => `"${type.nameOf(h)}"`).join(', ')}.\n\n` +
+                                   `What to do with ${plan.label} from the file?`,
+                            modes,
+                        });
+                        if (!pick) return false;
+                        mode = pick.mode;
+                    }
+                    if (mode === 'add') {
+                        room--;
+                    } else if (mode.startsWith('replace:')) {
+                        const replaced = free.find(h => `replace:${type.idOf(h)}` === mode);
+                        taken.add(type.idOf(replaced));
+                        Object.assign(plan, { match: replaced, replaces: type.nameOf(replaced) },
+                            await type.prepare(plan.data, replaced, ctx));
+                    } else {
+                        plan.skipped = true;
+                    }
+                }
+                chosen = chosen.filter(p => !p.skipped);
+                if (!chosen.length) return false;
+            }
+        }
+        const how = (p) => (p.replaces ? `replaces "${p.replaces}"` : p.match ? 'overwrite' : 'new');
+
+        const details = chosen.map(p => `${p.label} (${how(p)}):\n` +
+            p.changes.map(c => `  - ${c}`).join('\n') +
+            (p.problems.length ? warn(`\n  Left out:\n${p.problems.map(c => `    - ${c}`).join('\n')}`) : '') +
+            (p.notes.length ? strong(`\n  Note: ${p.notes.join('; ')}`) : '')).join('\n\n');
+        const overwritten = chosen.filter(p => p.match);
+        if (!await showDialog(type.title, `${details}\n\n` +
+            (overwritten.length ? 'A backup of what is overwritten is downloaded first.' : ''), { confirm: true })) return false;
+        if (overwritten.length) {
+            downloadFile(JSON.stringify({
+                ...exportHeader('backups'),
+                files: await Promise.all(overwritten.map(p => type.backup(p.match, ctx))),
+            }, null, 2), `${type.plural} - backup before import - ${isoDate()}.json`);
+        }
+
+        const progress = showProgress(type.title, chosen.map(p => `${p.label} (${how(p)})`));
+        let index = 0;
+        try {
+            for (const plan of chosen) {
+                progress.set(index, 'busy');
+                await type.write(plan, ctx);
+                progress.set(index++, 'done');
+            }
+        } catch (e) {
+            progress.set(index, 'failed');
+            await progress.finish(error(`Import failed: ${e?.message ?? e}`) +
+                '\n\nThe items before it were imported; the ones after it were not.');
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish('Import finished.' + (type.finishNote ? `\n\n${type.finishNote}` : '') +
+            '\n\nThe page reloads when you close this message.');
+        reloadAfterImport();
+        return true;
+    }
+
+    // Titles and departments in a rule's condition are kept by their
+    // external ID, with their source system: that is the one of the same
+    // name here (another environment). notes: what can't be found.
+    function conditionHere(condition, systems, notes) {
+        if (!isPlainObject(condition)) return condition;
+        const copy = structuredClone(condition);
+        const here = (entry) => {
+            const id = entry?.source?.systemId ?? entry?.sourceSystemId;
+            if (!id) return entry;
+            const name = entry.source?.displayName ?? entry.sourceSystemDisplayName;
+            const system = systems.find(id, name);
+            if (!system) {
+                notes.push(`"${entry.name ?? entry.displayName ?? entry.externalId}" in the condition is of source system "${name ?? id}", ` +
+                           'which is not in this HelloID environment');
+                return entry;
+            }
+            if (system.systemId === id) return entry;
+            return {
+                ...entry,
+                ...(isPlainObject(entry.source) ? { source: { ...entry.source, systemId: system.systemId, displayName: system.displayName,
+                    identificationKey: entry.source.identificationKey === id ? system.systemId : entry.source.identificationKey } } : {}),
+                ...('sourceSystemId' in entry ? { sourceSystemId: system.systemId } : {}),
+                ...('sourceSystemDisplayName' in entry ? { sourceSystemDisplayName: system.displayName } : {}),
+            };
+        };
+        if (Array.isArray(copy.titleCondition?.titles)) copy.titleCondition.titles = copy.titleCondition.titles.map(here);
+        if (Array.isArray(copy.departmentCondition?.departments)) copy.departmentCondition.departments = copy.departmentCondition.departments.map(here);
+        return copy;
+    }
+
+    // Business rules: the condition and entitlements are saved as a DRAFT,
+    // as everywhere in this script (a draft the rule has is replaced); name,
+    // description and categories take effect right away (HelloID saves them
+    // apart). The entitlements are found by their system, type and name.
+    const RULE_IMPORT = {
+        contents: 'businessRule',
+        title: 'Import business rules',
+        plural: 'Business rules',
+        finishNote: 'The conditions and entitlements are saved as DRAFTS: check them, and publish them yourself in HelloID. ' +
+            'Names, descriptions and categories took effect right away.',
+        valid: (data) => isPlainObject(data.rule) && typeof data.rule.name === 'string',
+        async context() {
+            const systems = await systemDirectory();
+            return { systems, entitlement: await entitlementDirectory(systems) };
+        },
+        list: async () => rowsOf(await sendToGateway(`${RULES_PATH}/overview`, 'POST',
+            { search: '', skip: 0, take: SETTINGS.fetchAllTake, published: true, draft: true })),
+        item: (data) => data.rule,
+        idOf: (rule) => rule?.ruleId,
+        nameOf: (rule) => rule?.name,
+        async prepare(data, match, ctx) {
+            const rule = data.rule;
+            const problems = [];
+            const notes = [];
+            const entitlements = [];
+            for (const e of rule.entitlements ?? []) {
+                const systemName = fileSystemName(data, e.systemIdentifier);
+                const found = ctx.entitlement(e, systemName);
+                if (found) {
+                    const { systemName: _, ...entitlement } = found;
+                    if (!entitlements.some(x => x.entitlementId === entitlement.entitlementId)) entitlements.push(entitlement);
+                } else if (ctx.pending?.('system', systemName)) {
+                    // (a system made earlier in this "Overwrite all")
+                    ctx.need?.(systemName);
+                    const note = `the entitlements of "${systemName}" are linked after it is made`;
+                    if (!notes.includes(note)) notes.push(note);
+                } else {
+                    problems.push(`${entitlementLabel(ruleEntitlement(e, {}))} of "${systemName ?? e.systemIdentifier}": not an entitlement here`);
+                }
+            }
+            const condition = conditionHere(rule.condition ?? null, ctx.systems, notes);
+            const wanted = { name: rule.name, description: rule.description ?? '', categories: rule.categories ?? [], condition, entitlements };
+            const current = match ? await fetchFromGateway(RULE_PATH(match.ruleId)) : null;
+            // Its latest state: the draft, when it has one (a save replaces it)
+            const latest = current?.hasDraft && isPlainObject(current.draft)
+                ? { condition: current.draft.condition ?? current.condition, entitlements: current.draft.entitlements ?? current.entitlements }
+                : current;
+            const draftChanges = !current ? [] : [...keyChanges(wanted, latest, ['condition']),
+                ...entitlementChanges(entitlements, latest.entitlements, ctx.systems)];
+            if (current?.hasDraft && draftChanges.length) notes.push('the rule has an unpublished draft: the import replaces it');
+            const changes = !current ? ['a new rule, saved as a draft']
+                : [...keyChanges(wanted, current, ['name', 'description', 'categories']).map(c => `${c} (takes effect right away, not as a draft)`),
+                    ...draftChanges];
+            return { wanted, current, changes, problems, notes };
+        },
+        async write(plan) {
+            let ruleId = plan.current?.ruleId;
+            if (!ruleId) {
+                ruleId = idIn(await sendToGateway(`${RULES_PATH}/add`, 'PUT', {}), 'ruleId', 'id');
+                if (!ruleId) throw new Error('HelloID did not say which rule it made.');
+            }
+            let rule = await fetchFromGateway(RULE_PATH(ruleId));
+            // Name, description and categories are saved apart (as HelloID does)
+            if (!plan.current || !sameJson(['name', 'description', 'categories'].map(k => rule[k]),
+                ['name', 'description', 'categories'].map(k => plan.wanted[k]))) {
+                await sendToGateway(`${RULES_PATH}/${encodeURIComponent(ruleId)}/general`, 'PUT', { ...rule, ...plan.wanted });
+                rule = await fetchFromGateway(RULE_PATH(ruleId));
+            }
+            await sendToGateway(RULES_PATH, 'POST', { ...rule, ...plan.wanted });
+        },
+        async backup(match, ctx) {
+            const rule = await fetchFromGateway(RULE_PATH(match.ruleId));
+            const ids = [...new Set((rule.entitlements ?? []).map(e => e.systemIdentifier))];
+            return { ...exportHeader('businessRule'), ruleId: rule.ruleId, name: rule.name, rule,
+                systems: ids.map(id => ({ systemId: id, displayName: ctx.systems.nameOf(id) })) };
+        },
+    };
+
+    // Toxic policies: the entitlements by their system, type and name
+    const TOXIC_PATH = '/service/rules/api/toxic-combinations';
+    const TOXIC_IMPORT = {
+        contents: 'toxicPolicy',
+        title: 'Import toxic policies',
+        plural: 'Toxic policies',
+        finishNote: 'New toxic policies are DISABLED. Check them, and enable them yourself.',
+        valid: (data) => isPlainObject(data.policy) && typeof data.policy.name === 'string',
+        context: RULE_IMPORT.context,
+        list: async () => rowsOf(await fetchFromGateway(`${TOXIC_PATH}?take=${SETTINGS.fetchAllTake}`)),
+        item: (data) => data.policy,
+        idOf: (policy) => policy?.toxicCombinationId,
+        nameOf: (policy) => policy?.name,
+        async prepare(data, match, ctx) {
+            const policy = data.policy;
+            const problems = [];
+            const notes = [];
+            const map = (ids) => (ids ?? []).map(id => {
+                const e = (data.entitlements ?? []).find(x => x?.entitlementId === id) ?? { entitlementId: id };
+                const systemName = fileSystemName(data, e.systemIdentifier);
+                const found = ctx.entitlement(e, systemName);
+                if (!found && ctx.pending?.('system', systemName)) {
+                    ctx.need?.(systemName);
+                    const note = `the entitlements of "${systemName}" are linked after it is made`;
+                    if (!notes.includes(note)) notes.push(note);
+                } else if (!found) problems.push(`${e.displayName ? entitlementLabel(ruleEntitlement(e, {})) : `entitlement ${id}`}` +
+                    `${systemName ? ` of "${systemName}"` : ''}: not an entitlement here`);
+                return found?.entitlementId ?? null;
+            }).filter(Boolean);
+            const wanted = {
+                name: policy.name,
+                description: policy.description ?? '',
+                enabled: match ? policy.enabled === true : false,
+                type: policy.type,
+                inputObjectIds: map(policy.inputObjectIds),
+                outputObjectIds: map(policy.outputObjectIds),
+            };
+            const changes = !match ? ['a new toxic policy, disabled']
+                : keyChanges(wanted, match, ['name', 'description', 'enabled', 'type', 'inputObjectIds', 'outputObjectIds']);
+            return { wanted, changes, problems, notes };
+        },
+        async write(plan) {
+            const id = plan.match?.toxicCombinationId ?? idIn(await sendToGateway(TOXIC_PATH, 'PUT', {}), 'toxicCombinationId', 'id');
+            if (!id) throw new Error('HelloID did not say which toxic policy it made.');
+            await sendToGateway(`${TOXIC_PATH}/configuration`, 'POST', { toxicCombinationId: id, ...plan.wanted });
+        },
+        async backup(match, ctx) {
+            const ids = [...new Set([...(match.inputObjectIds ?? []), ...(match.outputObjectIds ?? [])])];
+            const entitlements = !ids.length ? [] : rowsOf(await fetchFromGateway(`${TOXIC_PATH}/entitlements/by-ids?` +
+                ids.map(id => `entitlementIds=${encodeURIComponent(id)}`).join('&')).catch(() => []));
+            const systems = [...new Set(entitlements.map(e => e.systemIdentifier))];
+            return { ...exportHeader('toxicPolicy'), toxicCombinationId: match.toxicCombinationId, name: match.name, policy: match,
+                entitlements, systems: systems.map(id => ({ systemId: id, displayName: ctx.systems.nameOf(id) })) };
+        },
+    };
+
+    // Custom events of the notifications: their system by ID or name
+    const CUSTOM_EVENTS_PATH = '/service/notifications/api/custom-events';
+    const CUSTOM_EVENT_IMPORT = {
+        contents: 'customEvent',
+        title: 'Import custom events',
+        plural: 'Custom events',
+        valid: (data) => isPlainObject(data.customEvent) && typeof data.customEvent.name === 'string',
+        context: async () => ({ systems: await systemDirectory() }),
+        list: async () => rowsOf(await fetchFromGateway(`${CUSTOM_EVENTS_PATH}?take=${SETTINGS.fetchAllTake}`)),
+        item: (data) => data.customEvent,
+        idOf: (event) => event?.customEventId,
+        nameOf: (event) => event?.name,
+        async prepare(data, match, ctx) {
+            const event = data.customEvent;
+            const system = event.systemId ? ctx.systems.find(event.systemId, data.systemName) : null;
+            const notes = [];
+            if (event.systemId && !system) {
+                if (!ctx.pending?.('system', data.systemName)) {
+                    return { blocked: `its system "${data.systemName ?? event.systemId}" is not in this HelloID environment` };
+                }
+                ctx.need?.(data.systemName);
+                notes.push(`after system "${data.systemName}" is made`);
+            }
+            const wanted = { name: event.name, systemId: system?.systemId ?? null, action: event.action, conditions: event.conditions ?? [] };
+            const changes = !match ? ['a new custom event'] : keyChanges(wanted, match, ['name', 'systemId', 'action', 'conditions']);
+            return { wanted, changes, problems: [], notes };
+        },
+        async write(plan) {
+            const id = plan.match?.customEventId ?? idIn(await sendToGateway(CUSTOM_EVENTS_PATH, 'POST', {}), 'customEventId', 'id');
+            if (!id) throw new Error('HelloID did not say which custom event it made.');
+            await sendToGateway(`${CUSTOM_EVENTS_PATH}/${encodeURIComponent(id)}`, 'POST', { customEventId: id, ...plan.wanted, isValid: null });
+        },
+        backup: async (match, ctx) => ({ ...exportHeader('customEvent'), customEventId: match.customEventId, name: match.name,
+            systemName: ctx.systems.nameOf(match.systemId), customEvent: match }),
+    };
+
+    // Schedules of the snapshots: the hour in UTC, as in the file; their
+    // tasks' systems by ID or name
+    const SCHEDULE_PATH = '/service/scheduler/api/schedule';
+    // The hour in a time zone at a UTC hour (today), and its offset
+    function hourInZone(zone, utcHour) {
+        const at = new Date();
+        at.setUTCHours(utcHour, 0, 0, 0);
+        let local = utcHour;
+        try {
+            local = Number(new Intl.DateTimeFormat('en-US', { timeZone: zone, hour: 'numeric', hourCycle: 'h23' })
+                .formatToParts(at).find(p => p.type === 'hour')?.value ?? utcHour) % 24;
+        } catch { /* unknown zone: UTC */ }
+        return { local, offset: ((local - utcHour + 36) % 24) - 12 };
+    }
+    const SCHEDULE_IMPORT = {
+        contents: 'schedule',
+        title: 'Import schedules',
+        plural: 'Schedules',
+        limit: 3, // HelloID allows no more
+        finishNote: 'New schedules are DISABLED. Check them, and enable them yourself.',
+        valid: (data) => isPlainObject(data.schedule) && typeof data.schedule.name === 'string',
+        context: async () => ({ systems: await systemDirectory() }),
+        list: async () => rowsOf(await fetchFromGateway(`${SCHEDULE_PATH}?timeZone=${encodeURIComponent(browserZone())}`)),
+        item: (data) => data.schedule,
+        idOf: (schedule) => schedule?.scheduleId,
+        nameOf: (schedule) => schedule?.name,
+        async prepare(data, match, ctx) {
+            const schedule = data.schedule;
+            const problems = [];
+            const notes = [];
+            const tasks = (schedule.tasks ?? []).filter(isPlainObject).map(task => {
+                if (!task.systemId) return { type: task.type };
+                const name = fileSystemName(data, task.systemId);
+                const system = ctx.systems.find(task.systemId, name);
+                if (!system && ctx.pending?.('system', name)) {
+                    ctx.need?.(name);
+                    notes.push(`the task for "${name}" is set after that system is made`);
+                    return null;
+                }
+                if (!system) problems.push(`the task for "${name ?? task.systemId}": that system is not in this HelloID environment`);
+                return system ? { type: task.type, systemId: system.systemId } : null;
+            }).filter(Boolean);
+            const wanted = {
+                name: schedule.name,
+                enabled: match ? schedule.enabled === true : false,
+                useSpecificTimeZone: schedule.useSpecificTimeZone === true,
+                selectedTimeZone: schedule.selectedTimeZone ?? null,
+                observeDst: schedule.observeDst === true,
+                hourOfDayUtc: schedule.hourOfDayUtc,
+                tasks,
+            };
+            const current = match && { ...match, tasks: (match.tasks ?? []).map(t => (t.systemId ? { type: t.type, systemId: t.systemId } : { type: t.type })) };
+            const changes = !match ? ['a new schedule, disabled']
+                : keyChanges(wanted, current, ['name', 'enabled', 'useSpecificTimeZone', 'selectedTimeZone', 'observeDst', 'hourOfDayUtc', 'tasks']);
+            return { wanted, changes, problems, notes };
+        },
+        async write(plan) {
+            const zone = plan.wanted.useSpecificTimeZone && plan.wanted.selectedTimeZone ? plan.wanted.selectedTimeZone : browserZone();
+            const { local, offset } = hourInZone(zone, plan.wanted.hourOfDayUtc);
+            await sendToGateway(SCHEDULE_PATH, 'POST', {
+                // (HelloID's own page makes the ID of a new one)
+                scheduleId: plan.match?.scheduleId ?? crypto.randomUUID(),
+                ...plan.wanted,
+                lastRunTime: plan.match?.lastRunTime ?? null,
+                hourOfDayLocal: local,
+                timezoneOffsetHours: offset,
+            });
+        },
+        backup: async (match, ctx) => ({ ...exportHeader('schedule'), scheduleId: match.scheduleId, name: match.name,
+            timeZone: browserZone(), schedule: match,
+            systems: [...new Set((match.tasks ?? []).map(t => t.systemId).filter(Boolean))]
+                .map(id => ({ systemId: id, displayName: ctx.systems.nameOf(id) })) }),
+    };
+
+    const ITEM_IMPORTS = [RULE_IMPORT, TOXIC_IMPORT, CUSTOM_EVENT_IMPORT, SCHEDULE_IMPORT];
+
+    // --- Settings pages ---
+    // A settings page: the user ticks the parts to import. A type:
+    //   contents, title, valid(data)
+    //   load(): the page as it is here (an export file of it: the backup)
+    //   plan(data, current, ctx): { parts: [{ key, label, changes,
+    //           checked }], notes, steps(chosen) -> [{ name, run }] }
+    async function importSetting(type, data) {
+        const ctx = { systems: await systemDirectory() };
+        const current = await type.load(ctx);
+        const plan = await type.plan(data, current, ctx);
+        const parts = plan.parts.filter(p => p.changes.length);
+        const notes = plan.notes.length ? warn(`\n\n${plan.notes.map(n => `Note: ${n}`).join('\n')}`) : '';
+        const header = `File: export from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
+        if (!parts.length) {
+            await showDialog(type.title, `${header}\n\nThis HelloID environment already has the settings of the file.${notes}`);
+            return true;
+        }
+        const answer = await chooseImport(type.title, {
+            intro: header + notes,
+            groups: [{ title: 'What to import', items: parts.map(p => ({ key: p.key, label: p.label,
+                detail: `${p.changes.length} change${p.changes.length === 1 ? '' : 's'}`, checked: p.checked })) }],
+        });
+        if (!answer) return false;
+        const chosen = parts.filter(p => answer.chosen.has(p.key));
+        if (!chosen.length) return false;
+        if (!await showDialog(type.title, chosen.map(p => `${p.label}:\n${p.changes.map(c => `  - ${c}`).join('\n')}`).join('\n\n') +
+            '\n\nA backup of the settings here is downloaded first.', { confirm: true })) return false;
+        downloadFile(JSON.stringify(current, null, 2), `${type.label} - backup before import - ${isoDate()}.json`);
+
+        const steps = plan.steps(new Set(chosen.map(p => p.key)));
+        const progress = showProgress(type.title, steps.map(s => s.name));
+        let index = 0;
+        try {
+            for (const step of steps) {
+                progress.set(index, 'busy');
+                await step.run();
+                progress.set(index++, 'done');
+            }
+        } catch (e) {
+            progress.set(index, 'failed');
+            await progress.finish(error(`Import failed: ${e?.message ?? e}`) +
+                '\n\nThe steps before it were done; the ones after it were not.');
+            throw Object.assign(new Error(String(e?.message ?? e)), { shown: true });
+        }
+        await progress.finish('Import finished.\n\nThe page reloads when you close this message.');
+        reloadAfterImport();
+        return true;
+    }
+
+    // Source > Configuration: primary contract, primary manager and display
+    // name (one request), and the custom fields (added and changed by name).
+    // HelloID saves the whole list of fields, and deletes what is not in
+    // it: fields that are only here stay, unless deleting them is ticked.
+    const CALCULATED_LAYERS_PATH = '/service/provisioning-integration/api/calculatedlayers';
+    const CUSTOM_FIELDS_PATH = '/service/provisioning-integration/api/customfields';
+    const LAYER_PARTS = [
+        { key: 'primaryContractConfiguration', label: 'Primary contract' },
+        { key: 'primaryManagerConfiguration', label: 'Primary manager' },
+        { key: 'displayNameConfiguration', label: 'Display name' },
+    ];
+    const SOURCE_CONFIGURATION_IMPORT = {
+        contents: 'sourceConfiguration',
+        title: 'Import source configuration',
+        label: 'Source configuration',
+        valid: (data) => isPlainObject(data.calculatedLayers) || Array.isArray(data.customFields),
+        load: async () => ({ ...exportHeader('sourceConfiguration'),
+            calculatedLayers: await fetchFromGateway(`${CALCULATED_LAYERS_PATH}/config`),
+            customFields: await fetchFromGateway(CUSTOM_FIELDS_PATH) }),
+        plan(data, current) {
+            const layers = isPlainObject(data.calculatedLayers) ? data.calculatedLayers : {};
+            const fileFields = (Array.isArray(data.customFields) ? data.customFields : []).filter(f => f?.name);
+            const hereFields = Array.isArray(current.customFields) ? current.customFields : [];
+            const inFile = (field) => fileFields.find(f => f.name === field.name);
+            // The whole list to save: update: the file's changes and new
+            // fields; remove: without the fields only this environment has
+            const fields = (update, remove) => [
+                ...hereFields.filter(field => !remove || inFile(field)).map(field => ({ ...field,
+                    ...(update && inFile(field) ? { displayName: inFile(field).displayName, type: inFile(field).type } : {}), selected: false })),
+                ...(!update ? [] : fileFields.filter(f => !hereFields.some(h => h.name === f.name)).map(f => ({
+                    // (HelloID's own page makes the ID of a new one)
+                    customFieldIdentifier: crypto.randomUUID(), type: f.type, name: f.name, displayName: f.displayName, selected: false,
+                }))),
+            ];
+            const fieldChanges = fileFields.flatMap(f => {
+                const field = hereFields.find(h => h.name === f.name);
+                if (!field) return [`custom field "${f.name}" (new)`];
+                return keyChanges(f, field, ['displayName', 'type']).map(c => `custom field "${f.name}": ${c}`);
+            });
+            const onlyHere = hereFields.filter(h => !fileFields.some(f => f.name === h.name));
+            return {
+                parts: [
+                    ...LAYER_PARTS.filter(p => p.key in layers).map(p => ({ ...p,
+                        changes: sameJson(layers[p.key], current.calculatedLayers?.[p.key]) ? [] : [p.label.toLowerCase()] })),
+                    { key: 'customFields', label: 'Custom fields', changes: fieldChanges },
+                    { key: 'removeFields', label: 'Delete the custom fields that the file does not have',
+                        changes: onlyHere.map(h => `delete custom field "${h.name}" (its values are lost)`),
+                        // ("Overwrite all" asks this one apart)
+                        optIn: { section: 'Custom fields that only this environment has', options: [
+                            { value: true, label: 'Delete them', description: 'The fields are deleted, and their values are lost.' },
+                            { value: false, label: 'Keep them', description: 'The fields stay as they are.' },
+                        ] } },
+                ],
+                notes: [],
+                steps: (chosen) => [
+                    ...(LAYER_PARTS.some(p => chosen.has(p.key)) ? [{
+                        name: LAYER_PARTS.filter(p => chosen.has(p.key)).map(p => p.label).join(', '),
+                        run: () => sendToGateway(CALCULATED_LAYERS_PATH, 'POST', Object.fromEntries(LAYER_PARTS.map(p =>
+                            [p.key, chosen.has(p.key) ? layers[p.key] : current.calculatedLayers?.[p.key]]))),
+                    }] : []),
+                    ...(chosen.has('customFields') || chosen.has('removeFields') ? [{ name: 'Custom fields',
+                        run: () => sendToGateway(CUSTOM_FIELDS_PATH, 'POST', fields(chosen.has('customFields'), chosen.has('removeFields'))) }] : []),
+                ],
+            };
+        },
+    };
+
+    // Source > Aggregation: the settings of automatic aggregation
+    const AGGREGATION_PATH = '/service/provisioning-pipeline/api/aggregation/automatic/configuration';
+    const AGGREGATION_IMPORT = {
+        contents: 'aggregationConfiguration',
+        title: 'Import aggregation configuration',
+        label: 'Aggregation configuration',
+        valid: (data) => isPlainObject(data.configuration?.configuration),
+        load: async () => ({ ...exportHeader('aggregationConfiguration'), configuration: await fetchFromGateway(AGGREGATION_PATH) }),
+        plan(data, current) {
+            const wanted = data.configuration.configuration;
+            const here = current.configuration?.configuration ?? {};
+            return {
+                parts: [{ key: 'aggregation', label: 'Automatic aggregation and suggestions',
+                    changes: keyChanges(wanted, here, Object.keys(wanted)) }],
+                notes: [],
+                steps: () => [{ name: 'Automatic aggregation and suggestions', run: () => sendToGateway(AGGREGATION_PATH, 'POST',
+                    { configuration: wanted, redetermineSuggestionsStatus: current.configuration?.redetermineSuggestionsStatus ?? null }) }],
+            };
+        },
+    };
+
+    // The person lifecycle: the days before each event
+    const LIFECYCLE_PATH = '/service/provisioning-pipeline/api/person-lifecycle';
+    const LIFECYCLE_IMPORT = {
+        contents: 'personLifecycle',
+        title: 'Import person lifecycle',
+        label: 'Person lifecycle',
+        valid: (data) => Array.isArray(data.configuration),
+        load: async () => ({ ...exportHeader('personLifecycle'), configuration: await fetchFromGateway(LIFECYCLE_PATH) }),
+        plan(data, current) {
+            const wanted = data.configuration.filter(isPlainObject);
+            const here = Array.isArray(current.configuration) ? current.configuration : [];
+            const changes = [...new Set([...wanted, ...here].map(c => c.eventType))].flatMap(type => {
+                const mine = wanted.find(c => c.eventType === type);
+                const theirs = here.find(c => c.eventType === type);
+                return sameJson(mine?.daysBefore, theirs?.daysBefore) ? []
+                    : [`event ${type}: days before ${theirs?.daysBefore ?? '-'} -> ${mine?.daysBefore ?? '-'}`];
+            });
+            return {
+                parts: [{ key: 'lifecycle', label: 'Days before the events', changes }],
+                notes: [],
+                steps: () => [{ name: 'Person lifecycle', run: () => sendToGateway(LIFECYCLE_PATH, 'POST', { configurations: wanted }) }],
+            };
+        },
+    };
+
+    // Persons excluded from provisioning: found by ID, else by external ID.
+    // Persons excluded here that the file doesn't have are only included
+    // again when that is ticked.
+    const VAULT_PERSONS_PATH = (included) => '/service/provisioning-integration/api/vault/latest/persons' +
+        `?skip=0&take=${SETTINGS.fetchAllTake}&search=&includedOnly=${included}&excludedOnly=${!included}`;
+    const PERSON_PATH = (action, id) => `/service/provisioning-integration/api/vault/latest/person/${action}?personId=${encodeURIComponent(id)}`;
+    const EXCLUDED_PERSONS_IMPORT = {
+        contents: 'excludedPersons',
+        title: 'Import excluded persons',
+        label: 'Excluded persons',
+        valid: (data) => Array.isArray(data.persons),
+        load: async () => ({ ...exportHeader('excludedPersons'), persons: rowsOf(await fetchFromGateway(VAULT_PERSONS_PATH(false))) }),
+        async plan(data, current) {
+            const excluded = current.persons;
+            const included = rowsOf(await fetchFromGateway(VAULT_PERSONS_PATH(true)));
+            const matches = (a, b) => a.personId === b.personId || (a.externalId && a.externalId === b.externalId);
+            const label = (p) => `${p.displayName ?? '?'}${p.externalId && !String(p.displayName).includes(p.externalId) ? ` (${p.externalId})` : ''}`;
+            const fileOnes = data.persons.filter(isPlainObject);
+            const toExclude = [];
+            const notHere = [];
+            fileOnes.forEach(p => {
+                if (excluded.some(e => matches(e, p))) return;
+                const found = included.find(i => i.personId === p.personId) ?? included.find(i => p.externalId && i.externalId === p.externalId);
+                if (found) toExclude.push(found);
+                else notHere.push(label(p));
+            });
+            const toInclude = excluded.filter(e => !fileOnes.some(p => matches(e, p)));
+            return {
+                parts: [
+                    { key: 'exclude', label: 'Exclude the persons of the file', changes: toExclude.map(p => `exclude ${label(p)}`) },
+                    // ("Overwrite all" does this without asking: the environment as in the file)
+                    { key: 'include', label: 'Include again the persons excluded here that the file does not have',
+                        changes: toInclude.map(p => `include ${label(p)}`) },
+                ],
+                notes: notHere.length ? [`not in this HelloID environment, so not excluded: ${notHere.join(', ')}`] : [],
+                steps: (chosen) => [
+                    ...(chosen.has('exclude') ? toExclude.map(p => ({ name: `Exclude ${label(p)}`,
+                        run: () => sendToGateway(PERSON_PATH('exclude', p.personId), 'PUT', {}) })) : []),
+                    ...(chosen.has('include') ? toInclude.map(p => ({ name: `Include ${label(p)}`,
+                        run: () => sendToGateway(PERSON_PATH('include', p.personId), 'PUT', {}) })) : []),
+                ],
+            };
+        },
+    };
+
+    // Reconciliation: the schedule, and the automatic actions per system
+    // (systems by ID or name). The exclusions can't be imported: HelloID
+    // makes those from the reports.
+    const RECONCILIATION_SCHEDULE_PATH = '/service/scheduler/api/schedule/reconciliation/configuration';
+    const RECONCILIATION_SYSTEMS_PATH = '/service/reconciliation/api/report/system-configuration';
+    const RECONCILIATION_SCHEDULE_KEYS = ['enabled', 'scheduledOnDay', 'scheduledOnHour'];
+    const RECONCILIATION_IMPORT = {
+        contents: 'reconciliationConfiguration',
+        title: 'Import reconciliation configuration',
+        label: 'Reconciliation configuration',
+        valid: (data) => isPlainObject(data.schedule) || Array.isArray(data.systemConfiguration),
+        load: async (ctx) => {
+            const [schedule, systemConfiguration, exclusions] = await Promise.all([
+                fetchFromGateway(RECONCILIATION_SCHEDULE_PATH),
+                fetchFromGateway(RECONCILIATION_SYSTEMS_PATH),
+                sendToGateway('/service/reconciliation/api/exclusions?forBulkActions=false', 'POST',
+                    { search: '', filters: [], skip: 0, take: SETTINGS.fetchAllTake }).catch(() => null),
+            ]);
+            const ids = rowsOf(systemConfiguration).map(s => s.systemId);
+            return { ...exportHeader('reconciliationConfiguration'), schedule, systemConfiguration, exclusions,
+                systems: ids.map(id => ({ systemId: id, displayName: ctx.systems.nameOf(id) })) };
+        },
+        plan(data, current, ctx) {
+            const notes = [];
+            const schedule = isPlainObject(data.schedule) ? data.schedule : null;
+            const here = rowsOf(current.systemConfiguration);
+            const wanted = [];
+            (Array.isArray(data.systemConfiguration) ? data.systemConfiguration : []).filter(isPlainObject).forEach(entry => {
+                const name = fileSystemName(data, entry.systemId);
+                const system = ctx.systems.find(entry.systemId, name);
+                if (!system) notes.push(`"${name ?? entry.systemId}" is not in this HelloID environment: left out`);
+                else wanted.push({ ...entry, systemId: system.systemId });
+            });
+            const nameOf = (id) => `"${ctx.systems.nameOf(id) ?? id}"`;
+            const actions = ['automaticAccountCreate', 'automaticAccountEnable', 'automaticPermissionAdd'];
+            const systemChanges = [
+                ...wanted.flatMap(w => {
+                    const h = here.find(x => x.systemId === w.systemId);
+                    return !h ? [`${nameOf(w.systemId)} (new)`] : keyChanges(w, h, actions).map(c => `${nameOf(w.systemId)}: ${c}`);
+                }),
+                ...here.filter(h => !wanted.some(w => w.systemId === h.systemId)).map(h => `${nameOf(h.systemId)} (removed)`),
+            ];
+            const exclusions = rowsOf(data.exclusions);
+            if (exclusions.length) notes.push(`the ${exclusions.length} exclusion(s) of the file can't be imported: HelloID makes them from the reports`);
+            return {
+                parts: [
+                    ...(schedule ? [{ key: 'schedule', label: 'Schedule',
+                        changes: keyChanges(schedule, current.schedule, RECONCILIATION_SCHEDULE_KEYS) }] : []),
+                    ...(Array.isArray(data.systemConfiguration) ? [{ key: 'systems', label: 'Systems and their automatic actions', changes: systemChanges }] : []),
+                ],
+                notes,
+                steps: (chosen) => {
+                    const source = chosen.has('schedule') ? schedule : current.schedule;
+                    const systems = chosen.has('systems') ? wanted : here;
+                    return [
+                        ...(chosen.has('systems') ? here.filter(h => !wanted.some(w => w.systemId === h.systemId)).map(h => ({
+                            name: `Remove ${nameOf(h.systemId)}`,
+                            run: () => sendToGateway(`${RECONCILIATION_SYSTEMS_PATH}/${encodeURIComponent(h.systemId)}`, 'DELETE'),
+                        })) : []),
+                        { name: 'Schedule and systems', run: () => sendToGateway(RECONCILIATION_SCHEDULE_PATH, 'POST', {
+                            ...Object.fromEntries(RECONCILIATION_SCHEDULE_KEYS.map(k => [k, source?.[k] ?? null])),
+                            enabled: source?.enabled === true,
+                            clientTimeZone: browserZone(),
+                            scheduleStatus: null,
+                            scheduledOn: null,
+                            selectedSystems: systems.map(s => s.systemId),
+                        }) },
+                        ...(chosen.has('systems') ? [{ name: 'Automatic actions per system',
+                            run: () => sendToGateway(RECONCILIATION_SYSTEMS_PATH, 'POST', wanted.map(w => ({
+                                systemId: w.systemId, ...Object.fromEntries(actions.map(a => [a, w[a] === true])) }))) }] : []),
+                    ];
+                },
+            };
+        },
+    };
+
+    const SETTING_IMPORTS = [SOURCE_CONFIGURATION_IMPORT, AGGREGATION_IMPORT, LIFECYCLE_IMPORT, EXCLUDED_PERSONS_IMPORT, RECONCILIATION_IMPORT];
+
+    // --- Any export file ---
+    // What a file is: its "contents", or a target system export (which has
+    // none); null for anything else
+    function importKind(data) {
+        if (!isPlainObject(data)) return null;
+        if (!data.contents && isPlainObject(data.configuration) && typeof data.templateIdentifier === 'string') return 'targetSystem';
+        return typeof data.contents === 'string' ? data.contents : null;
+    }
+    // The order in which a batch imports: what others point at comes first
+    const IMPORT_ORDER = ['targetSystem', 'sourceSystem', 'notificationSystem', 'customEvent', 'notifications', 'businessRule',
+        'toxicPolicy', 'schedule', 'sourceConfiguration', 'aggregationConfiguration', 'personLifecycle', 'excludedPersons',
+        'reconciliationConfiguration'];
+    const SINGLE_IMPORTS = {
+        targetSystem: (data) => importData(data),
+        sourceSystem: (data) => importSourceSystemData(data),
+        notificationSystem: (data) => importNotificationSystemData(data),
+        notifications: (data) => importNotificationsData(data),
+    };
+
+    const KIND_LABELS = {
+        targetSystem: 'Target systems', sourceSystem: 'Source systems', notificationSystem: 'Notification systems',
+        customEvent: 'Custom events', notifications: 'Notifications', businessRule: 'Business rules',
+        toxicPolicy: 'Toxic policies', schedule: 'Schedules', sourceConfiguration: 'Source configuration',
+        aggregationConfiguration: 'Aggregation configuration', personLifecycle: 'Person lifecycle',
+        excludedPersons: 'Excluded persons', reconciliationConfiguration: 'Reconciliation configuration',
+    };
+
+    // --- Overwrite all (the menu, several files) ---
+    // Every file is read and compared first, without writing anything. The
+    // special cases are chosen in one dialog, and all changes are shown in
+    // one overview. After a confirmation, a backup of everything that will
+    // be touched is downloaded, and then everything is imported, the
+    // overview showing how each item goes. A failure doesn't stop the
+    // others; what needs an item that failed is not done.
+
+    // What the imports get instead of their dialogs:
+    //   plan: only work out what would change (nothing is written)
+    //   decide(key, spec): the answer to a special case; spec: section,
+    //       item, detail, options [{ value, label, description }], default.
+    //       Each one is collected for the decisions dialog.
+    //   pending(kind, name): is it made earlier in this run (kind: system,
+    //       customEvent)? need(name): this item needs it
+    //   skip(reason), same(), planned({ lines, notes, isNew, name, id, ids }):
+    //       what an import answers instead of doing it
+    function makeAuto({ plan, answers = {}, pending = () => false }) {
+        const auto = {
+            plan,
+            decisions: [],
+            needs: new Set(),
+            decide(key, spec) {
+                if (!auto.decisions.some(d => d.key === key)) auto.decisions.push({ key, ...spec });
+                return key in answers ? answers[key] : spec.default;
+            },
+            pending: (kind, name) => plan && pending(kind, name),
+            need: (name) => { if (name) auto.needs.add(name); },
+            skip: (reason) => ({ skip: reason }),
+            same: () => ({ same: true }),
+            planned: (result) => ({ planned: result }),
+        };
+        return auto;
+    }
+    // The progress of an import that runs within the overview
+    const quietProgress = () => ({ set() {}, failBusy() {}, close() {}, finish: async () => {} });
+
+    // A line of the overview, from what an import answered (see makeAuto).
+    // status: todo (⏳), same (✅), note (⚠️: done with a note), skip (❌)
+    function overviewEntry(result, base) {
+        const lines = (texts) => (texts ?? []).flatMap(text => withoutMarks(String(text)).split('\n'))
+            .map(text => text.trimEnd()).filter(text => text.trim());
+        if (result?.error) return { ...base, status: 'skip', details: lines([result.error]) };
+        if (result?.skip) return { ...base, status: 'skip', details: lines([result.skip]) };
+        if (result?.same || !result?.planned) return { ...base, status: 'same', details: ['already as in the file'], run: null };
+        const notes = lines(result.planned.notes);
+        return { ...base, status: notes.length ? 'note' : 'todo', details: [...lines(result.planned.lines), ...notes] };
+    }
+
+    // The imports that have their own dialogs (one file at a time): planned
+    // with auto.plan, then run again with auto (checked again just before
+    // it is written)
+    function singlePlanner(group, importer, { nameOf, backup }) {
+        return async (files, batch) => {
+            const entries = [];
+            for (const file of files) {
+                const auto = makeAuto({ plan: true, answers: batch.answers, pending: batch.pending });
+                let result;
+                try { result = await importer(file.data, auto); } catch (e) { result = { error: String(e?.message ?? e) }; }
+                batch.decisions.push(...auto.decisions);
+                const planned = result?.planned;
+                entries.push(overviewEntry(result, {
+                    group,
+                    // (a file of notifications says per notification whether it is new)
+                    label: `"${nameOf(file.data)}"${planned?.isNew === true ? ' (new)' : planned?.isNew === false ? ' (overwrite)' : ''}`,
+                    provides: nameOf(file.data),
+                    needs: [...auto.needs],
+                    backup: planned && !planned.isNew ? () => backup(planned, file.data) : null,
+                    run: async () => {
+                        const answer = await importer(file.data, makeAuto({ plan: false, answers: batch.answers }));
+                        if (answer?.skip) throw new Error(answer.skip);
+                        return [];
+                    },
+                }));
+            }
+            return entries;
+        };
+    }
+
+    // Rules, toxic policies, custom events, schedules: as importItems, all
+    // files of a type together
+    function itemsPlanner(type) {
+        return async (files, batch) => {
+            const ctx = { ...await type.context(), pending: batch.pending };
+            const here = await type.list(ctx);
+            const plans = [];
+            for (const { data } of files) {
+                const item = type.item(data);
+                const match = here.find(h => type.idOf(h) && type.idOf(h) === type.idOf(item)) ??
+                    here.find(h => sameText(type.nameOf(h), type.nameOf(item))) ?? null;
+                const needs = [];
+                ctx.need = (name) => { if (name && !needs.includes(name)) needs.push(name); };
+                plans.push({ data, item, match, needs, label: `"${type.nameOf(item)}"`, ...await type.prepare(data, match, ctx) });
+            }
+            // A type HelloID allows only so many of: the user chooses for
+            // each new one that has no room
+            if (type.limit) {
+                const newOnes = plans.filter(p => !p.blocked && !p.match);
+                let room = type.limit - here.length;
+                if (newOnes.length > room) {
+                    const taken = new Set();
+                    for (const plan of newOnes) {
+                        const options = [
+                            ...(room > 0 ? [{ value: 'add', label: 'Add it', description: `${room} place(s) left of ${type.limit}.` }] : []),
+                            ...here.map(h => ({ value: `replace:${type.idOf(h)}`, label: `Replace "${type.nameOf(h)}"`,
+                                description: `"${type.nameOf(h)}" is overwritten with the one of the file.` })),
+                            { value: 'skip', label: 'Skip it', description: 'It is not imported.' },
+                        ];
+                        const answer = batch.decide(`limit:${type.contents}:${type.idOf(plan.item) ?? type.nameOf(plan.item)}`, {
+                            section: `More than ${type.limit} ${type.plural.toLowerCase()} (the most HelloID allows)`,
+                            item: `${plan.label} from the file`,
+                            options,
+                            default: options[0].value === 'add' ? 'add' : 'skip',
+                        });
+                        if (answer === 'add' && room > 0) {
+                            room--;
+                        } else if (typeof answer === 'string' && answer.startsWith('replace:') && !taken.has(answer)) {
+                            taken.add(answer);
+                            const replaced = here.find(h => `replace:${type.idOf(h)}` === answer);
+                            ctx.need = (name) => { if (name && !plan.needs.includes(name)) plan.needs.push(name); };
+                            Object.assign(plan, { match: replaced, replaces: type.nameOf(replaced) }, await type.prepare(plan.data, replaced, ctx));
+                        } else {
+                            plan.blocked = answer === 'add' ? `no room: HelloID allows at most ${type.limit}` : 'skipped';
+                        }
+                    }
+                }
+            }
+            // At run time: the context again (systems made earlier in this
+            // run are there by then), the item here again, and its changes
+            let runCtx = null;
+            const freshCtx = () => (runCtx ??= type.context());
+            return plans.map(plan => {
+                const how = plan.replaces ? `replaces "${plan.replaces}"` : plan.match ? 'overwrite' : 'new';
+                const result = plan.blocked ? { skip: plan.blocked }
+                    : plan.match && !plan.changes.length && !plan.problems.length ? { same: true }
+                    : { planned: { lines: plan.changes,
+                        notes: [...plan.problems.map(text => `left out: ${text}`), ...plan.notes] } };
+                return overviewEntry(result, {
+                    group: KIND_LABELS[type.contents],
+                    label: `${plan.label} (${how})`,
+                    provides: type.nameOf(plan.item),
+                    needs: plan.needs,
+                    backup: plan.match && !plan.blocked ? () => type.backup(plan.match, ctx) : null,
+                    run: async () => {
+                        const fresh = await freshCtx();
+                        const hereNow = await type.list(fresh);
+                        const matchNow = plan.replaces ? hereNow.find(h => type.idOf(h) === type.idOf(plan.match))
+                            : hereNow.find(h => type.idOf(h) && type.idOf(h) === type.idOf(plan.item)) ??
+                              hereNow.find(h => sameText(type.nameOf(h), type.nameOf(plan.item))) ?? null;
+                        const now = await type.prepare(plan.data, matchNow, fresh);
+                        if (now.blocked) throw new Error(now.blocked);
+                        if (matchNow && !now.changes.length) return [];
+                        await type.write({ ...now, match: matchNow }, fresh);
+                        return [...now.problems.map(text => `left out: ${text}`), ...now.notes];
+                    },
+                });
+            });
+        };
+    }
+
+    // The settings pages: their opt-in parts are special cases
+    function settingPlanner(type) {
+        return async (files, batch) => {
+            const entries = [];
+            for (const { data } of files) {
+                try {
+                    const ctx = { systems: await systemDirectory() };
+                    const current = await type.load(ctx);
+                    const plan = await type.plan(data, current, ctx);
+                    const chosen = plan.parts.filter(part => part.changes.length).filter(part => !part.optIn ||
+                        batch.decide(`${type.contents}:${part.key}`, {
+                            section: part.optIn.section,
+                            item: part.changes.join('\n'),
+                            options: part.optIn.options,
+                            default: true,
+                        }) === true);
+                    const keys = new Set(chosen.map(part => part.key));
+                    const result = !chosen.length ? (plan.notes.length ? { planned: { lines: [], notes: plan.notes } } : { same: true })
+                        : { planned: { lines: chosen.flatMap(part => [`${part.label}:`, ...part.changes.map(c => `  - ${c}`)]),
+                            notes: plan.notes } };
+                    entries.push(overviewEntry(result, {
+                        group: KIND_LABELS[type.contents],
+                        label: type.label,
+                        needs: [],
+                        backup: chosen.length ? async () => current : null,
+                        run: chosen.length ? async () => {
+                            // (as it is now, with the parts chosen in the overview)
+                            const ctxNow = { systems: await systemDirectory() };
+                            const planNow = await type.plan(data, await type.load(ctxNow), ctxNow);
+                            for (const step of planNow.steps(keys)) await step.run();
+                            return [];
+                        } : null,
+                    }));
+                } catch (e) {
+                    entries.push(overviewEntry({ error: String(e?.message ?? e) }, { group: KIND_LABELS[type.contents], label: type.label, needs: [] }));
+                }
+            }
+            return entries;
+        };
+    }
+
+    const notificationNames = (data) => (data.notifications ?? []).filter(isPlainObject).map(n => n.name).join('", "');
+    const PLANNERS = {
+        targetSystem: singlePlanner(KIND_LABELS.targetSystem, (data, auto) => importData(data, { auto }), {
+            nameOf: (data) => data.displayName ?? data.configuration?.displayName ?? '?',
+            backup: (planned) => collectSystemExport(String(planned.name).trim()),
+        }),
+        sourceSystem: singlePlanner(KIND_LABELS.sourceSystem, (data, auto) => importSourceSystemData(data, { auto }), {
+            nameOf: (data) => data.system?.displayName ?? '?',
+            backup: (planned) => collectSourceSystemExport(planned.id),
+        }),
+        notificationSystem: singlePlanner(KIND_LABELS.notificationSystem, (data, auto) => importNotificationSystemData(data, { auto }), {
+            nameOf: (data) => data.system?.displayName ?? '?',
+            backup: (planned) => collectNotificationSystemExport(planned.id),
+        }),
+        notifications: singlePlanner(KIND_LABELS.notifications, (data, auto) => importNotificationsData(data, { auto }), {
+            nameOf: notificationNames,
+            backup: (planned) => (planned.ids.length ? collectNotificationsExport(planned.ids) : null),
+        }),
+        ...Object.fromEntries(ITEM_IMPORTS.map(type => [type.contents, itemsPlanner(type)])),
+        ...Object.fromEntries(SETTING_IMPORTS.map(type => [type.contents, settingPlanner(type)])),
+    };
+
+    // The special cases, all in one dialog: per case its options, each
+    // with what it does. Resolves to { key: value }, or null (cancelled).
+    function chooseDecisions(decisions) {
+        return new Promise(resolve => {
+            addStyles();
+            const dialog = make('dialog', { className: `${DIALOG_CLASS} tm-choose` });
+            const body = make('div', { className: 'tm-dialog-content' },
+                make('pre', {}, 'These need a choice before the overview. What is chosen applies to this import only.'));
+            const picks = [];
+            const sections = [...new Set(decisions.map(d => d.section))];
+            sections.forEach(section => {
+                const box = make('div', { className: 'tm-choose-group' }, make('strong', {}, section));
+                decisions.filter(d => d.section === section).forEach(decision => {
+                    const radioName = `tm-decision-${Math.random().toString(36).slice(2)}`;
+                    const item = make('div', { className: 'tm-decision' },
+                        make('div', {}, decision.item),
+                        decision.detail ? make('pre', { className: 'text-muted' }, decision.detail) : null);
+                    decision.options.forEach((option, i) => {
+                        const radio = make('input', { type: 'radio', name: radioName, checked: option.value === decision.default });
+                        radio.addEventListener('change', () => { picks.find(p => p.key === decision.key).index = i; });
+                        item.appendChild(make('label', { className: 'tm-choose-item' }, radio, ` ${option.label}`,
+                            option.description ? make('small', { className: 'text-muted' }, ` ${option.description}`) : null));
+                    });
+                    picks.push({ key: decision.key, options: decision.options,
+                        index: Math.max(0, decision.options.findIndex(o => o.value === decision.default)) });
+                    box.appendChild(item);
+                });
+                body.appendChild(box);
+            });
+            let answer = null;
+            const cancel = make('button', { type: 'button', className: 'btn btn-sm btn-default' }, 'Cancel');
+            const next = make('button', { type: 'button', className: 'btn btn-sm btn-primary' }, 'Next');
+            cancel.addEventListener('click', () => dialog.close());
+            next.addEventListener('click', () => {
+                answer = Object.fromEntries(picks.map(p => [p.key, p.options[p.index].value]));
+                dialog.close();
+            });
+            dialog.addEventListener('close', () => {
+                dialog.remove();
+                resolve(answer);
+            });
+            dialog.addEventListener('keydown', (e) => e.stopPropagation());
+            dialog.append(make('h5', {}, 'Overwrite all: special cases'), body,
+                make('div', { className: 'tm-dialog-footer' }, make('span', { style: 'margin-right: auto' }), cancel, next));
+            document.body.appendChild(dialog);
+            dialog.showModal();
+            body.focus();
+        });
+    }
+
+    // All changes in one card: first to confirm, then how they go.
+    //   confirmed: resolves to true (Confirm) or false (Cancel)
+    //   render():  shows the entries as they are now
+    //   finish(message): the closing text; resolves when it is closed
+    const OVERVIEW_ICONS = { todo: '⏳', running: '⏳', same: '✅', done: '✅', note: '⚠️', skip: '❌', failed: '❌' };
+
+    function showOverview(title, intro, entries) {
+        let closing = '';
+        const text = () => intro + [...new Set(entries.map(e => e.group))].map(group => `\n\n${strong(group)}\n` +
+            entries.filter(e => e.group === group).map(e => {
+                const line = [`${OVERVIEW_ICONS[e.status]} ${e.label}${e.status === 'running' ? ' (busy)' : ''}`,
+                    ...e.details.map(detail => `      ${detail}`)].join('\n');
+                return ['skip', 'failed'].includes(e.status) ? error(line) : e.status === 'note' ? warn(line) : line;
+            }).join('\n')).join('') + closing;
+
+        const dialog = make('dialog', { className: DIALOG_CLASS });
+        const body = make('pre', { tabIndex: 0 });
+        const render = () => renderMessage(body, text());
+        const copy = make('button', { type: 'button', className: 'btn btn-sm btn-primary tm-dialog-copy' }, 'Copy text');
+        copy.style.marginRight = 'auto';
+        copy.addEventListener('click', async () => {
+            copy.textContent = await copyToClipboard(withoutMarks(text())) ? 'Copied' : 'Copy failed';
+            setTimeout(() => { copy.textContent = 'Copy text'; }, SETTINGS.copyFeedbackMs);
+        });
+        const cancel = make('button', { type: 'button', className: 'btn btn-sm btn-default' }, 'Cancel');
+        const confirm = make('button', { type: 'button', className: 'btn btn-sm btn-primary' }, 'Confirm and import');
+        const close = make('button', { type: 'button', className: 'btn btn-sm btn-primary', hidden: true, disabled: true }, 'Close');
+        let running = false;
+        let resolveConfirmed;
+        const confirmed = new Promise(resolve => { resolveConfirmed = resolve; });
+        cancel.addEventListener('click', () => dialog.close());
+        confirm.addEventListener('click', () => {
+            running = true;
+            cancel.hidden = true;
+            confirm.hidden = true;
+            close.hidden = false;
+            resolveConfirmed(true);
+        });
+        close.addEventListener('click', () => dialog.close());
+        dialog.addEventListener('cancel', (e) => { if (running) e.preventDefault(); });
+        dialog.addEventListener('keydown', (e) => e.stopPropagation());
+        const closed = new Promise(resolve => dialog.addEventListener('close', () => {
+            dialog.remove();
+            resolveConfirmed(false);
+            resolve();
+        }));
+        dialog.append(make('h5', {}, title), body, make('div', { className: 'tm-dialog-footer' }, copy, cancel, confirm, close));
+        render();
+        addStyles();
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        body.focus();
+        if (!entries.some(e => ['todo', 'note'].includes(e.status))) confirm.disabled = true; // nothing to do
+        else if (hasWarnings(text())) holdButtons([confirm]);
+        return {
+            confirmed,
+            render,
+            finish(message) {
+                closing = `\n\n${message}`;
+                render();
+                close.disabled = false;
+                close.focus();
+                return closed;
+            },
+        };
+    }
+
+    async function overwriteAll(files, kinds) {
+        // What this run makes, by name: what points at it is found when it is written
+        const pendingNames = { system: new Set(), customEvent: new Set() };
+        files.forEach(({ kind, data }) => {
+            const name = kind === 'targetSystem' ? data.displayName ?? data.configuration?.displayName
+                : ['sourceSystem'].includes(kind) ? data.system?.displayName
+                : kind === 'customEvent' ? data.customEvent?.name : null;
+            if (typeof name === 'string') pendingNames[kind === 'customEvent' ? 'customEvent' : 'system'].add(name.trim());
+        });
+        const pending = (kind, name) => typeof name === 'string' && pendingNames[kind]?.has(name.trim());
+
+        const planAll = async (answers) => {
+            const decisions = [];
+            const decide = (key, spec) => {
+                if (!decisions.some(d => d.key === key)) decisions.push({ key, ...spec });
+                return key in answers ? answers[key] : spec.default;
+            };
+            const reading = showProgress('Overwrite all: reading what is here (nothing is changed yet)',
+                kinds.map(kind => KIND_LABELS[kind] ?? kind));
+            const entries = [];
+            for (const [i, kind] of kinds.entries()) {
+                reading.set(i, 'busy');
+                try {
+                    entries.push(...await PLANNERS[kind](files.filter(f => f.kind === kind), { answers, decisions, decide, pending }));
+                    reading.set(i, 'done');
+                } catch (e) {
+                    entries.push(overviewEntry({ error: String(e?.message ?? e) }, { group: KIND_LABELS[kind] ?? kind, label: 'these files', needs: [] }));
+                    reading.set(i, 'failed');
+                }
+            }
+            reading.close();
+            return { entries, decisions };
+        };
+
+        let { entries, decisions } = await planAll({});
+        if (decisions.length) {
+            const answers = await chooseDecisions(decisions);
+            if (!answers) return false;
+            if (decisions.some(d => !sameJson(answers[d.key], d.default))) ({ entries } = await planAll(answers));
+        }
+
+        const intro = 'All changes of this import. ⏳ will be done, ✅ already as in the file, ⚠️ will be done with a note, ' +
+                      '❌ will not be done. Nothing is written before you confirm; a backup of everything that is touched ' +
+                      'is downloaded first.';
+        const overview = showOverview('Overwrite all', intro, entries);
+        if (!await overview.confirmed) return false;
+
+        // The backup of everything that will be touched, before anything is written
+        const backup = { group: 'Backup', label: 'Backup of everything that will be touched', status: 'running', details: [] };
+        entries.unshift(backup);
+        overview.render();
+        const toDo = entries.filter(e => e !== backup && ['todo', 'note'].includes(e.status));
+        try {
+            const exports = [];
+            for (const entry of toDo.filter(e => e.backup)) {
+                const file = await entry.backup();
+                if (file) exports.push(file);
+            }
+            downloadFile(JSON.stringify({ ...exportHeader('backups'), files: exports }, null, 2),
+                `Overwrite all - backup before import - ${isoDate()}.json`);
+            Object.assign(backup, { status: 'done', details: [`${exports.length} item(s), downloaded`] });
+        } catch (e) {
+            Object.assign(backup, { status: 'failed', details: [String(e?.message ?? e)] });
+            toDo.forEach(entry => Object.assign(entry, { status: 'skip', details: ['not done: the backup failed'] }));
+            await overview.finish(error('Nothing was imported, as the backup could not be made.'));
+            return false;
+        }
+
+        importBatch = { reload: false };
+        const failed = new Set();
+        try {
+            for (const entry of toDo) {
+                const missing = (entry.needs ?? []).filter(name => failed.has(name));
+                if (missing.length) {
+                    Object.assign(entry, { status: 'failed', details: [`not done: it needs "${missing.join('", "')}", which failed`] });
+                    if (entry.provides) failed.add(entry.provides);
+                    overview.render();
+                    continue;
+                }
+                entry.status = 'running';
+                overview.render();
+                try {
+                    const notes = (await entry.run?.()) ?? [];
+                    Object.assign(entry, notes.length ? { status: 'note', details: notes } : { status: 'done' });
+                } catch (e) {
+                    Object.assign(entry, { status: 'failed', details: [String(e?.message ?? e)] });
+                    if (entry.provides) failed.add(entry.provides);
+                }
+                overview.render();
+            }
+            const count = (status) => toDo.filter(e => e.status === status).length;
+            await overview.finish(`Import finished: ${count('done') + count('note')} done (${count('note')} with a note), ` +
+                `${count('failed')} failed.` + (count('failed') ? error('\nSee the ❌ lines above.') : '') +
+                '\n\nNew items that can be switched on start disabled; business rules are saved as drafts. ' +
+                'The page reloads when you close this message.');
+        } finally {
+            importBatch = null;
+        }
+        location.reload();
+        return true;
+    }
+
+    // Picks files and imports each; only: the kinds this page imports
+    async function importFiles(only = null) {
+        if (!gateway) throw new Error('No request of HelloID seen yet. Open a page of HelloID Provisioning, wait until it has loaded, and try again.');
+        const picked = await pickImportFiles();
+        if (!picked) return false;
+        const files = [];
+        const skipped = [];
+        for (const { name, text } of picked) {
+            let data;
+            try { data = JSON.parse(text); } catch { skipped.push(`${name}: not a valid JSON file`); continue; }
+            // A backup of an import: the files in it
+            const entries = data?.contents === 'backups' && Array.isArray(data.files) ? data.files.map((d, i) => [`${name} (${i + 1})`, d]) : [[name, data]];
+            for (const [entryName, entry] of entries) {
+                const kind = importKind(entry);
+                const known = kind && (IMPORT_ORDER.includes(kind));
+                const items = ITEM_IMPORTS.find(t => t.contents === kind);
+                const settings = SETTING_IMPORTS.find(t => t.contents === kind);
+                if (!known) skipped.push(`${entryName}: not an export file this script knows`);
+                else if (only && !only.includes(kind)) skipped.push(`${entryName}: not for this page`);
+                else if ((items && !items.valid(entry)) || (settings && !settings.valid(entry))) skipped.push(`${entryName}: the file is incomplete`);
+                else files.push({ name: entryName, data: entry, kind });
+            }
+        }
+        const skippedText = skipped.length ? warn(`\n\nSkipped:\n${skipped.map(s => `  - ${s}`).join('\n')}`) : '';
+        if (!files.length) {
+            await showDialog('Import', `Nothing to import.${skippedText}`);
+            return false;
+        }
+        const kinds = IMPORT_ORDER.filter(k => files.some(f => f.kind === k));
+        if (files.length > 1 || skipped.length) {
+            const summary = kinds.map(k => `  - ${KIND_LABELS[k] ?? k}: ${files.filter(f => f.kind === k).length} file(s)`).join('\n');
+            // (the page buttons: one by one only)
+            const answer = await showDialog('Import', `In this order:\n${summary}${skippedText}\n\n` +
+                (only ? 'Each import has its own choices and confirmation.'
+                    : 'One by one: each import has its own choices and confirmation.\n' +
+                      strong('Overwrite all: everything that matches is overwritten, and what does not match is made new, ' +
+                             'without asking per item.') + ' You choose the special cases once, then see all changes in one ' +
+                      'overview, and confirm them before anything is written.'),
+            { confirm: true, confirmLabel: 'One by one', alternative: only ? null : 'Overwrite all' });
+            if (!answer) return false;
+            if (answer === 'alternative') return overwriteAll(files, kinds);
+        }
+        importBatch = { reload: false };
+        try {
+            for (const kind of kinds) {
+                const ofKind = files.filter(f => f.kind === kind);
+                const items = ITEM_IMPORTS.find(t => t.contents === kind);
+                const settings = SETTING_IMPORTS.find(t => t.contents === kind);
+                const runs = items ? [() => importItems(items, ofKind)]
+                    : ofKind.map(f => () => (settings ? importSetting(settings, f.data) : SINGLE_IMPORTS[kind](f.data)));
+                for (const run of runs) {
+                    try {
+                        await run();
+                    } catch (e) {
+                        if (!e?.shown) await showDialog('Import failed', error(String(e?.message ?? e)));
+                        const last = kind === kinds[kinds.length - 1] && run === runs[runs.length - 1];
+                        if (!last && !await showDialog('Import', 'Go on with the other files?', { confirm: true })) return false;
+                    }
+                }
+            }
+        } finally {
+            const reload = importBatch.reload;
+            importBatch = null;
+            if (reload) location.reload();
+        }
+        return true;
+    }
+
+    // The browser opens a file picker only right after a click on the page:
+    // a click in the Tampermonkey menu doesn't count. So the menu opens a
+    // dialog first, and its button (a click on the page) opens the picker.
+    GM_registerMenuCommand('Import HelloID export files…', async () => {
+        try {
+            if (!gateway) throw new Error('No request of HelloID seen yet. Open a page of HelloID Provisioning, wait until it has loaded, and try again.');
+            if (!await showDialog('Import HelloID export files', 'Choose the export files to import: one file, or several at once ' +
+                '(e.g. all files of an export folder). Each file goes to its own import, with its own choices and confirmation.',
+            { confirm: true, confirmLabel: 'Choose files', confirmIcon: 'fa-solid fa-upload' })) return;
+            await importFiles();
+        } catch (e) {
+            if (!e?.shown) showDialog('Import failed', error(String(e?.message ?? e)));
+        }
+    });
+
+    // An Import button on the pages of these types, in the page's header
+    // (spot: where; the button is small, or "large" next to HelloID's
+    // full-size buttons), or else in the bottom right corner of the window
+    const headingOf = (selector) => () => {
+        const heading = document.querySelector(selector);
+        return heading && { el: heading, where: 'append' };
+    };
+    // Before HelloID's blue Add button (the button gets its size)
+    const beforeAdd = (selector) => () => {
+        const add = document.querySelector(selector);
+        return add && { el: add, where: 'before', like: add };
+    };
+    // The blue button with a + on a page we have no HTML of
+    const ADD_BUTTON = 'router-outlet ~ * button.btn-complete:has(i.fa-plus)';
+    const IMPORT_PAGES = [
+        { route: '#/source/aggregation/overview', tab: 'Configuration', kinds: ['aggregationConfiguration'], label: 'the aggregation configuration' },
+        { route: '#/source/schedules/overview', kinds: ['schedule'], label: 'schedules', spot: beforeAdd(ADD_BUTTON) },
+        ...['layers/displayName', 'layers/primaryContract', 'layers/primaryManager', 'custom-fields'].map(page => ({
+            route: `#/source/general/${page}/edit`, kinds: ['sourceConfiguration'], label: 'the source configuration',
+            // Before Cancel and Save
+            spot: () => {
+                const save = document.querySelector('[data-cy="display-name-layer-save"], [data-cy="custom-fields-save"]');
+                return save && { el: save.parentElement, where: 'prepend', large: true };
+            },
+        })),
+        { route: '#/business/rules', tab: 'Rules', orNoTab: true, kinds: ['businessRule'], label: 'business rules',
+            spot: beforeAdd('button[data-cy="add-rule"]') },
+        { route: '#/business/rules', tab: 'Toxic policy', kinds: ['toxicPolicy'], label: 'toxic policies',
+            spot: beforeAdd('helloid-toxic-combinations-grid button.btn-complete') },
+        { route: '#/business/exclusions', kinds: ['excludedPersons'], label: 'excluded persons',
+            spot: () => {
+                const heading = [...document.querySelectorAll('helloid-exclusions-overview h4')].find(h => /excluded/i.test(h.textContent));
+                return heading && { el: heading, where: 'append' };
+            } },
+        { route: '#/business/person-lifecycle', kinds: ['personLifecycle'], label: 'the person lifecycle',
+            spot: headingOf('helloid-person-lifecycle-configuration h4') },
+        { route: '#/business/custom-events', kinds: ['customEvent'], label: 'custom events',
+            spot: beforeAdd('helloid-custom-events-overview h4 ~ button.btn-complete') },
+        { route: '#/business/reconciliation', tab: 'Configuration', kinds: ['reconciliationConfiguration'], label: 'the reconciliation configuration',
+            // Before "Create report"
+            spot: () => {
+                const group = document.querySelector('helloid-reconciliation-overview h4 + div');
+                return group && { el: group, where: 'prepend', large: true };
+            } },
+    ];
+    const PAGE_IMPORT_ID = 'tm-page-import';
+
+    function importPage() {
+        const [route, query = ''] = location.hash.split('?');
+        const tab = new URLSearchParams(query).get('tab');
+        return IMPORT_PAGES.find(p => route === p.route && (!p.tab || tab === p.tab || (p.orNoTab && !tab))) ?? null;
+    }
+
+    function addPageImportButton() {
+        const page = importPage();
+        let btn = document.getElementById(PAGE_IMPORT_ID);
+        if (btn && btn.dataset.page !== page?.label) {
+            btn.remove();
+            btn = null;
+        }
+        if (!page) return;
+        if (!btn) {
+            btn = createActionButton('fa-solid fa-upload', `Import ${page.label} from exported JSON files`, () => importFiles(page.kinds));
+            btn.id = PAGE_IMPORT_ID;
+            btn.dataset.page = page.label;
+            btn.append(make('span', { className: 'tm-page-import-label' }, ' Import'));
+        }
+        const spot = page.spot?.();
+        // (Angular may render the header again: then it is put back)
+        if (spot) {
+            if (btn.isConnected && btn.tmSpot === spot.el) return;
+            btn.tmSpot = spot.el;
+            // Next to an Add button: its size, and the label only with its
+            // full size
+            const small = spot.like ? spot.like.classList.contains('btn-xs') : !spot.large;
+            btn.className = `btn ${small ? 'btn-xs ' : ''}btn-default` +
+                [...(spot.like?.classList ?? [])].filter(c => /^(m[tb]-|!?px-)/.test(c)).map(c => ` ${c}`).join('');
+            btn.removeAttribute('style');
+            if (spot.where === 'append') btn.style.marginLeft = '10px';
+            else btn.style.marginRight = '5px';
+            // A header that spreads its items out: keep it with the Add button
+            if (spot.where === 'before' && (spot.el.parentElement.classList.contains('justify-between') ||
+                /space-between/.test(getComputedStyle(spot.el.parentElement).justifyContent))) {
+                btn.style.marginLeft = 'auto';
+            }
+            btn.querySelector('.tm-page-import-label').hidden = small;
+            if (spot.where === 'before') spot.el.before(btn);
+            else if (spot.where === 'prepend') spot.el.prepend(btn);
+            else spot.el.append(btn);
+        } else if (!btn.isConnected || (btn.tmSpot && !btn.tmSpot.isConnected)) {
+            btn.tmSpot = null;
+            btn.className = 'btn btn-sm btn-default';
+            btn.querySelector('.tm-page-import-label').hidden = false;
+            Object.assign(btn.style, { position: 'fixed', right: '24px', bottom: '24px', zIndex: '1040', margin: '0',
+                boxShadow: '0 2px 8px rgba(0,0,0,.25)' });
+            document.body.appendChild(btn);
+        }
     }
 
     // =====================================================================
@@ -9628,6 +11223,7 @@
                 addGithubButton();
                 addNotificationButtons();
                 addSourceSystemButtons();
+                addPageImportButton();
                 addCloneLinks();
                 openPendingClone();
                 addRevealButtons();
