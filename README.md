@@ -34,6 +34,8 @@ On the **Target systems** overview, each system tile gets a copy button next to 
 
 On the **Business rules** overview, each rule name gets a copy button on the right side of the cell. Clicking it copies the rule name to your clipboard.
 
+On the **Logging** tab, the message of each row has a copy button too.
+
 ### Export a target system
 
 On the **Target systems** overview, each system has an export button (download icon). It saves one JSON file, named `<system name> - <system ID> - <date>.json`, with:
@@ -88,6 +90,32 @@ Besides the configuration, the import sets the agent selection, creates or updat
 - Permissions can only be linked once HelloID has retrieved them from the system. The import asks HelloID to do so and waits for them. A new system that was imported without its secrets can't retrieve anything yet: set the secrets and import the same file again.
 
 Secrets that were left out of the file keep the value the system already has; in a new system they are empty.
+
+#### Partial files
+
+A file made by hand or by another system can hold only what it changes. Give it `"partial": true` next to `templateIdentifier` and `systemId`:
+
+```json
+{
+  "partial": true,
+  "templateIdentifier": "<the type of the system, as in an export>",
+  "systemId": "<the ID of the system to update>",
+  "configuration": {
+    "scriptConfiguration": { "BaseUrl": "https://example.org" },
+    "scripts": { "accountUpdate": "..." },
+    "mappingConfiguration": { "fields": [ { "name": "mail", "type": 1, "mappingActions": [] } ] },
+    "correlationConfiguration": { "enabled": true, "accountFieldId": "mail", "personPropertyPath": "Person.ExternalId" }
+  }
+}
+```
+
+- What the file leaves out stays as it is: a part, a general setting, a script, or the uniqueness check.
+- **Configuration values** are merged key by key, also within groups.
+- **Mapping fields** are merged by name: a field the file has replaces the system's field of that name, as a whole, and a new name is added. Fields the file doesn't have stay; a partial file can't delete one.
+- Correlation and the unique fields can name their field by its name, by its ID in the file, or by its ID in the system.
+- Only the parts that differ are offered in the import dialog, and you still confirm the details first.
+
+This works for target systems. A partial file can't make lists shorter: thresholds, permissions, resources and depends-on systems are replaced as a whole when the file has them.
 
 ### Export and import notifications
 
@@ -146,14 +174,35 @@ A second script, which needs this one, moves PowerShell v2 systems for Microsoft
 
 ### Export without a browser (PowerShell)
 
-`Export-HelloIDTargetSystems.ps1` makes the same files as the Export button, for automation. It needs PowerShell 7.5 or later. It logs in with a local admin account through `/authentication/admlogin`, which must not have MFA, and uses the portal's own Bearer token. Then it exports all target systems, or only the ones you name:
+`Export-HelloID.ps1` exports the configuration of an environment, for automation and backups. It needs PowerShell 7.5 or later. It logs in with a local admin account through `/authentication/admlogin`, which must not have MFA, and uses the portal's own Bearer token.
+
+You name what to export. Types with names take one or more patterns: `*` for all, `*customer*` for the ones with "customer" in their name, or an exact name. The settings pages are switches. `-All` exports everything; without any of these, the script stops and lists them.
 
 ```powershell
-./Export-HelloIDTargetSystems.ps1 -Domain customer.helloid.com -OutputFolder D:\Exports
-./Export-HelloIDTargetSystems.ps1 -Domain customer.helloid.com -SystemName 'Microsoft Entra ID' -Credential $credential
+./Export-HelloID.ps1 -Domain customer.helloid.com -All -OutputFolder D:\Exports
+./Export-HelloID.ps1 -Domain customer.helloid.com -TargetSystems 'Microsoft Entra ID', *AFAS* -BusinessRules * -Credential $credential
+./Export-HelloID.ps1 -Domain customer.helloid.com -SourceSystems * -SourceConfiguration -PersonLifecycle
 ```
 
-Secrets are written as `***`, unless you add `-IncludeSecrets`. The script finds HelloID's provisioning API server itself; if that fails, give it with `-GatewayUrl`. It lists each file it wrote, and ends with exit code 1 when a system could not be exported.
+| Parameter | Subfolder | What a file has |
+|---|---|---|
+| `-TargetSystems` | `TargetSystems` | What the Export button saves: the configuration, agents, business rules, notifications and the systems that use it |
+| `-SourceSystems` | `SourceSystems` | What the Export button of a source system saves |
+| `-BusinessRules` | `BusinessRules` | One rule in full, published or draft, with the names of the systems of its entitlements |
+| `-ToxicPolicies` | `ToxicPolicies` | One toxic policy, with its entitlements |
+| `-CustomEvents` | `CustomEvents` | One custom event of the notifications, with the name of its system |
+| `-NotificationConfigurations` | `NotificationConfigurations` | One notification, as its Export button saves it |
+| `-NotificationSystems` | `NotificationSystems` | What the Export button of a notification system saves |
+| `-Schedules` | `Schedules` | One schedule of the snapshots, with its tasks, in the time zone of your computer |
+| `-SourceConfiguration` | `SourceConfiguration` | Primary contract, primary manager, display name and the custom fields |
+| `-AggregationConfiguration` | `AggregationConfiguration` | The settings of automatic aggregation and the suggestions |
+| `-PersonLifecycle` | `PersonLifecycle` | How many days before each lifecycle event |
+| `-ExcludedPersons` | `ExcludedPersons` | The persons excluded from provisioning. This is **personal data**. |
+| `-ReconciliationConfiguration` | `ReconciliationConfiguration` | The schedule, the automatic actions per system, and the exclusions |
+
+Files are named `<name> - <ID> - <date>.json`, or `<name> - <date>.json` for a settings page. IDs that point at systems come with their names, as IDs differ per environment. The files of target systems, source systems, notifications and notification systems are the same as those of the Export buttons, so the Import buttons read them. Importing the other types will come later.
+
+Secrets are written as `***`, unless you add `-IncludeSecrets`. The script finds HelloID's provisioning API server itself; if that fails, give it with `-GatewayUrl`. It lists each file it wrote, warns about an exact name that matches nothing, and ends with exit code 1 when something could not be exported.
 
 ### Settings
 

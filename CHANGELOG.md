@@ -2,6 +2,31 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-11-12.1
+
+### Export-HelloID.ps1: the whole environment
+
+`Export-HelloIDTargetSystems.ps1` is now `Export-HelloID.ps1`, and exports more than target systems:
+
+- **Types by name:** target systems, source systems, business rules, toxic policies, custom events, notification configurations, notification systems and schedules. Each takes name patterns, such as `-BusinessRules *customer*`, or `*` for all.
+- **Settings pages:** source configuration, aggregation, person lifecycle, excluded persons and reconciliation, each with a switch.
+- **`-All`** exports everything.
+- **Files:** one subfolder per type, and one file per item, named after it. Source systems, notifications and notification systems get the same files as their Export buttons.
+- **Changed:** `-SystemName` is replaced by `-TargetSystems`. The secrets of notification systems are now masked as the Export button masks them.
+
+### Import target system: partial files
+
+A file with `"partial": true` imports only what it has, so files made by other systems can change part of a system:
+
+- what the file leaves out keeps what the system has (parts, general settings, scripts);
+- configuration values are merged key by key;
+- mapping fields are merged by name: the file's fields replace those of the same name, and new ones are added;
+- correlation and the unique fields can name their field.
+
+### Other changes
+
+- **Logging tab:** a copy button on the message of each row.
+
 ## 2026-10-28.1
 
 ### Migration export: the handoff and the tool once, with the version

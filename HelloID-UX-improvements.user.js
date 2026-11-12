@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-10-28.1
+// @version      2026-11-12.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -1355,6 +1355,8 @@
         ...['Name', 'System'].map(header => ({ header, route: NOTIFICATIONS_ROUTE })),
         // Persons > Rules
         { header: 'Name', route: PERSON_RULES_ROUTE, requires: PERSON_RULES_GRID },
+        // Logging tab (Empty, Origin, Time, Message): the message of each row
+        { header: 'Message', route: 'tab=Logging', requires: 'Origin' },
     ];
 
     const headerTexts = (grid) => [...grid.querySelectorAll('.ag-header-cell')]
@@ -4231,6 +4233,51 @@
         }
         return result;
     }
+
+    // A file that says "partial": true (see partial in importData): its
+    // mapping fields are merged by name into those of the system (a field
+    // of the system that the file has is replaced, keeping its ID; a new
+    // one is added), and its configuration values key by key. The
+    // correlation and the unique fields may name a field by its ID in the
+    // file, its ID in the system, or its name.
+    function mergeByField(configuration, current, file) {
+        const result = { ...configuration };
+        if (isPlainObject(file.scriptConfiguration)) {
+            result.scriptConfiguration = mergeSettings(
+                isPlainObject(current.scriptConfiguration) ? current.scriptConfiguration : {}, file.scriptConfiguration);
+        }
+        const currentFields = current.mappingConfiguration?.fields ?? [];
+        const fileFields = Array.isArray(file.mappingConfiguration?.fields) ? file.mappingConfiguration.fields : null;
+        const fields = !fileFields ? currentFields : [
+            ...currentFields.map(field => {
+                const mine = fileFields.find(f => f.name === field.name);
+                return mine ? { ...mine, identifier: field.identifier } : field;
+            }),
+            ...fileFields.filter(f => !currentFields.some(c => c.name === f.name))
+                .map(f => ({ ...f, identifier: f.identifier ?? `new:${f.name}` })),
+        ];
+        const idOf = (ref) => {
+            if (ref === null || ref === undefined) return ref;
+            const name = fileFields?.find(f => f.identifier === ref)?.name ??
+                         currentFields.find(f => f.identifier === ref)?.name ?? ref;
+            return fields.find(f => f.name === name)?.identifier ?? ref;
+        };
+        result.mappingConfiguration = { ...result.mappingConfiguration, fields };
+        const unique = result.mappingConfiguration.uniquenessConfiguration;
+        if (Array.isArray(unique?.selectedUniqueFields)) {
+            result.mappingConfiguration.uniquenessConfiguration =
+                { ...unique, selectedUniqueFields: unique.selectedUniqueFields.map(idOf) };
+        }
+        if (isPlainObject(result.correlationConfiguration)) {
+            const correlation = result.correlationConfiguration;
+            result.correlationConfiguration = { ...correlation, accountFieldId: idOf(correlation.accountFieldId) };
+            if (correlation.enabled === true && !fields.some(f => f.identifier === result.correlationConfiguration.accountFieldId)) {
+                throw new Error(`Correlation is on, but its field (${correlation.accountFieldId}) is not in the file's ` +
+                                'mapping nor in the system\'s. Nothing was imported.');
+            }
+        }
+        return result;
+    }
     const GENERAL_FIELDS = ['displayName', 'description', 'icon', 'isDisabled', 'executeOnPremises',
         'limitConcurrentActionsConfiguration'];
     // For every type: these are stored apart from the type's configuration
@@ -5446,7 +5493,9 @@
     // into a new one when this environment doesn't have it.
     // options:
     //   partial: the file only has some parts: the others keep what the
-    //            system has (a file made from a GitHub repository)
+    //            system has (a file made from a GitHub repository, or a
+    //            file that says "partial": true; such a file also merges
+    //            its mapping fields and values, see mergeByField)
     //   confirmedNew: a new system was confirmed already: no question
     //   finishNote: added to the closing message
     //   forceNew: make a new system, also when the file's system is here
@@ -5456,6 +5505,9 @@
             throw new Error('The file is not an export of a target system.');
         }
         const steps = IMPORT_STEPS[data.templateIdentifier];
+        // (made by hand or by another system: only what it has is imported)
+        const byField = data.partial === true;
+        partial ||= byField;
         if (!steps) throw new Error(`Import is not supported for systems of type "${data.templateIdentifier}".`);
         // Older exports only have these inside the configuration
         const systemId = data.systemId ?? data.configuration.systemId;
@@ -5466,7 +5518,8 @@
         // its field in the file's own mapping
         const fileFields = data.configuration.mappingConfiguration?.fields ?? [];
         const fileCorrelation = data.configuration.correlationConfiguration;
-        if (fileCorrelation?.enabled === true &&
+        // (a partial file may point at a field of the system: see mergeByField)
+        if (!byField && fileCorrelation?.enabled === true &&
             !fileFields.some(f => f.identifier === fileCorrelation.accountFieldId)) {
             throw new Error('Correlation is on in the file, but its field (correlationConfiguration.accountFieldId: ' +
                             `${fileCorrelation.accountFieldId}) is not in the mapping of the file. ` +
@@ -5478,7 +5531,9 @@
         // else. First those with only a system of the same name here (it
         // is another system than the one of the file): use these, leave
         // them out, or stop.
-        const header = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}`;
+        const partialNote = byField ? '\n\nThe file is partial: what it leaves out stays as it is, and its mapping fields ' +
+            'and configuration values are added to those of the system.' : '';
+        const header = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ${data.exportedAt ?? '?'}${partialNote}`;
         const notHere = missingDependencies(data.configuration, systems);
         const onlyByName = (d) => !systems.some(s => s.systemId === d.systemId) && findDependency(d, systems);
         const byName = (data.configuration.dependOnSystems ?? []).filter(onlyByName).map(d => {
@@ -5606,6 +5661,7 @@
             // whose migration is open: HelloID keeps it disabled.
             ...(created || isPlainObject(current.migrationStatus) ? { isDisabled: true } : {}),
         };
+        if (byField) configuration = mergeByField(configuration, current, fileConfiguration);
         // (with what is chosen not to be imported, these are emptied below)
         // (a new system: chosen already; what is not chosen isn't read)
         let { requests: newNotifications, skipped: notificationsSkipped } = chosen && !chosen.has(NOTIFICATIONS_CHOICE)
@@ -5650,8 +5706,7 @@
         let mayComplete = Boolean(openChecklist) && migrationTasks(openChecklist, configuration)
             .every(task => isTicked(openChecklist, task.path) || tickable.some(t => t.label === task.label));
 
-        const from = `File: export of "${fileName}" from ${data.exportedFrom ?? '?'}, ` +
-                     `${data.exportedAt ?? '?'}`;
+        const from = header;
         // What could not be imported, of what is imported (emptied below for what is not chosen)
         let dependsMissing = missing;
         let rulesSkipped = () => ruleWork.skipped;
