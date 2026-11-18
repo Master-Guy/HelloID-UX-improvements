@@ -26,6 +26,20 @@ On the **Entitlements** tab of a target system, three filter buttons are added n
 
 The filters can be combined. The page reloads shortly after your last click to apply them, and your filter choices are remembered for next time.
 
+### Business rules: filter on entitlements and persons
+
+On **Business rules > Rules**, HelloID's filter card gets two more panels next to State and Categories:
+
+- **Entitlements**: "Has none" or "Has at least one"
+- **Persons**: "Has none" or "Has at least one"
+
+They combine like HelloID's own panels:
+
+- a rule has to match **any** of the ticked options of a panel, and **every** panel that has something ticked;
+- a panel with nothing ticked doesn't filter, and neither does one with both options ticked.
+
+For example, "Entitlements: has none" with "Persons: has at least one" shows the rules that reach persons but grant nothing. The filters work together with HelloID's own filters and the search. They reset when you go to another page.
+
 ### Copy system names
 
 On the **Target systems** overview, each system tile gets a copy button next to the configure button. Clicking it copies the system name to your clipboard.

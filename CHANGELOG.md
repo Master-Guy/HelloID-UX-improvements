@@ -2,6 +2,12 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-11-17.1
+
+### Business rules: filter on entitlements and persons
+
+On **Business rules > Rules**, HelloID's filter card has two more panels: **Entitlements** and **Persons**, each with "Has none" and "Has at least one". A rule matches any ticked option of a panel, and every panel that has something ticked. A panel with nothing ticked doesn't filter.
+
 ## 2026-11-12.3
 
 ### Export everything

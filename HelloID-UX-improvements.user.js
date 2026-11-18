@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-11-12.3
+// @version      2026-11-17.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -350,6 +350,8 @@
     //   which no longer applies once all rows are fetched
     // route: only on pages with this in their address
     // active: () -> is it in use right now? (default: yes)
+    // body: skip and take are in the request's JSON body (a POST), not
+    //   in its address
     const INTERCEPTS = [
         // Target system > Entitlements tab
         { pattern: /\/entitlements-overview(\?|$)/, filter: (all) => all.filter(matchesFilters) },
@@ -385,6 +387,15 @@
             filter: (all) => filterHistory(all),
             route: HISTORY_ROUTE,
             active: () => hasHistoryRange(),
+        },
+        // Business rules > Rules tab: only while a filter on the number of
+        // entitlements or persons is set
+        {
+            pattern: new RegExp('/rules/api/rules/overview([?]|$)'),
+            body: true,
+            filter: (all) => filterRuleCounts(all),
+            grid: 'helloid-rules-grid ag-grid-angular',
+            active: () => onRulesTab() && hasRuleCountFilter(),
         },
     ];
     const onPage = (route) => !route || location.hash.includes(route);
@@ -454,14 +465,21 @@
     // wait for that, if needed, and are sent as a 1-row request: they keep
     // the app's own request (with its login headers), but the answer comes
     // from the cache.
-    function rewriteUrl(url) {
+    // body: the request's JSON body, for an intercept that has skip and
+    // take in there (the rest of the body is part of the query)
+    function rewriteUrl(url, body = null) {
         // Before filtering: drop filters (and cached data) from another page
         syncFiltersWithPage();
 
         const u = new URL(url, location.href);
-        const skip = parseInt(u.searchParams.get('skip'), 10) || 0;
-        const takeParam = u.searchParams.get('take');
-        const key = queryKey(url);
+        const inBody = isPlainObject(body);
+        const skip = parseInt(inBody ? body.skip : u.searchParams.get('skip'), 10) || 0;
+        const takeParam = inBody ? body.take ?? null : u.searchParams.get('take');
+        let key = queryKey(url);
+        if (inBody) {
+            const { skip: _, take: __, ...rest } = body;
+            key += `|${JSON.stringify(Object.fromEntries(Object.entries(rest).sort(([a], [b]) => a.localeCompare(b))))}`;
+        }
 
         let entry = fullResponses.get(key);
         if (entry?.data && Date.now() - entry.time > CACHE_MAX_AGE_MS) {
@@ -476,8 +494,11 @@
             showLoadingWhile(entry.ready, interceptFor(url).grid);
         }
 
-        u.searchParams.set('skip', '0');
-        u.searchParams.set('take', loads ? String(SETTINGS.fetchAllTake) : '1');
+        const take = loads ? SETTINGS.fetchAllTake : 1;
+        if (!inBody) {
+            u.searchParams.set('skip', '0');
+            u.searchParams.set('take', String(take));
+        }
         return {
             skip,
             take: takeParam === null ? Infinity : (parseInt(takeParam, 10) || Infinity),
@@ -485,7 +506,9 @@
             key,
             entry,
             loads,
-            url: u.toString(),
+            url: inBody ? url : u.toString(),
+            // (the body to send instead)
+            body: inBody ? JSON.stringify({ ...body, skip: 0, take }) : undefined,
         };
     }
 
@@ -587,14 +610,32 @@
             if (response.ok) response.clone().text().then(text => watched(watch, text), () => {});
             return response;
         }
-        if (!interceptFor(url)) return origFetch.call(this, input, init);
+        const intercept = interceptFor(url);
+        if (!intercept) return origFetch.call(this, input, init);
 
-        const page = rewriteUrl(url);
+        // skip and take in the body: read it (a body that isn't JSON goes
+        // as it is)
+        let body = null;
+        if (intercept.body) {
+            const text = typeof init?.body === 'string' ? init.body
+                : input instanceof pageWindow.Request ? await input.clone().text() : null;
+            try { body = JSON.parse(text); } catch { return origFetch.call(this, input, init); }
+        }
+        const page = rewriteUrl(url, body);
         if (!page.loads) await page.entry.ready;
 
         try {
-            const newInput = input instanceof pageWindow.Request ? new pageWindow.Request(page.url, input) : page.url;
-            const response = await origFetch.call(this, newInput, init);
+            let newInput = input instanceof pageWindow.Request ? new pageWindow.Request(page.url, input) : page.url;
+            let newInit = init;
+            if (page.body !== undefined) {
+                if (typeof init?.body === 'string') {
+                    newInput = input;
+                    newInit = { ...init, body: page.body };
+                } else {
+                    newInput = new pageWindow.Request(input, { body: page.body });
+                }
+            }
+            const response = await origFetch.call(this, newInput, newInit);
 
             const text = await response.clone().text();
             const body = respond(text, page, response.ok);
@@ -630,6 +671,13 @@
         delete this._tmResult;
         this._tmHeaders = {};
         this._tmUrl = s;
+        this._tmBodyIntercept = false;
+        // skip and take in the body: the page is worked out in send
+        if (interceptFor(s)?.body) {
+            this._tmPage = null;
+            this._tmBodyIntercept = true;
+            return origOpen.call(this, method, url, ...rest);
+        }
         if (interceptFor(s)) {
             this._tmPage = rewriteUrl(s);
             if (this._tmPage.loads) {
@@ -664,6 +712,20 @@
                 headers: Object.fromEntries(Object.entries(headers).filter(([h]) => !/^content-type$/i.test(h))),
                 withCredentials: this.withCredentials,
             };
+        }
+
+        if (this._tmBodyIntercept) {
+            this._tmBodyIntercept = false;
+            let body = null;
+            try { body = typeof args[0] === 'string' ? JSON.parse(args[0]) : null; } catch { /* not JSON: as it is */ }
+            if (isPlainObject(body)) {
+                this._tmPage = rewriteUrl(this._tmUrl, body);
+                args = [this._tmPage.body, ...args.slice(1)];
+                if (this._tmPage.loads) {
+                    // Also when the app never reads the answer (see open)
+                    this.addEventListener('loadend', () => getModified(this), { once: true });
+                }
+            }
         }
 
         const page = this._tmPage;
@@ -1024,7 +1086,8 @@
 
             const newPanels = [];
             host.querySelectorAll('.filter-panel').forEach(panel => {
-                if (panel.querySelector(`.${FOOTER_CLASS}`)) return;
+                // (not on panels of this script itself)
+                if (panel.querySelector(`.${FOOTER_CLASS}`) || panel.dataset.tmOwn) return;
 
                 // Flex column, so the footer can sit at the bottom and the
                 // footers of all panels line up
@@ -7863,6 +7926,114 @@
     }
 
     // =====================================================================
+    // Business rules > Rules: filter on the number of entitlements and persons
+    // =====================================================================
+    // HelloID's filter card of this tab (State, Categories) gets two panels
+    // more, Entitlements and Persons, each with "Has none" and "Has at
+    // least one". As in HelloID's own panels: a rule matches any of the
+    // ticked options of a panel, and every panel that has something
+    // ticked; a panel with nothing ticked (or all) doesn't filter.
+    // HelloID's request has nothing for that, so while something is
+    // ticked, all rules (of HelloID's own filters) are fetched once and
+    // filtered on the request (see Response interception).
+
+    const RULE_COUNT_KEY = 'tm-helloid-rule-counts'; // in sessionStorage: { panel key: [option keys] }
+    const RULE_COUNT_CLASS = 'tm-rule-count-filter';
+    const RULE_COUNT_PANELS = [
+        { key: 'entitlements', label: 'Entitlements', field: 'configuredEntitlementCount' },
+        { key: 'persons', label: 'Persons', field: 'personInRuleLastEvaluationCount' },
+    ];
+    const RULE_COUNT_OPTIONS = [
+        { key: 'none', label: 'Has none', test: (n) => !(n > 0) },
+        { key: 'some', label: 'Has at least one', test: (n) => n > 0 },
+    ];
+    const RULES_GRID = 'helloid-rules-grid ag-grid-angular';
+
+    // Business rules, on its Rules tab (also the page without a tab)
+    function onRulesTab() {
+        const [route, query = ''] = location.hash.split('?');
+        const tab = new URLSearchParams(query).get('tab');
+        return route === '#/business/rules' && (!tab || tab === 'Rules');
+    }
+
+    const ruleCountState = () => {
+        const state = sessionGet(RULE_COUNT_KEY, null);
+        return isPlainObject(state) ? state : {};
+    };
+    // The panels that filter, each with its ticked options
+    const activeRuleCounts = () => RULE_COUNT_PANELS.map(panel => ({
+        ...panel,
+        options: RULE_COUNT_OPTIONS.filter(o => (ruleCountState()[panel.key] ?? []).includes(o.key)),
+    })).filter(panel => panel.options.length && panel.options.length < RULE_COUNT_OPTIONS.length);
+    const hasRuleCountFilter = () => activeRuleCounts().length > 0;
+
+    // Called with all rules (see INTERCEPTS)
+    function filterRuleCounts(all) {
+        const active = activeRuleCounts();
+        return all.filter(rule => active.every(panel => panel.options.some(o => o.test(rule[panel.field]))));
+    }
+
+    function reloadRules() {
+        document.querySelectorAll(RULES_GRID).forEach(gridEl => {
+            const api = findGridApi(gridEl);
+            if (typeof api?.purgeInfiniteCache === 'function') api.purgeInfiniteCache();
+            else if (typeof api?.refreshServerSide === 'function') api.refreshServerSide({ purge: true });
+            else api?.refreshInfiniteCache?.();
+        });
+    }
+
+    // The panels, in HelloID's filter card of the tab (it is made again
+    // each time it opens: the boxes show what is stored)
+    function addRuleCountFilter() {
+        if (!onRulesTab()) return;
+        document.querySelectorAll('helloid-filter-panels').forEach(host => {
+            if (host.querySelector(`.${RULE_COUNT_CLASS}`)) return;
+            const panels = [...host.querySelectorAll('.filter-panel')];
+            // (the card of the rules: it has HelloID's Categories panel)
+            if (!panels.some(p => /categor/i.test(p.querySelector('.card-header')?.textContent ?? ''))) return;
+            const row = panels[0].parentElement;
+            const state = ruleCountState();
+            RULE_COUNT_PANELS.forEach(panel => {
+                const box = document.createElement('div');
+                box.className = `filter-panel overflow-ellipsis ${RULE_COUNT_CLASS}`;
+                box.dataset.tmOwn = '1';
+                Object.assign(box.style, { display: 'flex', flexDirection: 'column' });
+                const header = document.createElement('strong');
+                header.className = 'card-header inline';
+                header.textContent = ` ${panel.label} `;
+                const list = document.createElement('div');
+                list.className = 'filter-grid-column flex flex-col gap-0';
+                RULE_COUNT_OPTIONS.forEach(option => {
+                    const item = document.createElement('div');
+                    item.className = 'checkbox check-complete m-t-0 m-b-5 flex';
+                    item.title = option.label;
+                    const input = document.createElement('input');
+                    input.type = 'checkbox';
+                    input.id = `tm-rule-count-${panel.key}-${option.key}-${Math.random().toString(36).slice(2)}`;
+                    input.checked = (state[panel.key] ?? []).includes(option.key);
+                    input.addEventListener('change', (e) => {
+                        e.stopPropagation(); // (HelloID's own panels: not theirs)
+                        const now = ruleCountState();
+                        const ticked = new Set(now[panel.key] ?? []);
+                        if (input.checked) ticked.add(option.key);
+                        else ticked.delete(option.key);
+                        sessionSet(RULE_COUNT_KEY, { ...now, [panel.key]: [...ticked] });
+                        reloadRules(); // through the filter, or as HelloID loads it again
+                    });
+                    const label = document.createElement('label');
+                    label.className = 'overflow-ellipsis';
+                    label.htmlFor = input.id;
+                    label.textContent = option.label;
+                    item.append(input, label);
+                    list.appendChild(item);
+                });
+                box.append(header, list);
+                row.appendChild(box);
+            });
+        });
+    }
+
+    // =====================================================================
     // All grids: resizable columns
     // =====================================================================
 
@@ -11334,6 +11505,9 @@
         if (sessionGet(HISTORY_RANGE_KEY, null) !== null) sessionSet(HISTORY_RANGE_KEY, null);
         historyDefault = null;
 
+        // Business rules > Rules: filter on the number of entitlements and persons
+        if (sessionGet(RULE_COUNT_KEY, null) !== null) sessionSet(RULE_COUNT_KEY, null);
+
         // Business rules > Entitlements: filter on "Rules"
         if (usedOnly()) {
             sessionSet(USED_FILTER_KEY, false);
@@ -11383,6 +11557,7 @@
                 addRuleStatusFilter();
                 addFilterPanelSearch();
                 addHistoryRangeFilter();
+                addRuleCountFilter();
                 makeGridsResizable();
                 applyPageColumnWidths();
             });
