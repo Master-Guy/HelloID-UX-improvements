@@ -7930,9 +7930,10 @@
     // =====================================================================
     // HelloID's filter card of this tab (State, Categories) gets two panels
     // more, Entitlements and Persons, each with "Has none" and "Has at
-    // least one". As in HelloID's own panels: a rule matches any of the
-    // ticked options of a panel, and every panel that has something
-    // ticked; a panel with nothing ticked (or all) doesn't filter.
+    // least one", all ticked at first. As in HelloID's own panels: a rule
+    // matches any of the ticked options of a panel, and every panel that
+    // has something ticked; a panel with all (or nothing) ticked doesn't
+    // filter.
     // HelloID's request has nothing for that, so while something is
     // ticked, all rules (of HelloID's own filters) are fetched once and
     // filtered on the request (see Response interception).
@@ -7956,6 +7957,9 @@
         return route === '#/business/rules' && (!tab || tab === 'Rules');
     }
 
+    // What is ticked in a panel; nothing stored: everything, as in HelloID's
+    // own panels (which doesn't filter)
+    const tickedIn = (state, key) => (Array.isArray(state[key]) ? state[key] : RULE_COUNT_OPTIONS.map(o => o.key));
     const ruleCountState = () => {
         const state = sessionGet(RULE_COUNT_KEY, null);
         return isPlainObject(state) ? state : {};
@@ -7963,7 +7967,7 @@
     // The panels that filter, each with its ticked options
     const activeRuleCounts = () => RULE_COUNT_PANELS.map(panel => ({
         ...panel,
-        options: RULE_COUNT_OPTIONS.filter(o => (ruleCountState()[panel.key] ?? []).includes(o.key)),
+        options: RULE_COUNT_OPTIONS.filter(o => tickedIn(ruleCountState(), panel.key).includes(o.key)),
     })).filter(panel => panel.options.length && panel.options.length < RULE_COUNT_OPTIONS.length);
     const hasRuleCountFilter = () => activeRuleCounts().length > 0;
 
@@ -8010,11 +8014,11 @@
                     const input = document.createElement('input');
                     input.type = 'checkbox';
                     input.id = `tm-rule-count-${panel.key}-${option.key}-${Math.random().toString(36).slice(2)}`;
-                    input.checked = (state[panel.key] ?? []).includes(option.key);
+                    input.checked = tickedIn(state, panel.key).includes(option.key);
                     input.addEventListener('change', (e) => {
                         e.stopPropagation(); // (HelloID's own panels: not theirs)
                         const now = ruleCountState();
-                        const ticked = new Set(now[panel.key] ?? []);
+                        const ticked = new Set(tickedIn(now, panel.key));
                         if (input.checked) ticked.add(option.key);
                         else ticked.delete(option.key);
                         sessionSet(RULE_COUNT_KEY, { ...now, [panel.key]: [...ticked] });

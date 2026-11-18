@@ -33,7 +33,7 @@ On **Business rules > Rules**, HelloID's filter card gets two more panels next t
 - **Entitlements**: "Has none" or "Has at least one"
 - **Persons**: "Has none" or "Has at least one"
 
-They combine like HelloID's own panels:
+All boxes are ticked at first, as in HelloID's own panels. They combine the same way:
 
 - a rule has to match **any** of the ticked options of a panel, and **every** panel that has something ticked;
 - a panel with nothing ticked doesn't filter, and neither does one with both options ticked.

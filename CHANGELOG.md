@@ -6,7 +6,7 @@ Changes to HelloID UX improvements, newest first. Each heading is the script ver
 
 ### Business rules: filter on entitlements and persons
 
-On **Business rules > Rules**, HelloID's filter card has two more panels: **Entitlements** and **Persons**, each with "Has none" and "Has at least one". A rule matches any ticked option of a panel, and every panel that has something ticked. A panel with nothing ticked doesn't filter.
+On **Business rules > Rules**, HelloID's filter card has two more panels: **Entitlements** and **Persons**, each with "Has none" and "Has at least one". A rule matches any ticked option of a panel, and every panel that has something ticked. A panel with all or nothing ticked doesn't filter. All boxes are ticked at first, as in HelloID's own panels.
 
 ## 2026-11-12.3
 
