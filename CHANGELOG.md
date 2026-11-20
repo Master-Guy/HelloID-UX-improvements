@@ -2,6 +2,14 @@
 
 Changes to HelloID UX improvements, newest first. Each heading is the script version that Tampermonkey shows. Versions that only changed the script's details (name, address, comments) are not listed.
 
+## 2026-11-20.1
+
+### Notification secrets in target system exports
+
+The notifications in a target system export, and in **Export everything**, had the passwords of their template values in plain text. They are now written as `***`, as in the export of notifications, unless the setting **Target system export: include secrets** is on. `Export-HelloID.ps1` 2026-11-20.1 does the same, unless you add `-IncludeSecrets`.
+
+When such a file is imported, a `***` value keeps the value the notification already has.
+
 ## 2026-11-17.1
 
 ### Business rules: filter on entitlements and persons

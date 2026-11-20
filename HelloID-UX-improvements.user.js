@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         HelloID UX improvements
-// @version      2026-11-17.1
+// @version      2026-11-20.1
 // @description  Adds custom improvements to the HelloID admin and provisioning interfaces
 // @updateURL    https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
 // @downloadURL  https://raw.githubusercontent.com/Master-Guy/HelloID-UX-improvements/refs/heads/main/HelloID-UX-improvements.user.js
@@ -2463,9 +2463,18 @@
             }));
         }
         const byName = (a, b) => String(a.name).localeCompare(String(b.name));
+        const notificationSystems = await collectNotificationSystems(notifications);
+        // The secrets of their template data as "***", as in the export of
+        // notifications: the password fields of their template
+        const masked = notifications.map(n => {
+            if (n.couldNotRead) return n;
+            const template = (notificationSystems.find(s => s.systemId === n.notificationSystemId)?.notificationTemplates ?? [])
+                .find(t => t.templateId === n.notificationTemplateId);
+            return { ...n, notificationTemplateData: maskValues(n.notificationTemplateData, template?.fields) };
+        });
         return {
-            notifications: notifications.sort(byName),
-            notificationSystems: await collectNotificationSystems(notifications),
+            notifications: masked.sort(byName),
+            notificationSystems,
             notificationsUsingThisSystem: notificationsUsingThisSystem.sort(byName),
         };
     }
@@ -4979,11 +4988,13 @@
             const match = here.find(n => !taken.has(n) && n.identifier === notification.identifier) ??
                           here.find(n => !taken.has(n) && n.event === notification.event && n.name === notification.name);
             if (match) taken.add(match);
+            const current = match ? await fetchFromGateway(`${NOTIFICATIONS_PATH}/${encodeURIComponent(match.identifier)}`) : null;
             const body = notificationFor(notification, match?.identifier ?? crypto.randomUUID(), fileSystemId, system);
-            if (match && sameNotification(body,
-                await fetchFromGateway(`${NOTIFICATIONS_PATH}/${encodeURIComponent(match.identifier)}`))) {
-                continue;
+            // Secrets the file left out ("***") keep the value they have here
+            if (isPlainObject(body.notificationTemplateData)) {
+                body.notificationTemplateData = restoreValues(body.notificationTemplateData, current?.notificationTemplateData);
             }
+            if (match && sameNotification(body, current)) continue;
             requests.push({
                 name: `Notification "${notification.name}" (${match ? 'change' : 'new'})`,
                 path: () => NOTIFICATIONS_PATH,

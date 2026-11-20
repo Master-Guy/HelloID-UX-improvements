@@ -100,7 +100,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2026-11-12.2'
+$ScriptVersion = '2026-11-20.1'
 $ExportedBy = "Export-HelloID.ps1 $ScriptVersion"
 
 #region Settings
@@ -536,9 +536,27 @@ function Get-Notifications($System) {
                 dataReferences = $references
             })
     }
+    # The secrets of their template data as "***", as in the export of notifications: the password
+    # fields of their template
+    $masked = New-List
+    foreach ($notification in $own) {
+        if (Get-Value $notification 'couldNotRead') { $masked.Add($notification); continue }
+        $template = $null
+        $senderId = Get-Value $notification 'notificationSystemId'
+        if ($senderId) {
+            $detail = try { Invoke-HelloIDApi "/service/notifications/api/notification/systems/$(& $escapeId $senderId)" -Cached }
+            catch { $null }
+            $templateId = Get-Value $notification 'notificationTemplateId'
+            $template = (Get-Value $detail 'notificationTemplates') |
+                Where-Object { $null -ne $_ -and (Get-Value $_ 'templateId') -eq $templateId } | Select-Object -First 1
+        }
+        $copy = ConvertTo-Ordered $notification
+        $copy.notificationTemplateData = Get-MaskedValues (Get-Value $notification 'notificationTemplateData') (Get-Value $template 'fields')
+        $masked.Add($copy)
+    }
     $byName = { [string]$(if ($_ -is [System.Collections.IDictionary]) { $_['name'] } else { Get-Value $_ 'name' }) }
     return [ordered]@{
-        notifications                = @($own | Sort-Object $byName)
+        notifications                = @($masked | Sort-Object $byName)
         notificationSystems          = (Get-NotificationSystems $own)
         notificationsUsingThisSystem = @($using | Sort-Object $byName)
     }
