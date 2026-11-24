@@ -1,0 +1,27 @@
+{
+  "server": { "host": "127.0.0.1", "port": 3917 },
+  "auth": { "bearerToken": "REPLACE-WITH-A-LONG-RANDOM-SECRET-OF-AT-LEAST-32-CHARACTERS" },
+  "chrome": {
+    "executablePath": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "profileDir": "%LOCALAPPDATA%\\helloid-mcp\\chrome-profile",
+    "closeAfterLogin": true
+  },
+  "audit": { "dir": "%LOCALAPPDATA%\\helloid-mcp\\audit" },
+  "safety": { "readOnly": false },
+  "environments": {
+    "training": {
+      "baseUrl": "https://example.helloid.training",
+      "gatewayUrl": null,
+      "mode": "write",
+      "allowEvaluate": true,
+      "allowDelete": false,
+      "allowRevokingRuleDelete": false,
+      "allowRevokingRulePublish": false,
+      "allowRetryActions": false,
+      "allowApproveBlocked": false,
+      "allowEnforce": false,
+      "allowDryRun": false,
+      "login": { "provider": "Microsoft", "username": "someone@example.com" }
+    }
+  }
+}

@@ -1,1 +1,4 @@
 /gitignored/*
+helloid-mcp/config.json
+helloid-mcp/node_modules/
+helloid-mcp/dist/

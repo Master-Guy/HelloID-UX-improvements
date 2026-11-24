@@ -1,0 +1,336 @@
+{
+  "_comment": "Synthetic sample data in HelloID's response shapes. All names, IDs and values are made up.",
+  "targetSystems": [
+    {
+      "systemId": "11111111-1111-4111-8111-111111111111",
+      "displayName": "Alpha Directory",
+      "description": "PowerShell v2 example",
+      "icon": "alpha.png",
+      "templateIdentifier": "powershell-target",
+      "dependOnSystems": [{ "systemId": "22222222-2222-4222-8222-222222222222" }],
+      "isDisabled": false,
+      "isReferenceSystem": false,
+      "listOnlyField": "only in the list"
+    },
+    {
+      "systemId": "22222222-2222-4222-8222-222222222222",
+      "displayName": "Beta Cloud",
+      "description": "Built-in Azure AD example",
+      "templateIdentifier": "azuread",
+      "dependOnSystems": [],
+      "isDisabled": false,
+      "isReferenceSystem": false
+    },
+    {
+      "systemId": "33333333-3333-4333-8333-333333333333",
+      "displayName": "Gamma Files",
+      "description": "Another type",
+      "templateIdentifier": "csv-target",
+      "dependOnSystems": [{ "systemId": "99999999-9999-4999-8999-999999999999" }],
+      "isDisabled": true,
+      "isReferenceSystem": false,
+      "mappingConfiguration": {
+        "fields": [{ "name": "manager", "mappingActions": [{ "value": "Person.Accounts._11111111111141118111111111111111.id" }] }]
+      }
+    }
+  ],
+  "powershellConfigurations": {
+    "11111111-1111-4111-8111-111111111111": {
+      "systemId": "11111111-1111-4111-8111-111111111111",
+      "displayName": "Alpha Directory",
+      "description": "PowerShell v2 example",
+      "templateIdentifier": "powershell-target",
+      "dependOnSystems": [{ "systemId": "22222222-2222-4222-8222-222222222222" }],
+      "isDisabled": false,
+      "isReferenceSystem": false,
+      "scriptConfiguration": {
+        "baseUrl": "https://alpha.example.test",
+        "clientSecret": "alpha-client-secret-value",
+        "serviceUser": "svc-alpha",
+        "hiddenValue": "alpha-hidden-password",
+        "emptySecret": ""
+      },
+      "scriptConfigurationForm": {
+        "fields": [
+          { "key": "baseUrl", "templateOptions": { "label": "Base URL" } },
+          { "key": "hiddenValue", "templateOptions": { "label": "Hidden", "type": "password" } }
+        ]
+      },
+      "permissions": [{ "identification": "perm-1", "displayName": "Groups" }],
+      "mappingConfiguration": { "fields": [{ "name": "userName", "mappingActions": [{ "value": "Person.ExternalId" }] }] }
+    }
+  },
+  "powershellDefaultScripts": {
+    "11111111-1111-4111-8111-111111111111": { "create": "Write-Output 'create'" }
+  },
+  "powershellResources": {
+    "11111111-1111-4111-8111-111111111111": { "resources": [] }
+  },
+  "azureAdConfigurations": {
+    "22222222-2222-4222-8222-222222222222": {
+      "systemId": "22222222-2222-4222-8222-222222222222",
+      "displayName": "Beta Cloud",
+      "templateIdentifier": "azuread",
+      "dependOnSystems": [],
+      "clientSecret": "beta-client-secret-value",
+      "tenantId": "tenant-example",
+      "exchangeConfiguration": { "password": "beta-exchange-password", "server": "mail.example.test" },
+      "mappingConfiguration": {
+        "fields": [{ "name": "mail", "mappingActions": [{ "value": "Person.Accounts._11111111111141118111111111111111.mail" }] }]
+      }
+    }
+  },
+  "agentSelections": {
+    "11111111-1111-4111-8111-111111111111": [{ "type": "tag", "value": "onprem" }],
+    "44444444-4444-4444-8444-444444444444": [],
+    "55555555-5555-4555-8555-555555555552": []
+  },
+  "agentSummaries": {
+    "11111111-1111-4111-8111-111111111111": { "agentCount": 2 },
+    "44444444-4444-4444-8444-444444444444": { "agentCount": 0 },
+    "55555555-5555-4555-8555-555555555552": { "agentCount": 0 }
+  },
+  "agents": [
+    { "agentId": "agent-1", "name": "Agent One", "selected": true },
+    { "agentId": "agent-2", "name": "Agent Two", "selected": false }
+  ],
+  "entitlementsOverview": {
+    "11111111-1111-4111-8111-111111111111": {
+      "pageData": [
+        { "ruleId": "77777777-7777-4777-8777-777777777771", "ruleName": "Employees get Alpha", "accountEntitlementForSystem": true, "accountAccessEntitlementForSystem": false, "permissionEntitlementForSystem": true },
+        { "ruleId": "77777777-7777-4777-8777-777777777772", "ruleName": "Sales get Alpha", "accountEntitlementForSystem": true, "accountAccessEntitlementForSystem": true, "permissionEntitlementForSystem": false },
+        { "ruleId": "77777777-7777-4777-8777-777777777773", "ruleName": "Empty rule", "accountEntitlementForSystem": false, "accountAccessEntitlementForSystem": false, "permissionEntitlementForSystem": false }
+      ],
+      "totalRowCount": 3
+    }
+  },
+  "rulesOverview": [
+    { "ruleId": "77777777-7777-4777-8777-777777777771", "name": "Employees get Alpha", "description": "", "categories": [], "configuredEntitlementCount": 2, "published": true, "hasDraft": false, "personInRuleLastEvaluationCount": 1, "lastChanged": "2026-01-02T03:04:05Z" },
+    { "ruleId": "77777777-7777-4777-8777-777777777772", "name": "Sales get Alpha", "description": "Sales", "categories": [], "configuredEntitlementCount": 2, "published": true, "hasDraft": true, "personInRuleLastEvaluationCount": 0, "lastChanged": "2026-01-03T03:04:05Z" },
+    { "ruleId": "77777777-7777-4777-8777-777777777773", "name": "Empty rule", "description": "", "categories": [], "configuredEntitlementCount": 0, "published": false, "hasDraft": true, "personInRuleLastEvaluationCount": 0, "lastChanged": "2026-01-04T03:04:05Z" }
+  ],
+  "rules": {
+    "77777777-7777-4777-8777-777777777771": {
+      "ruleId": "77777777-7777-4777-8777-777777777771",
+      "name": "Employees get Alpha",
+      "description": "",
+      "categories": [],
+      "published": true,
+      "draft": null,
+      "hasDraft": false,
+      "condition": {
+        "hasActiveContract": true,
+        "titleCondition": { "invert": false, "titles": [{ "externalId": "T-1", "name": "Engineer", "source": { "systemId": "44444444-4444-4444-8444-444444444444", "displayName": "HR Source", "identificationKey": "44444444-4444-4444-8444-444444444444" } }] },
+        "departmentCondition": { "invert": false, "departments": [{ "externalId": "D-0", "displayName": "No source", "source": { "systemId": "00000000-0000-0000-0000-000000000000", "displayName": null } }] },
+        "personConditions": [],
+        "contractConditions": []
+      },
+      "entitlements": [
+        { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null },
+        { "entitlementId": "88888888-8888-4888-8888-888888888884", "systemIdentifier": "22222222-2222-4222-8222-222222222222", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }
+      ]
+    },
+    "77777777-7777-4777-8777-777777777772": {
+      "ruleId": "77777777-7777-4777-8777-777777777772",
+      "name": "Sales get Alpha",
+      "description": "Sales",
+      "categories": [],
+      "published": true,
+      "hasDraft": true,
+      "draft": {
+        "condition": {
+          "titleCondition": { "invert": false, "titles": [] },
+          "departmentCondition": { "invert": false, "departments": [{ "externalId": "D-9", "displayName": "Old sales", "source": { "systemId": "99999999-9999-4999-8999-999999999999", "displayName": "Old HR" } }] }
+        },
+        "entitlements": [
+          { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }
+        ]
+      },
+      "condition": {
+        "titleCondition": { "invert": false, "titles": [] },
+        "departmentCondition": { "invert": false, "departments": [] }
+      },
+      "entitlements": [
+        { "entitlementId": "88888888-8888-4888-8888-888888888882", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "AccountAccess", "displayName": "Account Access", "permissionDefinitionDisplayName": null },
+        { "entitlementId": "88888888-8888-4888-8888-888888888889", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Permission", "displayName": "Removed group", "permissionDefinitionDisplayName": "Groups" }
+      ]
+    },
+    "77777777-7777-4777-8777-777777777773": {
+      "ruleId": "77777777-7777-4777-8777-777777777773",
+      "name": "Empty rule",
+      "description": "",
+      "categories": [],
+      "published": false,
+      "hasDraft": true,
+      "draft": { "condition": null, "entitlements": [] },
+      "condition": null,
+      "entitlements": []
+    }
+  },
+  "conditionSummaries": {
+    "77777777-7777-4777-8777-777777777771": { "person": { "value": "active", "label": "Person" }, "titles": null, "departments": null, "personConditions": [], "contractConditions": [] }
+  },
+  "rulesForEntitlement": {
+    "88888888-8888-4888-8888-888888888881": [
+      { "ruleId": "77777777-7777-4777-8777-777777777771", "name": "Employees get Alpha", "description": "", "published": true, "hasDraft": false, "entitlementConfiguredInPublished": true, "entitlementConfiguredInDraft": false },
+      { "ruleId": "77777777-7777-4777-8777-777777777772", "name": "Sales get Alpha", "description": "Sales", "published": true, "hasDraft": true, "entitlementConfiguredInPublished": false, "entitlementConfiguredInDraft": true }
+    ]
+  },
+  "entitlements": [
+    { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": 1, "displayName": "Account", "permissionDefinitionDisplayName": null, "inTargetSystem": true, "ruleCount": 2 },
+    { "entitlementId": "88888888-8888-4888-8888-888888888882", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": 2, "displayName": "Account Access", "permissionDefinitionDisplayName": null, "inTargetSystem": true, "ruleCount": 1 },
+    { "entitlementId": "88888888-8888-4888-8888-888888888883", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": 3, "displayName": "Group Sales", "permissionDefinitionDisplayName": "Groups", "inTargetSystem": true, "ruleCount": 0 },
+    { "entitlementId": "88888888-8888-4888-8888-888888888884", "systemIdentifier": "22222222-2222-4222-8222-222222222222", "type": 1, "displayName": "Account", "permissionDefinitionDisplayName": null, "inTargetSystem": true, "ruleCount": 1 }
+  ],
+  "sourceSystems": [
+    {
+      "systemId": "44444444-4444-4444-8444-444444444444",
+      "displayName": "HR Source",
+      "description": null,
+      "executeOnPremises": false
+    }
+  ],
+  "sourceSystemDetails": {
+    "44444444-4444-4444-8444-444444444444": {
+      "systemId": "44444444-4444-4444-8444-444444444444",
+      "displayName": "HR Source",
+      "description": null,
+      "executeOnPremises": false,
+      "personsScript": "Write-Output '[]'",
+      "scriptConfiguration": "{\"url\":\"https://hr.example.test\",\"apiKey\":\"hr-api-key-value\",\"passphrase\":\"hr-hidden-value\"}",
+      "scriptConfigurationForm": "[{\"key\":\"url\",\"templateOptions\":{}},{\"key\":\"passphrase\",\"templateOptions\":{\"type\":\"password\"}}]",
+      "repositoryMetaData": { "name": "HelloID-Conn-Prov-Source-Example", "version": "1.0.0", "readmeHtml": "<p>A long README</p>" }
+    }
+  },
+  "sourceCatalog": [{ "id": 123456, "name": "HelloID-Conn-Prov-Source-Example" }],
+  "notificationSystems": [
+    { "systemId": "55555555-5555-4555-8555-555555555551", "displayName": "Email", "description": "Built-in", "icon": "Email.png", "isBuiltin": true },
+    { "systemId": "55555555-5555-4555-8555-555555555552", "displayName": "PowerShell Notify", "description": "Custom", "icon": "PowerShell.png", "isBuiltin": false }
+  ],
+  "notificationSystemDetails": {
+    "55555555-5555-4555-8555-555555555551": {
+      "systemId": "55555555-5555-4555-8555-555555555551",
+      "displayName": "Email",
+      "isBuiltin": true,
+      "systemConfiguration": { "fields": [], "data": {} },
+      "notificationTemplates": [{ "templateId": "tpl-email", "displayName": "Mail template", "fields": [] }]
+    },
+    "55555555-5555-4555-8555-555555555552": {
+      "systemId": "55555555-5555-4555-8555-555555555552",
+      "displayName": "PowerShell Notify",
+      "isBuiltin": false,
+      "executeOnPremise": true,
+      "systemConfiguration": {
+        "fields": [
+          { "key": "hidden", "templateOptions": { "type": "password" } },
+          { "key": "text.required", "templateOptions": { "label": "Text" } }
+        ],
+        "data": { "hidden": "notify-hidden-value", "apiToken": "notify-token-value", "text": { "required": "hello" } }
+      },
+      "notificationTemplates": [
+        { "templateId": "tpl-1", "displayName": "Template One", "fields": [{ "key": "secretWord", "templateOptions": { "type": "password" } }, { "key": "subject", "templateOptions": {} }] }
+      ]
+    }
+  },
+  "notifications": [
+    { "identifier": "66666666-6666-4666-8666-666666666661", "systemId": "11111111-1111-4111-8111-111111111111", "event": "Account create", "name": "Alpha account created", "enabled": true, "lastChange": "2026-01-05T00:00:00Z", "notificationSystemId": "55555555-5555-4555-8555-555555555552", "notificationTemplateId": "tpl-1" },
+    { "identifier": "66666666-6666-4666-8666-666666666662", "systemId": "22222222-2222-4222-8222-222222222222", "event": "Account update", "name": "Beta update", "enabled": false, "lastChange": "2026-01-06T00:00:00Z", "notificationSystemId": "55555555-5555-4555-8555-555555555551", "notificationTemplateId": "tpl-email" },
+    { "identifier": "66666666-6666-4666-8666-666666666663", "systemId": null, "event": "Custom event", "name": "Orphan custom", "enabled": false, "lastChange": "2026-01-07T00:00:00Z", "notificationSystemId": "55555555-5555-4555-8555-555555555559", "notificationTemplateId": null }
+  ],
+  "notificationDetails": {
+    "66666666-6666-4666-8666-666666666661": {
+      "identifier": "66666666-6666-4666-8666-666666666661",
+      "systemId": "11111111-1111-4111-8111-111111111111",
+      "event": "Account create",
+      "name": "Alpha account created",
+      "enabled": true,
+      "notificationSystemId": "55555555-5555-4555-8555-555555555552",
+      "notificationTemplateId": "tpl-1",
+      "notificationTemplateData": { "secretWord": "template-hidden-value", "subject": "Welcome" },
+      "customEventId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "dataReferences": []
+    },
+    "66666666-6666-4666-8666-666666666662": {
+      "identifier": "66666666-6666-4666-8666-666666666662",
+      "systemId": "22222222-2222-4222-8222-222222222222",
+      "event": "Account update",
+      "name": "Beta update",
+      "enabled": false,
+      "notificationSystemId": "55555555-5555-4555-8555-555555555551",
+      "notificationTemplateId": "tpl-email",
+      "notificationTemplateData": { "subject": "Changed" },
+      "dataReferences": [
+        { "key": "AlphaDirectory", "type": 1, "systemId": "11111111-1111-4111-8111-111111111111" },
+        { "key": "OldSystem", "type": 1, "systemId": "99999999-9999-4999-8999-999999999999" }
+      ]
+    },
+    "66666666-6666-4666-8666-666666666663": {
+      "identifier": "66666666-6666-4666-8666-666666666663",
+      "systemId": null,
+      "event": "Custom event",
+      "name": "Orphan custom",
+      "enabled": false,
+      "notificationSystemId": "55555555-5555-4555-8555-555555555559",
+      "notificationTemplateId": null,
+      "notificationTemplateData": {},
+      "customEventId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9",
+      "dataReferences": []
+    }
+  },
+  "customEvents": [
+    { "customEventId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", "name": "Manager changed", "systemId": "11111111-1111-4111-8111-111111111111", "action": 3, "conditions": [] },
+    { "customEventId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", "name": "Old event", "systemId": "99999999-9999-4999-8999-999999999999", "action": 1, "conditions": [] }
+  ],
+  "toxicCombinations": [
+    { "toxicCombinationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "name": "No sales and finance", "description": "", "enabled": true, "type": 1, "inputObjectIds": ["88888888-8888-4888-8888-888888888883", "88888888-8888-4888-8888-888888888899"], "outputObjectIds": ["88888888-8888-4888-8888-888888888883"] }
+  ],
+  "schedules": [
+    { "scheduleId": "cccccccc-cccc-4ccc-8ccc-ccccccccccc1", "name": "Nightly", "enabled": true, "useSpecificTimeZone": false, "selectedTimeZone": null, "observeDst": false, "hourOfDayUtc": 2, "tasks": [{ "type": 1, "systemId": "44444444-4444-4444-8444-444444444444" }, { "type": 2, "systemId": "99999999-9999-4999-8999-999999999999" }] }
+  ],
+  "reconciliationSchedule": { "enabled": true, "scheduledOnDay": 1, "scheduledOnHour": 3 },
+  "reconciliationSystems": [
+    { "systemId": "11111111-1111-4111-8111-111111111111", "automaticAccountCreate": true, "automaticAccountEnable": false, "automaticPermissionAdd": false }
+  ],
+  "reconciliationExclusions": { "pageData": [], "totalRowCount": 0 },
+  "calculatedLayers": { "primaryContractConfiguration": { "rules": [] }, "primaryManagerConfiguration": { "rules": [] }, "displayNameConfiguration": { "format": 1 } },
+  "customFields": [{ "customFieldIdentifier": "cf-1", "name": "costCode", "displayName": "Cost code", "type": 0, "selected": false }],
+  "aggregation": { "configuration": { "enabled": true, "suggestions": false }, "redetermineSuggestionsStatus": null },
+  "personLifecycle": [{ "eventType": 1, "daysBefore": 7 }],
+  "excludedPersons": [{ "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd3", "displayName": "Chris Excluded (E003)", "externalId": "E003" }],
+  "persons": [
+    { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1", "displayName": "Anna Example (E001)", "externalId": "E001", "excluded": false, "status": { "blocked": false }, "primaryContract": { "title": { "name": "Engineer" }, "department": { "displayName": "Development" } }, "source": { "displayName": "HR Source" }, "contracts": [], "accounts": [] },
+    { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd2", "displayName": "Bram Sample (E002)", "externalId": "E002", "excluded": false, "status": { "blocked": false }, "primaryContract": { "title": { "name": "Seller" }, "department": { "displayName": "Sales" } }, "source": { "displayName": "HR Source" }, "contracts": [], "accounts": [] },
+    { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd3", "displayName": "Chris Excluded (E003)", "externalId": "E003", "excluded": true, "status": { "blocked": false }, "primaryContract": null, "source": { "displayName": "HR Source" }, "contracts": [], "accounts": [] },
+    { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd4", "displayName": "Dana Nomatch (E004)", "externalId": "E004", "excluded": false, "status": { "blocked": true }, "primaryContract": null, "source": { "displayName": "HR Source" }, "contracts": [], "accounts": [] }
+  ],
+  "granted": [
+    { "enforcedStateId": "f1", "entitlement": { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }, "entitlementName": "Account", "lastChangedOnUtc": "2026-01-10T00:00:00Z", "subPermissionCount": 0, "personEntitlementId": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1", "entitlementId": "88888888-8888-4888-8888-888888888881" }, "systemId": "11111111-1111-4111-8111-111111111111", "personName": "Anna Example (E001)", "hasOpenActions": false },
+    { "enforcedStateId": "f2", "entitlement": { "entitlementId": "88888888-8888-4888-8888-888888888882", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "AccountAccess", "displayName": "Account Access", "permissionDefinitionDisplayName": null }, "entitlementName": "Account Access", "lastChangedOnUtc": "2026-01-10T00:00:00Z", "subPermissionCount": 0, "personEntitlementId": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1", "entitlementId": "88888888-8888-4888-8888-888888888882" }, "systemId": "11111111-1111-4111-8111-111111111111", "personName": "Anna Example (E001)", "hasOpenActions": false },
+    { "enforcedStateId": "f3", "entitlement": { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }, "entitlementName": "Account", "lastChangedOnUtc": "2026-01-11T00:00:00Z", "subPermissionCount": 0, "personEntitlementId": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd2", "entitlementId": "88888888-8888-4888-8888-888888888881" }, "systemId": "11111111-1111-4111-8111-111111111111", "personName": "Bram Sample (E002)", "hasOpenActions": true },
+    { "enforcedStateId": "f4", "entitlement": { "entitlementId": "88888888-8888-4888-8888-888888888884", "systemIdentifier": "22222222-2222-4222-8222-222222222222", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }, "entitlementName": "Account", "lastChangedOnUtc": "2026-01-12T00:00:00Z", "subPermissionCount": 0, "personEntitlementId": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd3", "entitlementId": "88888888-8888-4888-8888-888888888884" }, "systemId": "22222222-2222-4222-8222-222222222222", "personName": "Chris Excluded (E003)", "hasOpenActions": false },
+    { "enforcedStateId": "f5", "entitlement": { "entitlementId": "88888888-8888-4888-8888-888888888881", "systemIdentifier": "11111111-1111-4111-8111-111111111111", "type": "Account", "displayName": "Account", "permissionDefinitionDisplayName": null }, "entitlementName": "Account", "lastChangedOnUtc": "2026-01-13T00:00:00Z", "subPermissionCount": 0, "personEntitlementId": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd4", "entitlementId": "88888888-8888-4888-8888-888888888881" }, "systemId": "11111111-1111-4111-8111-111111111111", "personName": "Dana Nomatch (E004)", "hasOpenActions": false }
+  ],
+  "ruleResultPersons": {
+    "77777777-7777-4777-8777-777777777771": ["Anna Example (E001)"],
+    "77777777-7777-4777-8777-777777777772": ["Anna Example (E001)", "Bram Sample (E002)"]
+  },
+  "evaluationRuns": [
+    { "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2", "startDateUtc": "2026-01-20T10:00:00Z", "endDateUtc": "2026-01-20T10:01:00Z", "state": 3, "enforce": false, "createResources": false, "stageFailed": false, "permissionImportLoggingId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeee009" },
+    { "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1", "startDateUtc": "2026-01-19T10:00:00Z", "endDateUtc": "2026-01-19T10:01:00Z", "state": 3, "enforce": true, "createResources": true, "stageFailed": false, "permissionImportLoggingId": null }
+  ],
+  "evaluationReport": [
+    { "runId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2", "person": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd1", "displayName": "Anna Example (E001)" }, "system": { "systemId": "11111111-1111-4111-8111-111111111111", "displayName": "Alpha Directory", "templateIdentifier": "powershell-target" }, "entitlementType": 1, "entitlementName": "Account", "permissionDefinitionDisplayName": null, "operation": 1, "actionState": 2, "origins": [1] },
+    { "runId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2", "person": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd2", "displayName": "Bram Sample (E002)" }, "system": { "systemId": "11111111-1111-4111-8111-111111111111", "displayName": "Alpha Directory", "templateIdentifier": "powershell-target" }, "entitlementType": 3, "entitlementName": "Group Sales", "permissionDefinitionDisplayName": "Groups", "operation": 2, "actionState": 2, "origins": [0] },
+    { "runId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2", "person": { "personId": "dddddddd-dddd-4ddd-8ddd-ddddddddddd3", "displayName": "Chris Excluded (E003)" }, "system": { "systemId": "22222222-2222-4222-8222-222222222222", "displayName": "Beta Cloud", "templateIdentifier": "azuread" }, "entitlementType": 1, "entitlementName": "Account", "permissionDefinitionDisplayName": null, "operation": 1, "actionState": 2, "origins": [1, 0] }
+  ],
+  "evaluationLogging": {
+    "logMessages": [
+      { "message": "Completed evaluation", "messageTimeUtc": "2026-01-20T10:01:00Z", "level": 2, "scopeId": "", "objectId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2" },
+      { "message": "Starting a manual evaluation", "messageTimeUtc": "2026-01-20T10:00:00Z", "level": 2, "scopeId": "", "objectId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2" }
+    ],
+    "skipToken": "",
+    "moreDataAvailable": false,
+    "containsOutdatedLogging": false
+  },
+  "rulePreviewPersons": ["Anna Example (E001)", "Bram Sample (E002)", "Dana Nomatch (E004)"]
+}
